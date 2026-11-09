@@ -46,7 +46,27 @@ describe('migrations', () => {
       if (/^\s*ALTER\s+TABLE/i.test(m.statement)) expect(m.statement.match(/\bADD\b/gi) ?? []).toHaveLength(1);
       expect(m.statement.trim()).not.toMatch(/;\s*\S/); // one statement per migration
     }
-    expect(names).toEqual(['v001_create_settings', 'v002_create_audit', 'v003_create_sources', 'v004_create_facts', 'v005_facts_origin_key', 'v006_sources_text_truncated',
+  });
+
+  it('use only IF NOT EXISTS forms the Forge SQL (TiDB) grammar accepts', () => {
+    // Accepted: CREATE TABLE IF NOT EXISTS, ADD COLUMN IF NOT EXISTS, ADD INDEX/KEY IF NOT EXISTS,
+    // CREATE [UNIQUE] INDEX IF NOT EXISTS name ON table. TiDB rejects IF NOT EXISTS after
+    // ADD UNIQUE / ADD PRIMARY KEY / ADD CONSTRAINT / ADD FULLTEXT (ER_PARSE_ERROR 1064, dev 8.7.0).
+    const accepted = [
+      /^CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+\w+\s*\(/i,
+      /^ALTER\s+TABLE\s+\w+\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+\w+\s/i,
+      /^ALTER\s+TABLE\s+\w+\s+ADD\s+(?:INDEX|KEY)\s+IF\s+NOT\s+EXISTS\s+\w+\s*\(/i,
+      /^CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+\w+\s+ON\s+\w+\s*\(/i,
+    ];
+    for (const m of MIGRATIONS) {
+      const s = m.statement.trim();
+      expect(accepted.some((re) => re.test(s)), `${m.name}: ${s.slice(0, 80)}`).toBe(true);
+      expect(s, m.name).not.toMatch(/\bADD\s+(?:UNIQUE|PRIMARY|CONSTRAINT|FULLTEXT|SPATIAL)\b[^(]*\bIF\s+NOT\s+EXISTS/i);
+    }
+  });
+
+  it('are listed in order', () => {
+    expect(MIGRATIONS.map((m) => m.name)).toEqual(['v001_create_settings', 'v002_create_audit', 'v003_create_sources', 'v004_create_facts', 'v005_facts_origin_key', 'v006_sources_text_truncated',
       'v007_create_scan_jobs',
       'v008_create_scan_hits',
       'v009_create_copies',

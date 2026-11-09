@@ -38,6 +38,7 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Halaman arsip/draft tidak lagi menjadi kandidat salinan. Pengecualian space lewat pengaturan belum ada.
 
 ### Fixed
+- Setup database tidak lagi berhenti di 14/16: migrasi v015 (unique index satu scan aktif per sumber) memakai `CREATE UNIQUE INDEX IF NOT EXISTS ... ON ...`, karena Forge SQL (TiDB) menolak `ADD UNIQUE INDEX IF NOT EXISTS` (ER_PARSE_ERROR 1064).
 - Salinan yang menyebut kondisi sendiri (mis. "training $40") untuk fakta tanpa kondisi kini Tidak pasti, bukan Menyimpang.
 - Nilai dengan angka tambahan ("$60 per day (max 3 days)"), tanggal beda format, dan satuan beda (2 weeks = 14 days; USD vs EUR → tidak dinilai) tidak lagi ditandai menyimpang secara keliru.
 - Kutipan diperiksa ulang: nilai lama di "from X to Y" jadi Historis, nilai setelah "previously"/"was" jadi Tidak pasti, dan kondisi yang tidak ada di teks jadi Tidak pasti. Istilah pencarian tanpa huruf/angka dibuang.

@@ -147,7 +147,8 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
   { name: 'v013_scan_jobs_pages_skipped', statement: 'ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS pages_skipped INT NOT NULL DEFAULT 0' },
   // Source page id while the scan runs, NULL once finished: the unique index allows one running scan per source.
   { name: 'v014_scan_jobs_active_source', statement: 'ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS active_source VARCHAR(32) NULL' },
-  { name: 'v015_scan_jobs_active_unique', statement: 'ALTER TABLE scan_jobs ADD UNIQUE INDEX IF NOT EXISTS uq_scan_jobs_active (active_source)' },
+  // TiDB has IF NOT EXISTS for `CREATE [UNIQUE] INDEX` and plain `ADD INDEX`, not for `ADD UNIQUE INDEX` (parse error).
+  { name: 'v015_scan_jobs_active_unique', statement: 'CREATE UNIQUE INDEX IF NOT EXISTS uq_scan_jobs_active ON scan_jobs (active_source)' },
   // Judge result per chunk of a candidate page, so a retry continues with the chunks not judged yet.
   {
     name: 'v016_create_scan_chunks',
