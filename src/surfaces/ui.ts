@@ -4,7 +4,7 @@ import { displayNames } from '../adapters/confluenceUsers';
 import { asUserGraph, fetchPageMeta, ownersFromPage, readSpaceTeams, scrubErrorText, type GraphRequest, type PageMeta } from '../adapters/teamworkGraph';
 import { LATEST_MIGRATION, MIGRATIONS } from '../core/migrations';
 import { SchemaMigrationFailedError, SchemaSettingUpError } from '../core/schema';
-import { confirmChange, dismissChange, getLatestChange, getPendingChange, pendingChangeFlag, type ChangeContext } from './changes';
+import { confirmChange, dismissChange, getLatestChange, getPendingChange, healSource, pendingChangeFlag, type ChangeContext } from './changes';
 import { getScanStatus, listCopies, startScan } from './copies';
 import { approveAll, approveProposal, listProposalsForPage, listRollout, markNotSameFact, pendingProposalCount, rejectProposal } from './proposals';
 import type { ApproveProposalPayload, ChangeIdOnlyPayload, ProposalIdPayload } from '../core/views';
@@ -43,6 +43,8 @@ export interface BylineDeps {
   pendingChange: (pageId: string) => Promise<PendingChangeFlag | null>;
   /** M4 proposals waiting on the page; must not throw (0 on failure). Absent = 0. */
   pendingProposals?: (pageId: string) => Promise<number>;
+  /** Re-queues lost jobs of a source page (see `healSource`); must not throw. Absent = no heal. */
+  heal?: (pageId: string, currentVersion: number | null) => Promise<unknown>;
   ensure: () => Promise<void>;
 }
 
@@ -52,6 +54,7 @@ const defaultDeps: BylineDeps = {
   names: (ids) => displayNames(ids),
   pendingChange: (id) => pendingChangeFlag(id),
   pendingProposals: (id) => pendingProposalCount(id),
+  heal: (id, version) => healSource(id, version),
   ensure: ensureSchema,
 };
 
@@ -113,6 +116,13 @@ export async function bylineStatus(ctx: ResolverContext, deps: BylineDeps = defa
   const onPage = schema.status === 'ready' && pageId !== undefined && String(pageId) !== '';
   const pendingChange = onPage ? await deps.pendingChange(String(pageId)) : null;
   const pendingProposals = onPage && deps.pendingProposals ? await deps.pendingProposals(String(pageId)) : 0;
+  if (onPage && deps.heal) {
+    const version = await page().then(
+      (p) => p.version ?? null,
+      () => null,
+    );
+    await deps.heal(String(pageId), version);
+  }
   return { message: bylineMessage(schema), schema, owner, spaceTeams, pendingChange, pendingProposals };
 }
 

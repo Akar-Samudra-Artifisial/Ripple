@@ -52,6 +52,7 @@ import type {
 import { isLlmRateLimited, isLlmRetryable } from '../llm';
 import type { ChatToolFn } from '../llm/extract';
 import { rewriteSentence } from '../llm/rewrite';
+import { proposeJobKey } from '../adapters/jobKeys';
 import { EXTRACT_QUEUE, type SourceContext } from './sources';
 
 const errorText = (err: unknown): string => scrubErrorText(err instanceof Error ? err.message : String(err));
@@ -76,7 +77,7 @@ export interface ProposeTarget {
 export async function enqueuePropose(sourcePageId: string, changeId: string, target?: ProposeTarget): Promise<string> {
   const { jobId } = await extractQueue.push({
     body: { pageId: sourcePageId, kind: 'propose', changeId, ...(target ? { copyPageId: target.copyPageId } : {}) },
-    concurrency: { key: `extract-page-${sourcePageId}`, limit: 1 },
+    concurrency: { key: proposeJobKey(changeId), limit: 1 },
     ...(target?.delaySeconds ? { delayInSeconds: target.delaySeconds } : {}),
   });
   return jobId;

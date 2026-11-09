@@ -23,7 +23,7 @@ import type { ChangeDecision, CopyStatus, ErrorReply, FactView, PendingChangeRep
 import type { ChatToolFn } from '../src/llm/extract';
 import type { ToolSpec } from '../src/llm/index';
 import { SchemaSettingUpError } from '../src/core/schema';
-import { confirmChange, dismissChange, getLatestChange, getPendingChange, handlePageUpdate, runDiffJob, SCHEMA_DEFER_SECONDS, type ChangeDeps, type DiffDeps, type TriggerDeps } from '../src/surfaces/changes';
+import { confirmChange, dismissChange, getLatestChange, getPendingChange, handlePageUpdate, healSource, runDiffJob, SCHEMA_DEFER_SECONDS, type ChangeDeps, type HealDeps, type DiffDeps, type TriggerDeps } from '../src/surfaces/changes';
 import { COPY_PAGES, SOURCE_PAGE_ID, type FactKey } from './fixtures/copies';
 import { TRAVEL_POLICY_FACTS, TRAVEL_POLICY_STORAGE } from './fixtures/travelPolicy';
 
@@ -256,6 +256,59 @@ beforeEach(() => {
   llmCalls = 0;
   vi.spyOn(console, 'info').mockImplementation(() => undefined);
   vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+});
+
+describe('healSource (jobs that were never delivered)', () => {
+  const NOW = Date.parse('2026-11-09T09:50:00Z');
+  const change = (id: string, copies: number, createdAt = '2026-11-09T09:39:04Z') =>
+    ({ id, status: 'confirmed', createdAt, impact: { copies: Array.from({ length: copies }, (_, i) => ({ copyId: `c-${i}` })) } }) as unknown as ChangeRow;
+  const healDeps = (over: Partial<HealDeps> = {}) => {
+    const queued: string[] = [];
+    const deps: HealDeps = {
+      facts: { getSource: async () => ({ pageId: '9502721', title: null, state: 'ready', pageVersion: 11, markedAt: '', extractedAt: null, error: null }) },
+      changes: { confirmedChanges: async () => [change('ch-v11', 1), change('ch-old', 1, '2026-10-01T00:00:00Z'), change('ch-none', 0)] },
+      proposalCount: async () => 0,
+      enqueueDiff: async (pageId, version) => {
+        queued.push(`diff ${pageId} v${version}`);
+        return 'job-diff';
+      },
+      enqueuePropose: async (pageId, changeId) => {
+        queued.push(`propose ${pageId} ${changeId}`);
+        return 'job-propose';
+      },
+      now: () => NOW,
+      ...over,
+    };
+    return { deps, queued };
+  };
+
+  it('queues the lost v12 diff and the propose job of a recent confirmed change without proposals', async () => {
+    const { deps, queued } = healDeps();
+    expect(await healSource('9502721', 12, deps)).toEqual({ diffJob: 'job-diff', proposeJobs: 1 });
+    expect(queued).toEqual(['diff 9502721 v12', 'propose 9502721 ch-v11']);
+    // Throttled per page: a second byline open right after queues nothing.
+    expect(await healSource('9502721', 12, deps)).toBeNull();
+  });
+
+  it('queues nothing when the version was read and every change has proposals', async () => {
+    const { deps, queued } = healDeps({ proposalCount: async () => 1, now: () => NOW + 10 * 60_000 });
+    expect(await healSource('9502721', 11, deps)).toEqual({ diffJob: null, proposeJobs: 0 });
+    expect(queued).toEqual([]);
+  });
+
+  it('ignores pages that are not a source and never throws', async () => {
+    const { deps, queued } = healDeps({ facts: { getSource: async () => undefined } });
+    expect(await healSource('123', 5, deps)).toBeNull();
+    const broken = healDeps({
+      facts: {
+        getSource: async () => {
+          throw new Error('db down');
+        },
+      },
+    });
+    expect(await healSource('456', 5, broken.deps)).toBeNull();
+    expect(queued).toEqual([]);
+  });
 });
 
 describe('updated:page trigger', () => {

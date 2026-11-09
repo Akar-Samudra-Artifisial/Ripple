@@ -1,5 +1,5 @@
 import { InvocationError, InvocationErrorCode } from '@forge/events';
-import { requestMigration, runMigrations } from '../adapters/sql';
+import { MIGRATE_QUEUE as MIGRATE_QUEUE_KEY, requestMigration, runMigrations } from '../adapters/sql';
 import { scrubErrorText } from '../adapters/teamworkGraph';
 import { sqlErrorInfo } from '../core/schema';
 import { enqueueDiff, handlePageUpdate, runDiffJob } from './changes';
@@ -33,7 +33,8 @@ export async function onAppLifecycle(event: { eventType?: string }): Promise<voi
 }
 
 /** Consumer for `schema-migrate`: waits out the Forge SQL DDL rate limit and re-queues itself if out of time. */
-export async function migrateSchema(): Promise<InvocationError | void> {
+export async function migrateSchema(event?: { jobId?: string; retryContext?: { retryCount?: number } }): Promise<InvocationError | void> {
+  logJobStart(MIGRATE_QUEUE_KEY, 'migrate', event?.jobId, event?.retryContext?.retryCount);
   let result: Awaited<ReturnType<typeof runMigrations>>;
   try {
     result = await runMigrations(MIGRATE_BUDGET_MS);
@@ -73,7 +74,16 @@ export async function onPageEvent(event: PageEvent): Promise<void> {
 
 interface ExtractEvent {
   body?: { pageId?: unknown; kind?: unknown; changeId?: unknown; copyId?: unknown; copyPageId?: unknown; version?: unknown; deferrals?: unknown };
+  jobId?: string;
   retryContext?: { retryCount?: number };
+}
+
+/**
+ * First line of every consumer run (ids and counts only), so a job that never logs anything else still shows that it
+ * ran, and a job that never shows it was never delivered (e.g. waiting on its concurrency key).
+ */
+export function logJobStart(queue: string, kind: string, jobId: unknown, retryCount: number | undefined): void {
+  console.info('ripple job start', { queue, kind, jobId: typeof jobId === 'string' ? jobId : null, retryCount: retryCount ?? 0 });
 }
 
 /** Queue retries one diff job spends waiting for the schema before it is queued again as a fresh job. */
@@ -106,6 +116,8 @@ export async function requeueDiffForSchema(
  * after the page was saved (body `{ pageId, kind: 'diff' }`, see `runDiffJob`).
  */
 export async function extractFacts(event: ExtractEvent): Promise<InvocationError | void> {
+  const kind = event.body?.kind === 'propose' || event.body?.kind === 'diff' ? event.body.kind : 'extract';
+  logJobStart('extract', kind, event.jobId, event.retryContext?.retryCount);
   const pageId = event.body?.pageId;
   if (typeof pageId !== 'string' || !/^\d{1,32}$/.test(pageId)) {
     console.warn('ripple extract: ignoring event without a valid page id');
@@ -146,12 +158,14 @@ export async function extractFacts(event: ExtractEvent): Promise<InvocationError
 
 interface ScanEvent {
   body?: { scanId?: unknown };
+  jobId?: string;
   retryContext?: { retryCount?: number };
 }
 
 const UUID = /^[0-9a-f-]{36}$/i;
 
 async function runScanConsumer(what: string, event: ScanEvent, run: (scanId: string, retryCount: number) => Promise<ScanOutcome>): Promise<InvocationError | void> {
+  logJobStart(what, what, event.jobId, event.retryContext?.retryCount);
   const scanId = event.body?.scanId;
   if (typeof scanId !== 'string' || !UUID.test(scanId)) {
     console.warn(`ripple ${what}: ignoring event without a valid scan id`);

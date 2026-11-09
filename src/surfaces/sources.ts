@@ -4,6 +4,7 @@
  */
 import { Queue } from '@forge/events';
 import { canEditPage, ConfluenceRetryableError, getSourcePage, PageNotFoundError, type SourcePage } from '../adapters/confluence';
+import { pageJobKey } from '../adapters/jobKeys';
 import { sqlRepo, type FactRepo, type PageVersionInfo } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
 import { scrubErrorText } from '../adapters/teamworkGraph';
@@ -36,7 +37,7 @@ const defaultDeps: SourceDeps = {
   canEdit: canEditPage,
   enqueue: async (pageId) => {
     // One extraction per page at a time; a second mark waits for the first job. Keys span all queues of the install.
-    const { jobId } = await extractQueue.push({ body: { pageId }, concurrency: { key: `extract-page-${pageId}`, limit: 1 } });
+    const { jobId } = await extractQueue.push({ body: { pageId }, concurrency: { key: pageJobKey(pageId), limit: 1 } });
     return jobId;
   },
   ensure: ensureSchema,

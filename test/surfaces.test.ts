@@ -1,3 +1,5 @@
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const forge = vi.hoisted(() => ({ push: vi.fn(async () => ({ jobId: 'job-1' })) }));
@@ -26,7 +28,9 @@ vi.mock('@forge/events', () => ({
 import { LATEST_MIGRATION, MIGRATIONS } from '../src/core/migrations';
 import { SchemaMigrationFailedError, SchemaSettingUpError } from '../src/core/schema';
 import { ACTIONS, factKeeperAction } from '../src/surfaces/actions';
-import { MAX_SCHEMA_DEFERRALS, onAppLifecycle, onPageEvent, requeueDiffForSchema } from '../src/surfaces/background';
+import { extractFacts, MAX_SCHEMA_DEFERRALS, onAppLifecycle, onPageEvent, requeueDiffForSchema } from '../src/surfaces/background';
+import { enqueueDiff } from '../src/surfaces/changes';
+import { enqueuePropose } from '../src/surfaces/proposals';
 import { bylineStatus, schemaView, type BylineDeps } from '../src/surfaces/ui';
 
 beforeEach(() => {
@@ -144,6 +148,14 @@ describe('bylineStatus', () => {
     expect(d.pageMeta).toHaveBeenCalledTimes(1); // shared by owner and space id lookups
   });
 
+  it('heals the viewed page with its current version (same REST v2 read as the owner)', async () => {
+    const heal = vi.fn(async () => null);
+    const d = deps({ heal, pageMeta: vi.fn(async () => ({ spaceId: '99', ownerId: 'owner-1', version: 12 })) });
+    await bylineStatus({ cloudId: 'c1', extension: { content: { id: 9502721 } } }, d);
+    expect(heal).toHaveBeenCalledWith('9502721', 12);
+    expect(d.pageMeta).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps the owner id when the name lookup fails or the name is hidden', async () => {
     const failing = await bylineStatus(
       { cloudId: 'c1', extension: { content: { id: 5 } } },
@@ -217,6 +229,31 @@ describe('background and Rovo stubs', () => {
     for (const key of ACTIONS) {
       expect(await factKeeperAction({ context: { moduleKey: key } })).toMatchObject({ status: 'not_implemented', feature: `Rovo action ${key}` });
     }
+  });
+
+  it('propose jobs no longer share the source page concurrency key with diff/extract jobs', async () => {
+    forge.push.mockClear();
+    await enqueuePropose('9502721', 'aec7c919-1749-4c74-8d71-0694fd554e58');
+    await enqueueDiff('9502721', 12);
+    const keys = (forge.push.mock.calls as unknown as [{ concurrency?: { key: string; limit: number } }][]).map((c) => c[0].concurrency);
+    expect(keys).toEqual([
+      { key: 'ripple-propose-aec7c919-1749-4c74-8d71-0694fd554e58', limit: 1 },
+      { key: 'ripple-page-9502721', limit: 1 },
+    ]);
+    // The old keys (whose slot stayed taken on dev) are gone from src.
+    const files = (dir: string): string[] =>
+      readdirSync(dir).flatMap((f) => {
+        const p = join(dir, f);
+        return statSync(p).isDirectory() ? files(p) : p.endsWith('.ts') ? [p] : [];
+      });
+    expect(files(join(__dirname, '../src')).filter((f) => readFileSync(f, 'utf8').includes('extract-page-'))).toEqual([]);
+  });
+
+  it('every extract job logs "ripple job start" with its kind and job id first (ids only)', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await extractFacts({ jobId: 'job-24a6', body: { pageId: 'not-a-page', kind: 'propose' }, retryContext: { retryCount: 2 } });
+    expect(info).toHaveBeenNthCalledWith(1, 'ripple job start', { queue: 'extract', kind: 'propose', jobId: 'job-24a6', retryCount: 2 });
   });
 
   it('a diff still waiting for the schema after its queue retries is queued again as a new job, up to a cap', async () => {

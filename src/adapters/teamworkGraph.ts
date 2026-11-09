@@ -214,10 +214,28 @@ export async function readContributors(request: GraphRequest, cloudId: string, p
   return read;
 }
 
-export async function readSpaceTeams(request: GraphRequest, cloudId: string, spaceId: string): Promise<{ teams: Team[] } & GraphMeta> {
-  const r = await request(SPACE_TEAMS_QUERY, { spaceAri: spaceAri(cloudId, spaceId) }, 'ripple_spaceTeams');
-  const read = 'failure' in r ? { teams: [], ...failedMeta(r.failure) } : parseSpaceTeams(r.body);
-  logRead('ripple_spaceTeams', { spaceId }, read, read.teams.length);
+/** Wait before the one retry of a failed space-teams read. */
+export const SPACE_TEAMS_RETRY_MS = 600;
+
+/**
+ * Teams of a space. The graph intermittently answers the same user and space with "User is not permitted to query
+ * this organization" and no data (seconds after a good answer), so a read without data and with errors is retried
+ * once after a short wait. Each attempt is logged (`attempt`).
+ */
+export async function readSpaceTeams(
+  request: GraphRequest,
+  cloudId: string,
+  spaceId: string,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+): Promise<{ teams: Team[] } & GraphMeta> {
+  let read: { teams: Team[] } & GraphMeta = { teams: [], ...failedMeta('not read') };
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    if (attempt > 1) await sleep(SPACE_TEAMS_RETRY_MS);
+    const r = await request(SPACE_TEAMS_QUERY, { spaceAri: spaceAri(cloudId, spaceId) }, 'ripple_spaceTeams');
+    read = 'failure' in r ? { teams: [], ...failedMeta(r.failure) } : parseSpaceTeams(r.body);
+    logRead('ripple_spaceTeams', { spaceId, attempt }, read, read.teams.length);
+    if (read.dataPresent || read.errors.length === 0) break;
+  }
   return read;
 }
 
@@ -241,6 +259,8 @@ export interface PageMeta {
   spaceId?: string;
   ownerId?: string;
   authorId?: string;
+  /** Current version number. */
+  version?: number;
 }
 
 /** Page metadata from Confluence REST v2 as the current user. Throws with the HTTP status on failure. */
@@ -249,7 +269,13 @@ export async function fetchPageMeta(pageId: string): Promise<PageMeta> {
   if (!res.ok) throw new Error(`Confluence REST v2 page ${pageId} failed: HTTP ${res.status}`);
   const page = (await res.json()) as Record<string, unknown>;
   const str = (v: unknown): string | undefined => (typeof v === 'string' && v !== '' ? v : v === undefined || v === null ? undefined : String(v));
-  return { spaceId: str(page.spaceId), ownerId: str(page.ownerId), authorId: str(page.authorId) };
+  const version = (page.version as { number?: unknown } | undefined)?.number;
+  return {
+    spaceId: str(page.spaceId),
+    ownerId: str(page.ownerId),
+    authorId: str(page.authorId),
+    ...(typeof version === 'number' && Number.isInteger(version) ? { version } : {}),
+  };
 }
 
 /** Owner then author of a REST v2 page (the routing fallback when the graph gives no owners). */

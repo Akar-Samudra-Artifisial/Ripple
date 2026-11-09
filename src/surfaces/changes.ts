@@ -36,6 +36,8 @@ import type {
 } from '../core/views';
 import { isLlmRateLimited, LlmOutputError } from '../llm';
 import { runFactExtraction, type ChatToolFn } from '../llm/extract';
+import { pageJobKey } from '../adapters/jobKeys';
+import { enqueuePropose } from './proposals';
 import { EXTRACT_QUEUE, type SourceContext } from './sources';
 
 const errorText = (err: unknown): string => scrubErrorText(err instanceof Error ? err.message : String(err));
@@ -92,7 +94,7 @@ const extractQueue = new Queue({ key: EXTRACT_QUEUE });
 export async function enqueueDiff(pageId: string, version: number | null, options: DiffQueueOptions = {}): Promise<string> {
   const { jobId } = await extractQueue.push({
     body: { pageId, kind: 'diff', version, ...(options.deferrals ? { deferrals: options.deferrals } : {}) },
-    concurrency: { key: `extract-page-${pageId}`, limit: 1 },
+    concurrency: { key: pageJobKey(pageId), limit: 1 },
     ...(options.delaySeconds ? { delayInSeconds: options.delaySeconds } : {}),
   });
   return jobId;
@@ -328,10 +330,7 @@ const defaultDeps: ChangeDeps = {
   graph: asUserGraph,
   ensure: ensureSchema,
   now: () => new Date(),
-  enqueuePropose: async (sourcePageId, changeId) => {
-    const { jobId } = await extractQueue.push({ body: { pageId: sourcePageId, kind: 'propose', changeId }, concurrency: { key: `extract-page-${sourcePageId}`, limit: 1 } });
-    return jobId;
-  },
+  enqueuePropose: (sourcePageId, changeId) => enqueuePropose(sourcePageId, changeId),
   supersedeProposals: (sourcePageId, changeId, factIds) => sqlProposalRepo.supersedeOlder(sourcePageId, changeId, factIds),
 };
 
@@ -352,6 +351,76 @@ async function guarded<T>(ctx: ChangeContext, deps: Pick<ChangeDeps, 'ensure'>, 
     if (err instanceof SchemaSettingUpError) return { error: err.message };
     console.warn(`ripple ${what} failed`, { pageId, error: errorText(err) });
     return { error: `Ripple could not ${what}: ${errorText(err)}` };
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Self-heal (byline of a source page): jobs that never ran are queued again
+// ---------------------------------------------------------------------------------------------------------------
+
+export interface HealDeps {
+  facts: Pick<FactRepo, 'getSource'>;
+  changes: Pick<ChangeRepo, 'confirmedChanges'>;
+  proposalCount: (changeId: string) => Promise<number>;
+  enqueueDiff: (pageId: string, version: number | null) => Promise<string>;
+  enqueuePropose: (sourcePageId: string, changeId: string) => Promise<string>;
+  now: () => number;
+}
+
+const defaultHealDeps: HealDeps = {
+  facts: sqlRepo,
+  changes: sqlChangeRepo,
+  proposalCount: async (changeId) => (await sqlProposalRepo.listForChange(changeId)).length,
+  enqueueDiff: (pageId, version) => enqueueDiff(pageId, version),
+  enqueuePropose: (sourcePageId, changeId) => enqueuePropose(sourcePageId, changeId),
+  now: Date.now,
+};
+
+/** At most one heal per page per isolate in this window (a heal only queues idempotent jobs). */
+export const HEAL_EVERY_MS = 2 * 60_000;
+/** Confirmed changes older than this are not re-proposed by the heal (their proposals were decided long ago). */
+const HEAL_CHANGE_MAX_AGE_MS = 7 * 24 * 3600_000;
+const HEAL_MAX_PROPOSE = 3;
+const healedAt = new Map<string, number>();
+
+export type HealOutcome = { diffJob: string | null; proposeJobs: number } | null;
+
+/**
+ * Re-queues work a source page lost (a queue event that was never delivered): a diff when the page has a newer
+ * version than the one Ripple last read, and the propose job of recent confirmed changes that affect copies but have
+ * no proposal at all. Both jobs are idempotent (the diff skips a version already read, proposals are unique per
+ * change and copy), so a heal racing a job that does run changes nothing. Never throws.
+ */
+export async function healSource(pageId: string, currentVersion: number | null, deps: HealDeps = defaultHealDeps): Promise<HealOutcome> {
+  const now = deps.now();
+  const last = healedAt.get(pageId);
+  if (last !== undefined && now - last < HEAL_EVERY_MS) return null;
+  healedAt.set(pageId, now);
+  try {
+    const source = await deps.facts.getSource(pageId);
+    if (!source) return null;
+    let diffJob: string | null = null;
+    if (source.state === 'ready' && currentVersion !== null && source.pageVersion !== null && currentVersion > source.pageVersion) {
+      diffJob = await deps.enqueueDiff(pageId, currentVersion);
+    }
+    let proposeJobs = 0;
+    for (const change of await deps.changes.confirmedChanges(pageId)) {
+      if (proposeJobs >= HEAL_MAX_PROPOSE) break;
+      if ((change.impact?.copies.length ?? 0) === 0) continue;
+      const created = change.createdAt ? Date.parse(change.createdAt) : Number.NaN;
+      if (!Number.isFinite(created) || now - created > HEAL_CHANGE_MAX_AGE_MS) continue;
+      if ((await deps.proposalCount(change.id)) > 0) continue;
+      await deps.enqueuePropose(pageId, change.id);
+      proposeJobs++;
+    }
+    if (diffJob || proposeJobs > 0) {
+      console.info('ripple heal: jobs queued again', { pageId, storedVersion: source.pageVersion, currentVersion, diffJob, proposeJobs });
+    }
+    return { diffJob, proposeJobs };
+  } catch (err) {
+    healedAt.delete(pageId);
+    console.warn('ripple heal failed', { pageId, error: errorText(err) });
+    return null;
   }
 }
 

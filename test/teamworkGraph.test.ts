@@ -15,6 +15,7 @@ import {
   readPageOwners,
   readSpaceTeams,
   scrubErrorText,
+  SPACE_TEAMS_RETRY_MS,
   spaceAri,
   type GraphRequest,
   type GraphUser,
@@ -150,5 +151,25 @@ describe('reads', () => {
     const r = await readSpaceTeams(request, 'c1', '7');
     expect(request).toHaveBeenCalledWith(expect.stringContaining('atlassianTeamsBySpace'), { spaceAri: 'ari:cloud:confluence:c1:space/7' }, 'ripple_spaceTeams');
     expect(r.teams).toEqual([{ id: 't1', name: 'Platform Team' }]);
+  });
+
+  it('retries a space-teams read once when the graph answers "not permitted" without data (intermittent)', async () => {
+    const denied = { body: { data: null, errors: [{ message: 'User is not permitted to query this organization' }] } };
+    const ok = { body: { data: { atlassianTeamsBySpace: { edges: [{ node: { id: 't1', displayName: 'Platform Team' } }] } } } };
+    const request = vi.fn<GraphRequest>().mockResolvedValueOnce(denied).mockResolvedValueOnce(ok);
+    const sleep = vi.fn(async () => undefined);
+    const r = await readSpaceTeams(request, 'c1', '7', sleep);
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalledWith(SPACE_TEAMS_RETRY_MS);
+    expect(r.teams).toHaveLength(1);
+
+    const always = vi.fn<GraphRequest>(async () => denied);
+    const failed = await readSpaceTeams(always, 'c1', '7', sleep);
+    expect(always).toHaveBeenCalledTimes(2); // one retry only
+    expect(failed.errors).toContain('User is not permitted to query this organization');
+
+    const empty = vi.fn<GraphRequest>(async () => ({ body: { data: { atlassianTeamsBySpace: { edges: [] } } } }));
+    await readSpaceTeams(empty, 'c1', '7', sleep);
+    expect(empty).toHaveBeenCalledTimes(1); // "no teams" is an answer, not a failure
   });
 });
