@@ -7,7 +7,7 @@
  */
 import { sqlChangeIssueRepo, PROJECT_KEY, type ChangeIssueRepo, type ChangeIssueRow, type CreatedIssueRef } from '../adapters/changeIssueRepo';
 import { sha256, sqlChangeRepo, type ChangeRepo, type ChangeRow } from '../adapters/changeRepo';
-import { pageIsOpen, pageLinkAsApp, type AppPageLink } from '../adapters/confluence';
+import { openCache, openCheck, pageIsOpen, pageLinkAsApp, type AppPageLink, type OpenCache, type OpenCheck } from '../adapters/confluence';
 import { JiraError, JiraUnavailableError, jira, jiraErrorClass, type CreatedIssue, type JiraClient } from '../adapters/jira';
 import { sqlProposalRepo, type ProposalRepo, type ProposalRow } from '../adapters/proposalRepo';
 import { sqlRepo, type FactRepo } from '../adapters/repo';
@@ -31,7 +31,7 @@ import {
 } from '../core/changeIssues';
 import { valueLabel } from '../core/copies';
 import { SchemaSettingUpError } from '../core/schema';
-import type { AdminCheck, ApprovalView, ErrorReply, RolloutIssue, SaveSettingsPayload, SaveSettingsResult, SettingsView } from '../core/views';
+import { adminErrorCode, type AdminCheck, type ApprovalView, type ErrorReply, type RolloutIssue, type SaveSettingsPayload, type SaveSettingsResult, type SettingsView } from '../core/views';
 
 export const SETTINGS_MODULE = 'ripple-settings';
 export const APPROVAL_MODULE = 'ripple-approval';
@@ -50,7 +50,7 @@ export interface IssueDeps {
   proposals: Pick<ProposalRepo, 'listForChange'>;
   facts: Pick<FactRepo, 'getSource' | 'listFacts'>;
   /** The page's title may be named to anyone (no read restriction). */
-  isOpen: (pageId: string) => Promise<boolean>;
+  isOpen: (pageId: string, check?: OpenCheck) => Promise<boolean>;
   /** Title and absolute URLs as the app; null when unreadable. */
   pageLink: (pageId: string) => Promise<AppPageLink | null>;
 }
@@ -85,11 +85,11 @@ async function factLines(deps: IssueDeps, change: ChangeRow, rows: readonly Prop
  * Listed pages: title and URL (with its title slug) only when the page may be named to anyone; otherwise
  * "Page <id>" linked by id only (`viewpage.action?pageId=`).
  */
-async function issuePages(deps: IssueDeps, pageIds: readonly string[]): Promise<IssuePage[]> {
+async function issuePages(deps: IssueDeps, pageIds: readonly string[], check: OpenCheck): Promise<IssuePage[]> {
   const out: IssuePage[] = [];
   for (const pageId of pageIds.slice(0, MAX_ISSUE_PAGES)) {
     const link = await deps.pageLink(pageId);
-    const open = link !== null && (await deps.isOpen(pageId));
+    const open = link !== null && (await deps.isOpen(pageId, check));
     out.push(open ? { pageId, title: link.title, url: link.url } : { pageId, title: null, url: link?.idUrl ?? null });
   }
   return out;
@@ -102,6 +102,9 @@ function teamNames(change: ChangeRow, openPageIds: readonly string[]): string[] 
   const names = (change.routing?.spaces ?? []).filter((s) => spaces.has(s.spaceId)).flatMap((s) => (s.teams ?? []).map((t) => t.name));
   return [...new Set(names.filter((n) => n.trim() !== ''))];
 }
+
+/** Time the "may this page be named" checks of one issue may take (queue consumer, 900 s timeout). */
+const ISSUE_OPEN_BUDGET_MS = 20_000;
 
 /** Tries of recording a created issue on its claim. */
 const COMPLETE_TRIES = 3;
@@ -127,15 +130,21 @@ async function completeWithRetry(repo: ChangeIssueRepo, changeId: string, owner:
 export type IssueIneligible = 'change_not_confirmed' | 'issues_not_wanted' | 'proposals_pending' | 'not_latest_change';
 
 /**
- * Only the source's newest confirmed change gets issues, only when a Jira project was set when it was confirmed
+ * A change gets issues unless a newer confirmed change of the same source changed one of its facts (its proposals
+ * were superseded, like `supersedeOlder` per fact), only when a Jira project was set when it was confirmed
  * (`routing.jiraProjectKey`: no retroactive issues for older changes) and only after a full propose job finished.
+ * Changes of other facts of the same source each keep their own issues.
  */
 export async function issueIneligibility(change: ChangeRow | undefined, changes: Pick<ChangeRepo, 'confirmedChanges'>): Promise<IssueIneligible | null> {
   if (!change || change.status !== 'confirmed' || !change.routing) return 'change_not_confirmed';
   if (!change.routing.jiraProjectKey) return 'issues_not_wanted';
   if (!change.proposedAt) return 'proposals_pending';
-  const latest = (await changes.confirmedChanges(change.sourcePageId))[0];
-  return latest?.id === change.id ? null : 'not_latest_change';
+  const confirmed = await changes.confirmedChanges(change.sourcePageId); // newest first
+  const at = confirmed.findIndex((c) => c.id === change.id);
+  // Not among the newest read: every row read is newer than this change.
+  const newer = at === -1 ? confirmed : confirmed.slice(0, at);
+  const facts = new Set(change.factChanges.map((f) => f.factId));
+  return newer.some((c) => c.factChanges.some((f) => facts.has(f.factId))) ? 'not_latest_change' : null;
 }
 
 /**
@@ -160,7 +169,10 @@ export async function createIssuesForChange(changeId: string, deps: IssueDeps = 
     const { groups, unowned } = groupByOwner(change.routing.pages, proposals);
     const out = { created: 0, failed: 0, skipped: 0, unowned };
     let source: { open: boolean; title: string | null } | undefined;
+    // Page and ancestor reads are shared by every owner of the change; each issue gets its own time budget.
+    const reads: OpenCache = openCache();
     for (const g of groups) {
+      const check = openCheck(ISSUE_OPEN_BUDGET_MS, reads);
       const token = await deps.repo.claim(changeId, g.ownerAccountId, change.sourcePageId, g.pageIds.length);
       if (!token) {
         out.skipped++;
@@ -177,11 +189,11 @@ export async function createIssuesForChange(changeId: string, deps: IssueDeps = 
           reused = true;
         } else {
           if (source === undefined) {
-            const open = await deps.isOpen(change.sourcePageId);
+            const open = await deps.isOpen(change.sourcePageId, check);
             source = { open, title: open ? ((await deps.facts.getSource(change.sourcePageId))?.title ?? null) : null };
           }
           const pages = new Set(g.pageIds);
-          const listed = await issuePages(deps, g.pageIds);
+          const listed = await issuePages(deps, g.pageIds, check);
           const description = issueAdf({
             ownerAccountId: g.ownerAccountId,
             facts: source.open
@@ -359,15 +371,18 @@ export const defaultSettingsDeps: SettingsDeps = { repo: sqlChangeIssueRepo, jir
  * Who may change the settings: Jira administrators (global ADMINISTER of the calling user, read as that user via
  * `mypermissions`), on Ripple's settings page only. The Confluence admin check (`/wiki/rest/api/user/current?
  * expand=operations`) needs a scope Ripple does not have, and the global settings page is not limited to admins.
- * Fails closed: a check that cannot be made (401/403, no consent, Jira down) is `check_failed`, never "admin".
+ * Fails closed: a check that cannot be made is `check_failed` (401/403, Jira down) or `needs_auth` (the user has not
+ * granted Ripple access to Jira yet), never "admin".
  */
 export async function adminCheck(ctx: SettingsContext, deps: Pick<SettingsDeps, 'jira'>): Promise<AdminCheck> {
   if (ctx.moduleKey !== SETTINGS_MODULE || !ctx.accountId) return 'not_admin';
   try {
     return (await deps.jira.isCurrentUserAdmin()) ? 'admin' : 'not_admin';
   } catch (err) {
-    console.info('ripple settings: Jira admin check failed', { error: jiraErrorCode(err), errorClass: jiraErrorClass(err) });
-    return 'check_failed';
+    const errorClass = jiraErrorClass(err);
+    console.info('ripple settings: Jira admin check failed', { error: jiraErrorCode(err), errorClass });
+    // The user has not granted Ripple access to Jira yet (no consent for `asUser` calls).
+    return errorClass === 'needs_auth' ? 'needs_auth' : 'check_failed';
   }
 }
 
@@ -398,7 +413,7 @@ export async function saveSettings(ctx: SettingsContext, payload: Partial<SaveSe
     if (raw !== null && raw !== undefined && (typeof raw !== 'string' || raw.length > 20)) return { ok: false, errorCode: 'invalid_key' };
     // Fails closed: a check that cannot be made never lets the save through, but is told apart from "not an admin".
     const admin = await adminCheck(ctx, deps);
-    if (admin !== 'admin') return { ok: false, errorCode: admin === 'not_admin' ? 'not_allowed' : 'admin_check_failed' };
+    if (admin !== 'admin') return { ok: false, errorCode: adminErrorCode(admin) };
     const key = (raw ?? '').trim().toUpperCase();
     if (key === '') {
       await deps.repo.saveJiraSettings(null);
@@ -443,7 +458,8 @@ export async function getApproval(ctx: ApprovalContext, deps: IssueDeps & { ensu
     const pages = owned(change, row.ownerAccountId);
     const proposals = (await deps.proposals.listForChange(row.changeId)).filter((p) => pages.has(p.pageId));
     const pageIds = [...new Set(proposals.map((p) => p.pageId))];
-    const listed = await issuePages(deps, pageIds);
+    // Resolver: one 5 s budget for every page of the panel.
+    const listed = await issuePages(deps, pageIds, openCheck());
     return {
       issueKey,
       task: {

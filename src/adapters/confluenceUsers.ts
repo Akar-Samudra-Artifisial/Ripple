@@ -33,6 +33,37 @@ export function parseUsersBulk(raw: unknown): Map<string, string> {
   return names;
 }
 
+export interface UserAccount {
+  name: string;
+  /** `atlassian` | `app` | `customer` | `unknown`. */
+  accountType: string;
+  /** `active` | `inactive` | `closed` | `unknown`. */
+  accountStatus: string;
+}
+
+/** accountId → name, type and status from a users-bulk body (missing type/status = `unknown`). */
+export function parseUserAccounts(raw: unknown): Map<string, UserAccount> {
+  const results = (raw as { results?: unknown } | null)?.results;
+  const out = new Map<string, UserAccount>();
+  if (!Array.isArray(results)) return out;
+  const names = parseUsersBulk(raw);
+  for (const r of results as { accountId?: unknown; accountType?: unknown; accountStatus?: unknown }[]) {
+    if (typeof r?.accountId !== 'string' || r.accountId === '') continue;
+    out.set(r.accountId, {
+      name: names.get(r.accountId) ?? '',
+      accountType: typeof r.accountType === 'string' ? r.accountType : 'unknown',
+      accountStatus: typeof r.accountStatus === 'string' ? r.accountStatus : 'unknown',
+    });
+  }
+  return out;
+}
+
+/** Accounts for at most `USERS_BULK_LIMIT` ids in one call; ids not returned are absent. Throws on HTTP failure. */
+export async function userAccounts(accountIds: readonly string[], request: UsersBulkRequest = asUserUsersBulk): Promise<Map<string, UserAccount>> {
+  const ids = [...new Set(accountIds.filter((id) => id !== ''))].slice(0, USERS_BULK_LIMIT);
+  return ids.length ? parseUserAccounts(await request(ids)) : new Map();
+}
+
 /** Display names for `accountIds` (deduplicated, chunked by `USERS_BULK_LIMIT`). Ids not returned are absent. */
 export async function displayNames(accountIds: readonly string[], request: UsersBulkRequest = asUserUsersBulk): Promise<Map<string, string>> {
   const ids = [...new Set(accountIds.filter((id) => id !== ''))];

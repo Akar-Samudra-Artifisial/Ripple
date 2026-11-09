@@ -635,6 +635,28 @@ describe('which changes get issues (live regression, dev 8.29.0)', () => {
     expect(await issuesNeeded(old, deps)).toBe(false);
   });
 
+  it('changes of different facts of one source each get their issues; only a newer change of the SAME fact supersedes', async () => {
+    const fc = (factId: string) => [{ factId, oldValue: '$60', oldUnit: null, newValue: '$75', newUnit: null, newQuote: 'q', version: 5, versionAt: null }];
+    const a = { ...store.change, id: OLDER, factChanges: fc('f1') } as ChangeRow;
+    const b = { ...store.change, id: CHANGE, factChanges: fc('f2') } as ChangeRow;
+    const all = new Map<string, ChangeRow>([
+      [CHANGE, b],
+      [OLDER, a],
+    ]);
+    const base = store.deps();
+    const deps: IssueDeps = { ...base, changes: { getChange: async (id) => all.get(id), confirmedChanges: async () => [b, a] } };
+    store.proposals = [
+      { id: 'pa', changeId: OLDER, pageId: 'A', factId: 'f1', status: 'proposed', errorCode: null },
+      { id: 'pb', changeId: CHANGE, pageId: 'B', factId: 'f2', status: 'proposed', errorCode: null },
+    ] as typeof store.proposals;
+    expect(await createIssuesForChange(OLDER, deps)).toMatchObject({ status: 'done', created: 1 });
+    expect(await createIssuesForChange(CHANGE, deps)).toMatchObject({ status: 'done', created: 1 });
+    expect(store.created).toHaveLength(2);
+    // A newer change that also touches f1 makes A stale.
+    b.factChanges = [...fc('f2'), ...fc('f1')];
+    expect(await createIssuesForChange(OLDER, deps)).toEqual({ status: 'skipped', reason: 'not_latest_change' });
+  });
+
   it('a change confirmed with the project gets its issues from the first full propose job (heal queues it when lost)', async () => {
     store.change = { ...store.change, proposedAt: null } as ChangeRow;
     expect(await issuesNeeded(store.change, store.deps())).toBe(false);
@@ -707,7 +729,9 @@ describe('settings and approval panel', () => {
     // The user has not granted consent (Forge NEEDS_AUTHENTICATION_ERR): its own class, still fail-closed.
     info.mockClear();
     userThrows = Object.assign(new Error('needs auth'), { name: 'NEEDS_AUTHENTICATION_ERR', status: 401 });
-    expect(await getSettings(ctx('acc-admin'), d)).toMatchObject({ canEdit: false, adminCheck: 'check_failed' });
+    expect(await getSettings(ctx('acc-admin'), d)).toMatchObject({ canEdit: false, adminCheck: 'needs_auth' });
+    userThrows = Object.assign(new Error('needs auth'), { name: 'NEEDS_AUTHENTICATION_ERR', status: 401 });
+    expect(await saveSettings(ctx('acc-admin'), { jiraProjectKey: 'XYZ' }, d)).toEqual({ ok: false, errorCode: 'admin_needs_auth' });
     expect(info).toHaveBeenCalledWith('ripple settings: Jira admin check failed', expect.objectContaining({ errorClass: 'needs_auth' }));
     expect(store.settings).toEqual({ projectKey: 'OPS' });
     info.mockRestore();

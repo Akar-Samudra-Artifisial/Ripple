@@ -453,7 +453,12 @@ export interface SettingsView {
   adminCheck: AdminCheck;
 }
 
-export type AdminCheck = 'admin' | 'not_admin' | 'check_failed';
+/** `needs_auth`: the check could not be made because the user has not granted Ripple access to Jira yet. */
+export type AdminCheck = 'admin' | 'not_admin' | 'check_failed' | 'needs_auth';
+
+/** Reply error code of a failed admin check (`not_allowed` = not an admin). */
+export const adminErrorCode = (a: Exclude<AdminCheck, 'admin'>): 'not_allowed' | 'admin_check_failed' | 'admin_needs_auth' =>
+  a === 'not_admin' ? 'not_allowed' : a === 'needs_auth' ? 'admin_needs_auth' : 'admin_check_failed';
 
 export interface SaveSettingsPayload {
   /** Project key (e.g. `OPS`); empty or null turns update tasks off. */
@@ -466,7 +471,7 @@ export interface SaveSettingsResult {
    * `invalid_key`, `not_allowed` (not a Jira admin), `admin_check_failed` (the admin check could not be made),
    * `project_not_found`, `jira_unavailable` (Ripple not installed in Jira), `jira_error`.
    */
-  errorCode: 'invalid_key' | 'not_allowed' | 'admin_check_failed' | 'project_not_found' | 'jira_unavailable' | 'jira_error' | null;
+  errorCode: 'invalid_key' | 'not_allowed' | 'admin_check_failed' | 'admin_needs_auth' | 'project_not_found' | 'jira_unavailable' | 'jira_error' | null;
 }
 
 /** Reply of `getApproval` (Jira issue panel, read-only); `task` is null for issues Ripple did not create. */
@@ -498,15 +503,38 @@ export interface DemoStatus {
   /** The viewer may load the demo data (Jira administrators). */
   canEdit: boolean;
   /**
-   * `not_allowed`, `admin_check_failed`, `invalid_owner_ids`, `owner_change_failed` (some pages kept the admin as
-   * owner), or the failing step (`space_create_http_403`, `page_find_http_404`, …).
+   * `not_allowed`, `admin_check_failed`, `admin_needs_auth` (no Jira consent yet), `invalid_owner_ids`,
+   * `owner_invalid` (an owner is not an active Atlassian account), `owner_check_failed` (owners could not be looked
+   * up), `space_key_taken` (a space with a demo key exists that Ripple did not create), `owner_change_failed` (some
+   * pages kept the admin as owner; `retryOwners` tries again), or the failing step (`space_create_http_403`, …).
+   * While another load holds the lease the reply is `loading` and nothing is written.
    */
   errorCode: string | null;
 }
 
 export interface LoadDemoPayload {
-  /** Optional page owners (Atlassian account ids, at most 6), given out round robin; default: the caller. */
+  /**
+   * Optional page owners (Atlassian account ids, at most 6), given out round robin; default: the caller. Absent =
+   * keep the owners of the previous load; checked with users-bulk (active Atlassian accounts only).
+   */
   ownerAccountIds?: string[];
+  /** Try the failed owner changes again (also after `done`). */
+  retryOwners?: boolean;
+}
+
+export interface CheckDemoOwnersPayload {
+  ownerAccountIds: string[];
+}
+
+/** Owners looked up before loading, for the confirmation "These people will become owners of N demo pages". */
+export interface DemoOwnersCheck {
+  /** Names as the admin may see them (users-bulk); only when `errorCode` is null. */
+  owners: { accountId: string; name: string }[];
+  /** Demo pages given to these owners (every page but the source). */
+  pages: number;
+  /** Ids that are not active Atlassian accounts (only for `owner_invalid`; the ids the admin typed). */
+  invalidAccountIds: string[];
+  errorCode: 'not_allowed' | 'admin_check_failed' | 'admin_needs_auth' | 'invalid_owner_ids' | 'owner_invalid' | 'owner_check_failed' | null;
 }
 
 /** Resolver name → payload and success reply. Every resolver may also answer `ErrorReply`. */
@@ -532,6 +560,8 @@ export interface ResolverContract {
   getDemoStatus: { payload: undefined; reply: DemoStatus };
   /** Jira administrators only: creates (or resumes creating) the demo spaces and pages as the caller; idempotent. */
   loadDemoData: { payload: LoadDemoPayload; reply: DemoStatus };
+  /** Jira administrators only: names of the owners (active Atlassian accounts) before `loadDemoData`. */
+  checkDemoOwners: { payload: CheckDemoOwnersPayload; reply: DemoOwnersCheck };
   /** On the source page: the latest confirmed change (for the Rollout tab). */
   getLatestChange: { payload: undefined; reply: LatestChangeReply };
   getPendingChange: { payload: undefined; reply: PendingChangeReply };

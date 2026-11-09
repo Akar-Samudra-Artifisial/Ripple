@@ -1,10 +1,13 @@
 import { router } from '@forge/bridge';
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from 'react';
-import type { DemoStatus, SaveSettingsResult, SettingsView } from '../../src/core/views';
+import type { DemoOwnersCheck, DemoStatus, SaveSettingsResult, SettingsView } from '../../src/core/views';
 import { call } from './bridge';
 import { Alert, LoadingRows, errorOf } from './components';
 import { httpsUrl } from './links';
 import { mount } from './mount';
+
+/** The admin check needs the user's consent for Ripple in Jira (asUser), which has not been given yet. */
+const NEEDS_AUTH = "Couldn't check your Jira permissions. Open Ripple in Jira once to grant access, then try again.";
 
 /** Jira project keys: start with a letter, then uppercase letters, digits or underscores (Jira default 2–10). */
 const KEY_PATTERN = /^[A-Z][A-Z0-9_]{1,9}$/;
@@ -13,6 +16,7 @@ const SAVE_ERROR: Record<NonNullable<SaveSettingsResult['errorCode']>, string> =
   invalid_key: 'That is not a valid Jira project key. Use uppercase letters and digits, starting with a letter (for example OPS).',
   not_allowed: 'Only Jira administrators can change this setting.',
   admin_check_failed: "Couldn't check your Jira permissions. Try again in a moment.",
+  admin_needs_auth: NEEDS_AUTH,
   project_not_found: 'No Jira project with this key was found, or Ripple cannot see it.',
   jira_unavailable: 'Ripple is not installed in Jira on this site. Install it in Jira, then try again.',
   jira_error: 'Jira did not respond as expected. Try again in a moment.',
@@ -134,6 +138,8 @@ function Settings() {
               {saving ? 'Saving…' : 'Save'}
             </button>
           </div>
+        ) : view.adminCheck === 'needs_auth' ? (
+          <Alert message={`${NEEDS_AUTH} The setting is read-only for now.`} onRetry={() => void load()} />
         ) : view.adminCheck === 'check_failed' ? (
           <Alert message="Couldn't check your Jira permissions, so the setting is read-only for now. Try again in a moment." onRetry={() => void load()} />
         ) : (
@@ -150,9 +156,16 @@ function Settings() {
 const DEMO_ERROR: Record<string, string> = {
   not_allowed: 'Only Jira administrators can load demo data.',
   admin_check_failed: "Couldn't check your Jira permissions. Try again in a moment.",
+  admin_needs_auth: NEEDS_AUTH,
   invalid_owner_ids: 'Enter up to 6 Atlassian account IDs, separated by commas or new lines.',
-  owner_change_failed: 'Demo data loaded, but some pages could not be given to the other owners. You own those pages.',
+  owner_invalid: 'Every owner must be an active Atlassian account you can see. Check the account IDs and try again.',
+  owner_check_failed: "Couldn't look up the owners. Try again in a moment.",
+  owner_change_failed: 'Demo data loaded, but some pages could not be given to the other owners. You own those pages for now.',
+  space_key_taken:
+    'A space with one of the demo keys (NLHR, NLONB, NLFIN, NLSALES, NLHELP) already exists and was not created by Ripple, so Ripple left it alone. Rename or delete that space to load the demo data.',
 };
+
+const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 function demoErrorText(code: string): string {
   if (DEMO_ERROR[code]) return DEMO_ERROR[code];
@@ -188,6 +201,8 @@ function DemoData() {
   const [owners, setOwners] = useState('');
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState<string>();
+  /** Owners looked up and waiting for the admin's confirmation. */
+  const [confirm, setConfirm] = useState<{ ids: string[]; check: DemoOwnersCheck }>();
   const id = useId();
 
   const refresh = useCallback(async () => {
@@ -202,6 +217,30 @@ function DemoData() {
     void refresh();
   }, [refresh]);
 
+  /** Calls `loadDemoData` until it is no longer `loading` (each call works within a time budget). */
+  const run = async (payload: { ownerAccountIds?: string[]; retryOwners?: boolean }) => {
+    setProblem(undefined);
+    setConfirm(undefined);
+    setBusy(true);
+    try {
+      let s = await call<DemoStatus>('loadDemoData', payload);
+      setStatus(s);
+      // Later calls keep the owners already saved (no `ownerAccountIds`): only the retry flag carries over.
+      const next: { retryOwners?: boolean } = payload.retryOwners ? { retryOwners: true } : {};
+      for (let i = 0; s.state === 'loading' && i < 10; i++) {
+        const before = s.step;
+        s = await call<DemoStatus>('loadDemoData', next);
+        setStatus(s);
+        // Another load holds the lock: wait a moment instead of asking again at once.
+        if (s.state === 'loading' && s.step === before) await pause(2000);
+      }
+    } catch (e) {
+      setProblem(`Loading stopped. ${errorOf(e)} Press the button again to continue.`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const start = async () => {
     if (busy) return;
     const ids = owners
@@ -212,17 +251,20 @@ function DemoData() {
       setProblem(DEMO_ERROR.invalid_owner_ids);
       return;
     }
+    // Empty input: keep the owners chosen before (or the admin owns every page).
+    if (ids.length === 0) return run({});
     setProblem(undefined);
     setBusy(true);
     try {
-      let s = await call<DemoStatus>('loadDemoData', { ownerAccountIds: ids });
-      setStatus(s);
-      for (let i = 0; s.state === 'loading' && i < 10; i++) {
-        s = await call<DemoStatus>('loadDemoData', {});
-        setStatus(s);
+      const check = await call<DemoOwnersCheck>('checkDemoOwners', { ownerAccountIds: ids });
+      if (check.errorCode) {
+        const which = check.invalidAccountIds.length ? ` Not usable: ${check.invalidAccountIds.join(', ')}.` : '';
+        setProblem(`${demoErrorText(check.errorCode)}${which}`);
+      } else {
+        setConfirm({ ids, check });
       }
     } catch (e) {
-      setProblem(`Loading stopped. ${errorOf(e)} Press the button again to continue.`);
+      setProblem(`Couldn't look up the owners. ${errorOf(e)}`);
     } finally {
       setBusy(false);
     }
@@ -256,18 +298,46 @@ function DemoData() {
               onChange={(e) => {
                 setOwners(e.target.value);
                 setProblem(undefined);
+                setConfirm(undefined);
               }}
             />
           </label>
           <p id={`${id}-owners-help`} className="muted source__meta">
-            Copy pages are shared among these accounts. Leave empty to own every page yourself.
+            Copy pages are shared among these accounts. Leave empty to keep the owners chosen before (or own every page yourself).
           </p>
-          <div className="actions">
-            <button type="button" className="button button--primary" disabled={busy} aria-busy={busy} onClick={() => void start()}>
-              {busy ? 'Loading…' : status.state === 'idle' ? 'Load demo data' : 'Continue loading'}
-            </button>
-          </div>
+          {confirm ? (
+            <div className="settings__confirm" role="group" aria-labelledby={`${id}-confirm`}>
+              <p id={`${id}-confirm`}>
+                These people will become owners of {confirm.check.pages} demo pages:
+              </p>
+              <ul>
+                {confirm.check.owners.map((o) => (
+                  <li key={o.accountId}>{o.name}</li>
+                ))}
+              </ul>
+              <div className="actions">
+                <button type="button" className="button button--primary" disabled={busy} onClick={() => void run({ ownerAccountIds: confirm.ids })}>
+                  Load demo data
+                </button>
+                <button type="button" className="button" disabled={busy} onClick={() => setConfirm(undefined)}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="actions">
+              <button type="button" className="button button--primary" disabled={busy} aria-busy={busy} onClick={() => void start()}>
+                {busy ? 'Loading…' : status.state === 'idle' ? 'Load demo data' : 'Continue loading'}
+              </button>
+            </div>
+          )}
         </>
+      ) : status.canEdit && status.errorCode === 'owner_change_failed' ? (
+        <div className="actions">
+          <button type="button" className="button" disabled={busy} aria-busy={busy} onClick={() => void run({ retryOwners: true })}>
+            {busy ? 'Retrying…' : 'Retry owners'}
+          </button>
+        </div>
       ) : !status.canEdit ? (
         <p className="muted">Only Jira administrators can load demo data.</p>
       ) : null}

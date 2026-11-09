@@ -12,13 +12,21 @@ export interface DemoRef {
   url: string | null;
 }
 
+export interface DemoSpaceRef extends DemoRef {
+  /** Plain-text description ('' when none): tells a space Ripple created (`DEMO_MARKER`) from a foreign one. */
+  description: string;
+}
+
 export interface DemoConfluence {
-  findSpace(key: string): Promise<UserResult<DemoRef | null>>;
+  findSpace(key: string): Promise<UserResult<DemoSpaceRef | null>>;
   createSpace(key: string, name: string, description: string): Promise<UserResult<DemoRef>>;
   findPage(spaceId: string, title: string): Promise<UserResult<DemoRef | null>>;
   createPage(spaceId: string, title: string, storage: string): Promise<UserResult<DemoRef>>;
-  /** Hands the new page (version 1) to another owner by saving version 2 with the same title and body. */
-  setOwner(pageId: string, title: string, storage: string, ownerAccountId: string): Promise<UserResult<true>>;
+  /**
+   * Makes `ownerAccountId` the owner of the page: reads it (owner, title, current body, version) and, only when the
+   * owner differs, saves the next version with the same title and the body as read (so edits made meanwhile are kept).
+   */
+  ensureOwner(pageId: string, ownerAccountId: string): Promise<UserResult<true>>;
 }
 
 interface Links {
@@ -32,12 +40,16 @@ const link = (base: string | undefined, webui: string | undefined): string | nul
 
 export const demoConfluence: DemoConfluence = {
   async findSpace(key) {
-    const res = await api.asUser().requestConfluence(route`/wiki/api/v2/spaces?keys=${key}&limit=1`, { headers: json });
+    const res = await api.asUser().requestConfluence(route`/wiki/api/v2/spaces?keys=${key}&description-format=plain&limit=1`, { headers: json });
     if (!res.ok) return { ok: false, status: res.status };
-    const body = (await res.json()) as { results?: { id?: string | number; key?: string; _links?: Links }[]; _links?: Links };
+    const body = (await res.json()) as {
+      results?: { id?: string | number; key?: string; description?: { plain?: { value?: unknown } } | null; _links?: Links }[];
+      _links?: Links;
+    };
     const space = body.results?.find((s) => s.key === key);
     if (!space || space.id === undefined) return { ok: true, value: null };
-    return { ok: true, value: { id: String(space.id), url: link(body._links?.base, space._links?.webui) } };
+    const description = space.description?.plain?.value;
+    return { ok: true, value: { id: String(space.id), url: link(body._links?.base, space._links?.webui), description: typeof description === 'string' ? description : '' } };
   },
 
   async createSpace(key, name, description) {
@@ -73,17 +85,25 @@ export const demoConfluence: DemoConfluence = {
     return { ok: true, value: { id: String(page.id), url: link(page._links?.base, page._links?.webui) } };
   },
 
-  async setOwner(pageId, title, storage, ownerAccountId) {
-    const res = await api.asUser().requestConfluence(route`/wiki/api/v2/pages/${pageId}`, {
+  async ensureOwner(pageId, ownerAccountId) {
+    const user = api.asUser();
+    const got = await user.requestConfluence(route`/wiki/api/v2/pages/${pageId}?body-format=storage`, { headers: json });
+    if (!got.ok) return { ok: false, status: got.status };
+    const page = (await got.json()) as { ownerId?: unknown; title?: unknown; version?: { number?: unknown }; body?: { storage?: { value?: unknown } } };
+    if (page.ownerId === ownerAccountId) return { ok: true, value: true };
+    const version = page.version?.number;
+    const storage = page.body?.storage?.value;
+    if (typeof page.title !== 'string' || typeof version !== 'number' || typeof storage !== 'string') return { ok: false, status: 502 };
+    const res = await user.requestConfluence(route`/wiki/api/v2/pages/${pageId}`, {
       method: 'PUT',
       headers: send,
       body: JSON.stringify({
         id: pageId,
         status: 'current',
-        title,
+        title: page.title,
         ownerId: ownerAccountId,
         body: { representation: 'storage', value: storage },
-        version: { number: 2, message: 'Ripple demo data: page owner' },
+        version: { number: version + 1, message: 'Ripple demo data: page owner' },
       }),
     });
     return res.ok ? { ok: true, value: true } : { ok: false, status: res.status };

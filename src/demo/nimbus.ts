@@ -12,18 +12,25 @@
 export type NimbusFactKey = 'domestic' | 'international' | 'approval' | 'claims' | 'flight';
 export type NimbusSpaceKey = 'NLHR' | 'NLONB' | 'NLFIN' | 'NLSALES' | 'NLHELP';
 
+/**
+ * Fixed text in the description of every space the demo loader creates: an existing space with a demo key is reused
+ * only when its description carries it (or the load recorded the space), never a foreign space with the same key.
+ */
+export const DEMO_MARKER = 'Created by Ripple demo data';
+
 export interface NimbusSpace {
   key: NimbusSpaceKey;
   name: string;
+  /** Contains `DEMO_MARKER`. */
   description: string;
 }
 
 export const NIMBUS_SPACES: readonly NimbusSpace[] = [
-  { key: 'NLHR', name: 'Nimbus Labs HR', description: 'People Ops policies of Nimbus Labs (Ripple demo data).' },
-  { key: 'NLONB', name: 'Nimbus Labs Onboarding', description: 'Guides for new joiners at Nimbus Labs (Ripple demo data).' },
-  { key: 'NLFIN', name: 'Nimbus Labs Finance FAQ', description: 'Answers from the Nimbus Labs Finance team (Ripple demo data).' },
-  { key: 'NLSALES', name: 'Nimbus Labs Sales Playbook', description: 'How the Nimbus Labs sales team works (Ripple demo data).' },
-  { key: 'NLHELP', name: 'Nimbus Labs IT & HR Help Center', description: 'Knowledge base articles for Nimbus Labs employees (Ripple demo data).' },
+  { key: 'NLHR', name: 'Nimbus Labs HR', description: 'People Ops policies of Nimbus Labs. Created by Ripple demo data.' },
+  { key: 'NLONB', name: 'Nimbus Labs Onboarding', description: 'Guides for new joiners at Nimbus Labs. Created by Ripple demo data.' },
+  { key: 'NLFIN', name: 'Nimbus Labs Finance FAQ', description: 'Answers from the Nimbus Labs Finance team. Created by Ripple demo data.' },
+  { key: 'NLSALES', name: 'Nimbus Labs Sales Playbook', description: 'How the Nimbus Labs sales team works. Created by Ripple demo data.' },
+  { key: 'NLHELP', name: 'Nimbus Labs IT & HR Help Center', description: 'Knowledge base articles for Nimbus Labs employees. Created by Ripple demo data.' },
 ];
 
 /** What a careful judge reports for one sentence, and the copy status Ripple must store for it. */

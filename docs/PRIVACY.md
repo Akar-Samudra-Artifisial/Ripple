@@ -44,5 +44,8 @@ and an audit trail of who confirmed, approved or rejected what and when.
   its title, link and the facts of a source in such a space can appear in the Jira task. Pick a Jira project whose
   audience matches the Confluence spaces Ripple watches (people who can see the task can also see those spaces), or
   leave the Jira project empty.
+  A page whose parent is a folder (or another non-page) also counts as restricted: reading folders needs
+  `read:folder:confluence`, which Ripple does not request. Each check has a time budget; when it runs out the page
+  counts as restricted too.
 - **Teamwork Graph, read-only** (`read:graph:*`): page owners/contributors and the team linked to a space, used to
   route update tasks. Nothing is written to the graph.

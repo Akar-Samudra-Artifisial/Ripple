@@ -3,18 +3,36 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 /** Requests made through the mocked `@forge/api` (adapter test only). */
 const apiCalls: { path: string; method: string; body: unknown }[] = [];
 let apiReply: { status: number; body: unknown } = { status: 200, body: {} };
+/** Replies used first, in order, before `apiReply`. */
+const apiQueue: { status: number; body: unknown }[] = [];
 
 vi.mock('@forge/api', () => {
   const requestConfluence = async (path: string, init?: { method?: string; body?: string }) => {
     apiCalls.push({ path, method: init?.method ?? 'GET', body: init?.body ? JSON.parse(init.body) : undefined });
-    return { status: apiReply.status, ok: apiReply.status >= 200 && apiReply.status < 300, json: async () => apiReply.body };
+    const r = apiQueue.shift() ?? apiReply;
+    return { status: r.status, ok: r.status >= 200 && r.status < 300, json: async () => r.body };
   };
   return {
     default: { asApp: () => ({ requestConfluence }), asUser: () => ({ requestConfluence }) },
     route: (s: TemplateStringsArray, ...v: unknown[]) => s.reduce((acc, part, i) => acc + part + (i < v.length ? String(v[i]) : ''), ''),
   };
 });
-vi.mock('@forge/sql', () => ({ sql: {}, migrationRunner: {} }));
+/** Statements run through the mocked `@forge/sql` (repo test only); `sqlAffected` = affected rows of each. */
+const sqlCalls: { statement: string; params: unknown[] }[] = [];
+let sqlAffected = 1;
+vi.mock('@forge/sql', () => ({
+  migrationRunner: {},
+  sql: {
+    prepare: (statement: string) => ({
+      bindParams: (...params: unknown[]) => ({
+        execute: async () => {
+          sqlCalls.push({ statement, params });
+          return { rows: Object.assign([], { affectedRows: sqlAffected }) };
+        },
+      }),
+    }),
+  },
+}));
 vi.mock('@forge/llm', () => ({ chat: vi.fn(), ForgeLlmError: class extends Error {} }));
 vi.mock('@forge/events', () => ({
   Queue: class {
@@ -27,34 +45,45 @@ vi.mock('@forge/events', () => ({
 }));
 
 import { demoConfluence, type DemoConfluence } from '../src/adapters/demoConfluence';
-import type { DemoRepo, DemoState } from '../src/adapters/demoRepo';
+import { parseDemoState, sqlDemoRepo, type DemoRepo, type DemoState } from '../src/adapters/demoRepo';
+import type { UserAccount } from '../src/adapters/confluenceUsers';
 import type { UserResult } from '../src/adapters/confluence';
-import { NIMBUS_ALL_PAGES, NIMBUS_EXPECTED, NIMBUS_PAGES, NIMBUS_SOURCE, NIMBUS_SPACES, TRAP_FORBIDDEN, TRAP_SLUG } from '../src/demo/nimbus';
+import { DEMO_MARKER, NIMBUS_ALL_PAGES, NIMBUS_EXPECTED, NIMBUS_PAGES, NIMBUS_SOURCE, NIMBUS_SPACES, TRAP_FORBIDDEN, TRAP_SLUG } from '../src/demo/nimbus';
 import type { AdminCheck, DemoStatus, ErrorReply } from '../src/core/views';
-import { DEMO_TOTAL, getDemoStatus, loadDemoData, type DemoDeps } from '../src/surfaces/demo';
+import { checkDemoOwners, DEMO_LEASE_MS, DEMO_TOTAL, getDemoStatus, loadDemoData, type DemoDeps } from '../src/surfaces/demo';
 
 const CTX = { moduleKey: 'ripple-settings', accountId: '557058:admin-0000' };
 const OWNERS = ['557058:aaaa-1111', '557058:bbbb-2222', '5b10a2844c20165700ede21g'];
 
 /** In-memory Confluence: spaces by key, pages by space + title; counts every create. */
 class FakeConfluence implements DemoConfluence {
-  spaces = new Map<string, string>();
+  /** Space key → id and description. */
+  spaces = new Map<string, { id: string; description: string }>();
   pages = new Map<string, string>();
+  /** Page id → current owner (the admin for a new page). */
+  pageOwner = new Map<string, string>();
   creates = 0;
+  /** Owner changes actually made (a PUT). */
   owners: { pageId: string; owner: string }[] = [];
   failCreateSpace?: number;
   failOwner?: number;
+  /** Runs once right before `createSpace` (a concurrent load / someone else creating the key). */
+  beforeCreateSpace?: (key: string) => void;
   private next = 1000;
 
-  async findSpace(key: string): Promise<UserResult<{ id: string; url: string } | null>> {
-    const id = this.spaces.get(key);
-    return { ok: true, value: id ? { id, url: `https://x.atlassian.net/wiki/spaces/${key}` } : null };
+  async findSpace(key: string): Promise<UserResult<{ id: string; url: string; description: string } | null>> {
+    const sp = this.spaces.get(key);
+    return { ok: true, value: sp ? { id: sp.id, url: `https://x.atlassian.net/wiki/spaces/${key}`, description: sp.description } : null };
   }
-  async createSpace(key: string): Promise<UserResult<{ id: string; url: string }>> {
+  async createSpace(key: string, _name: string, description: string): Promise<UserResult<{ id: string; url: string }>> {
+    const hook = this.beforeCreateSpace;
+    this.beforeCreateSpace = undefined;
+    hook?.(key);
+    if (this.spaces.has(key)) return { ok: false, status: 400 };
     if (this.failCreateSpace) return { ok: false, status: this.failCreateSpace };
     this.creates++;
     const id = String(this.next++);
-    this.spaces.set(key, id);
+    this.spaces.set(key, { id, description });
     return { ok: true, value: { id, url: `https://x.atlassian.net/wiki/spaces/${key}` } };
   }
   async findPage(spaceId: string, title: string): Promise<UserResult<{ id: string; url: string } | null>> {
@@ -65,10 +94,13 @@ class FakeConfluence implements DemoConfluence {
     this.creates++;
     const id = String(this.next++);
     this.pages.set(`${spaceId}/${title}`, id);
+    this.pageOwner.set(id, CTX.accountId);
     return { ok: true, value: { id, url: `https://x.atlassian.net/wiki/pages/${id}` } };
   }
-  async setOwner(pageId: string, _title: string, _storage: string, owner: string): Promise<UserResult<true>> {
+  async ensureOwner(pageId: string, owner: string): Promise<UserResult<true>> {
+    if (this.pageOwner.get(pageId) === owner) return { ok: true, value: true };
     if (this.failOwner) return { ok: false, status: this.failOwner };
+    this.pageOwner.set(pageId, owner);
     this.owners.push({ pageId, owner });
     return { ok: true, value: true };
   }
@@ -81,10 +113,31 @@ let clock: number;
 /** Milliseconds every Confluence call advances the clock (for the budget). */
 let tick: number;
 
+/** Every write that reached the store. */
+let writes: number;
+/** Runs before each CAS write (to simulate another load or a crash). */
+let beforeWrite: ((s: DemoState) => void) | undefined;
+/** Accounts users-bulk knows; `usersFail` makes the lookup throw. */
+let accounts: Map<string, UserAccount>;
+let usersFail: boolean;
+let usersCalls: string[][];
+const active = (name: string): UserAccount => ({ name, accountType: 'atlassian', accountStatus: 'active' });
+
+const copy = (s: DemoState): DemoState => JSON.parse(JSON.stringify(s)) as DemoState;
 const repo: DemoRepo = {
-  getDemoState: async () => (stored ? (JSON.parse(JSON.stringify(stored)) as DemoState) : undefined),
-  saveDemoState: async (s) => {
-    stored = JSON.parse(JSON.stringify(s)) as DemoState;
+  getDemoState: async () => (stored ? copy(stored) : undefined),
+  createDemoState: async (s) => {
+    if (stored) return false;
+    writes++;
+    stored = copy(s);
+    return true;
+  },
+  replaceDemoState: async (s, expected) => {
+    beforeWrite?.(s);
+    if (!stored || stored.lease !== expected) return false;
+    writes++;
+    stored = copy(s);
+    return true;
   },
 };
 
@@ -99,10 +152,24 @@ function deps(): DemoDeps {
       };
     },
   });
-  return { confluence: timed, repo, admin: async () => admin, ensure: async () => undefined, now: () => clock, budgetMs: 18_000 };
+  let lease = 0;
+  return {
+    confluence: timed,
+    repo,
+    admin: async () => admin,
+    users: async (ids) => {
+      usersCalls.push([...ids]);
+      if (usersFail) throw new Error('Confluence users-bulk failed: HTTP 503');
+      return new Map([...accounts].filter(([id]) => ids.includes(id)));
+    },
+    ensure: async () => undefined,
+    now: () => clock,
+    newLease: () => `lease-${++lease}`,
+    budgetMs: 18_000,
+  };
 }
 
-const ok = (r: DemoStatus | ErrorReply): DemoStatus => {
+const ok = <T extends object>(r: T | ErrorReply): T => {
   if ('error' in r) throw new Error(r.error);
   return r;
 };
@@ -114,6 +181,14 @@ beforeEach(() => {
   clock = 0;
   tick = 0;
   apiCalls.length = 0;
+  apiQueue.length = 0;
+  sqlCalls.length = 0;
+  sqlAffected = 1;
+  writes = 0;
+  beforeWrite = undefined;
+  accounts = new Map(OWNERS.map((id, i) => [id, active(`Owner ${i}`)]));
+  usersFail = false;
+  usersCalls = [];
   vi.spyOn(console, 'info').mockImplementation(() => undefined);
   vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 });
@@ -159,6 +234,10 @@ describe('getDemoStatus / loadDemoData', () => {
     expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'idle', canEdit: false, errorCode: 'not_allowed' });
     admin = 'check_failed';
     expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'idle', canEdit: false, errorCode: 'admin_check_failed' });
+    admin = 'needs_auth';
+    expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'idle', canEdit: false, errorCode: 'admin_needs_auth' });
+    expect(ok(await checkDemoOwners(CTX, { ownerAccountIds: OWNERS }, deps()))).toMatchObject({ errorCode: 'admin_needs_auth', owners: [] });
+    expect(usersCalls).toEqual([]);
     expect(conf.creates).toBe(0);
     expect(stored).toBeUndefined();
     expect(await loadDemoData({ ...CTX, moduleKey: 'ripple-byline' }, {}, deps())).toEqual({ error: 'Open Ripple settings to do that.' });
@@ -217,9 +296,148 @@ describe('getDemoStatus / loadDemoData', () => {
     conf.failOwner = 403;
     const s = ok(await loadDemoData(CTX, { ownerAccountIds: OWNERS }, deps()));
     expect(s).toMatchObject({ state: 'done', step: DEMO_TOTAL, errorCode: 'owner_change_failed' });
-    expect(stored?.ownerErrors).toBe(NIMBUS_PAGES.length);
-    expect(Object.values(stored?.pages ?? {}).filter((p) => p.ownerFailed)).toHaveLength(NIMBUS_PAGES.length);
+    expect(Object.values(stored?.pages ?? {}).filter((p) => p.ownerState === 'failed')).toHaveLength(NIMBUS_PAGES.length);
     expect(console.warn).toHaveBeenCalledWith('ripple demo: page owner change failed', expect.objectContaining({ error: 'owner_http_403' }));
+    const logged = JSON.stringify([vi.mocked(console.warn).mock.calls, vi.mocked(console.info).mock.calls]);
+    for (const id of OWNERS) expect(logged).not.toContain(id);
+  });
+
+  it('never uses a foreign space with a demo key; a marked space (or a race that made one) is reused', async () => {
+    conf.spaces.set('NLHR', { id: '5', description: 'HR team space' });
+    expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'failed', step: 0, errorCode: 'space_key_taken' });
+    expect(conf.creates).toBe(0);
+    expect(stored?.spaces).toEqual({});
+    // Created by an earlier load whose state was lost: the marker says it is ours.
+    conf.spaces.set('NLHR', { id: '5', description: `People Ops. ${DEMO_MARKER}.` });
+    expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'done', errorCode: null });
+    expect(stored?.spaces.NLHR?.id).toBe('5');
+    // Every space Ripple creates carries the marker.
+    for (const s of NIMBUS_SPACES) expect(s.description).toContain(DEMO_MARKER);
+  });
+
+  it('a create that fails because the key appeared meanwhile follows the same marker rule', async () => {
+    conf.beforeCreateSpace = (key) => conf.spaces.set(key, { id: '7', description: 'someone else' });
+    expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'failed', errorCode: 'space_key_taken' });
+    conf.spaces.clear();
+    stored = undefined;
+    conf.beforeCreateSpace = (key) => conf.spaces.set(key, { id: '8', description: DEMO_MARKER });
+    expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'done', errorCode: null });
+    expect((stored as DemoState | undefined)?.spaces.NLHR?.id).toBe('8');
+  });
+
+  it('a second call while another load holds the lease answers loading and writes nothing', async () => {
+    clock = 1_000;
+    stored = { state: 'loading', spaces: {}, pages: {}, ownerAccountIds: [], errorCode: null, lease: 'other', lockedUntil: clock + 10_000, rev: 4 };
+    expect(ok(await loadDemoData(CTX, { ownerAccountIds: OWNERS, retryOwners: true }, deps()))).toMatchObject({ state: 'loading', errorCode: null });
+    expect(ok(await getDemoStatus(CTX, deps()))).toMatchObject({ state: 'loading' });
+    expect(writes).toBe(0);
+    expect(conf.creates).toBe(0);
+    expect(usersCalls).toEqual([]);
+    // The lease expires (the other load crashed): this load takes it over.
+    clock += DEMO_LEASE_MS;
+    expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'done' });
+    expect(stored).toMatchObject({ lease: '', lockedUntil: 0 });
+  });
+
+  it('a load whose lease was taken over stops at its next save', async () => {
+    let n = 0;
+    beforeWrite = () => {
+      if (++n === 4 && stored) stored.lease = 'thief';
+    };
+    expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'loading' });
+    expect(stored?.lease).toBe('thief');
+    // The first insert and three space saves; the fourth save found another lease.
+    expect(writes).toBe(4);
+    // The fourth space was created but not recorded; the next load finds it by its marker.
+    expect(conf.creates).toBe(4);
+    expect(Object.keys(stored?.spaces ?? {})).toHaveLength(3);
+  });
+
+  it('two loads racing for a free state: only one inserts it', async () => {
+    const first = repo.createDemoState;
+    repo.createDemoState = async (s) => {
+      stored = { ...s, lease: 'winner', lockedUntil: clock + 10_000 };
+      return false;
+    };
+    try {
+      expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'loading' });
+      expect(conf.creates).toBe(0);
+    } finally {
+      repo.createDemoState = first;
+    }
+  });
+
+  it('a page is saved as pending before its owner change; a crash in between is resumed', async () => {
+    const real = conf.ensureOwner.bind(conf);
+    conf.ensureOwner = async () => {
+      throw new Error('runtime killed');
+    };
+    expect(await loadDemoData(CTX, { ownerAccountIds: OWNERS }, deps())).toEqual({ error: 'Ripple could not load the demo data.' });
+    const first = NIMBUS_PAGES[0];
+    expect(stored?.pages[first?.slug ?? '']).toMatchObject({ owner: OWNERS[0], ownerState: 'pending' });
+    conf.ensureOwner = real;
+    // The crashed load still holds the lease until it expires.
+    expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'loading' });
+    clock += DEMO_LEASE_MS;
+    expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'done', errorCode: null });
+    expect(conf.creates).toBe(DEMO_TOTAL);
+    expect(conf.owners).toHaveLength(NIMBUS_PAGES.length);
+    expect(Object.values(stored?.pages ?? {}).filter((p) => p.ownerState === 'done')).toHaveLength(NIMBUS_PAGES.length);
+  });
+
+  it('found pages get their slot owner when the owner differs (checked, not assumed)', async () => {
+    ok(await loadDemoData(CTX, {}, deps()));
+    expect(conf.owners).toEqual([]);
+    stored = undefined;
+    const someone = NIMBUS_PAGES[1];
+    ok(await loadDemoData(CTX, { ownerAccountIds: OWNERS }, deps()));
+    expect(conf.creates).toBe(DEMO_TOTAL);
+    expect(conf.owners).toHaveLength(NIMBUS_PAGES.length);
+    // A page already owned by its slot is left alone.
+    const id = (stored as DemoState | undefined)?.pages[someone?.slug ?? '']?.id ?? '';
+    conf.owners.length = 0;
+    stored = undefined;
+    conf.pageOwner.set(id, 'someone-else');
+    ok(await loadDemoData(CTX, { ownerAccountIds: OWNERS }, deps()));
+    expect(conf.owners).toEqual([{ pageId: id, owner: OWNERS[1] }]);
+  });
+
+  it('absent owners keep the earlier choice; retryOwners retries failed owner changes after done', async () => {
+    tick = 1_000;
+    expect(ok(await loadDemoData(CTX, { ownerAccountIds: OWNERS }, deps())).state).toBe('loading');
+    clock = 0;
+    tick = 0;
+    conf.failOwner = 403;
+    expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'done', errorCode: 'owner_change_failed' });
+    expect(stored?.ownerAccountIds).toEqual(OWNERS);
+    const ok1 = conf.owners.length;
+    // Done: a plain press changes nothing.
+    const w = writes;
+    ok(await loadDemoData(CTX, {}, deps()));
+    expect(writes).toBe(w);
+    conf.failOwner = undefined;
+    expect(ok(await loadDemoData(CTX, { retryOwners: true }, deps()))).toMatchObject({ state: 'done', errorCode: null });
+    expect(conf.owners.length).toBe(NIMBUS_PAGES.length);
+    expect(conf.owners.length).toBeGreaterThan(ok1);
+    expect(conf.owners.map((o) => o.owner).sort()).toEqual(NIMBUS_PAGES.map((_, i) => OWNERS[i % OWNERS.length]).sort());
+  });
+
+  it('owners must be active Atlassian accounts (users-bulk); account ids are never logged', async () => {
+    const [a, b, c] = OWNERS as [string, string, string];
+    accounts.set(b, { name: 'Bot', accountType: 'app', accountStatus: 'active' });
+    accounts.set(c, { name: 'Gone', accountType: 'atlassian', accountStatus: 'inactive' });
+    expect(ok(await loadDemoData(CTX, { ownerAccountIds: OWNERS }, deps()))).toMatchObject({ state: 'idle', errorCode: 'owner_invalid' });
+    accounts.delete(c);
+    expect(ok(await checkDemoOwners(CTX, { ownerAccountIds: [a, c] }, deps()))).toEqual({ owners: [], pages: NIMBUS_PAGES.length, invalidAccountIds: [c], errorCode: 'owner_invalid' });
+    usersFail = true;
+    expect(ok(await loadDemoData(CTX, { ownerAccountIds: [a] }, deps()))).toMatchObject({ errorCode: 'owner_check_failed' });
+    expect(conf.creates).toBe(0);
+    expect(writes).toBe(0);
+    usersFail = false;
+    expect(ok(await checkDemoOwners(CTX, { ownerAccountIds: [a] }, deps()))).toEqual({ owners: [{ accountId: a, name: 'Owner 0' }], pages: NIMBUS_PAGES.length, invalidAccountIds: [], errorCode: null });
+    expect(ok(await checkDemoOwners(CTX, { ownerAccountIds: Array.from({ length: 7 }, (_, i) => `557058:user-${i}000`) }, deps()))).toMatchObject({ errorCode: 'invalid_owner_ids' });
+    admin = 'not_admin';
+    expect(ok(await checkDemoOwners(CTX, { ownerAccountIds: [a] }, deps()))).toMatchObject({ errorCode: 'not_allowed' });
     const logged = JSON.stringify([vi.mocked(console.warn).mock.calls, vi.mocked(console.info).mock.calls]);
     for (const id of OWNERS) expect(logged).not.toContain(id);
   });
@@ -237,8 +455,40 @@ describe('demoConfluence adapter', () => {
     apiReply = { status: 200, body: { id: 77, _links: { base: 'https://x.atlassian.net/wiki', webui: '/spaces/NLHR' } } };
     expect(await demoConfluence.createSpace('NLHR', 'Nimbus Labs HR', 'd')).toEqual({ ok: true, value: { id: '77', url: 'https://x.atlassian.net/wiki/spaces/NLHR' } });
     expect(apiCalls[0]).toMatchObject({ path: '/wiki/rest/api/space', method: 'POST', body: { key: 'NLHR', name: 'Nimbus Labs HR' } });
+    expect(apiCalls[0]?.body).toMatchObject({ description: { plain: { value: 'd' } } });
+    // The owner change reads the page first and saves the body as read (an edit made meanwhile is kept).
+    apiQueue.push({ status: 200, body: { ownerId: CTX.accountId, title: 'T', version: { number: 3 }, body: { storage: { value: '<p>edited</p>' } } } });
     apiReply = { status: 403, body: { message: 'secret' } };
-    expect(await demoConfluence.setOwner('9001', 'T', '<p>x</p>', OWNERS[0] ?? '')).toEqual({ ok: false, status: 403 });
-    expect(apiCalls[1]).toMatchObject({ path: '/wiki/api/v2/pages/9001', method: 'PUT', body: { ownerId: OWNERS[0], title: 'T', version: { number: 2 } } });
+    expect(await demoConfluence.ensureOwner('9001', OWNERS[0] ?? '')).toEqual({ ok: false, status: 403 });
+    expect(apiCalls[1]).toMatchObject({ path: '/wiki/api/v2/pages/9001?body-format=storage', method: 'GET' });
+    expect(apiCalls[2]).toMatchObject({ path: '/wiki/api/v2/pages/9001', method: 'PUT', body: { ownerId: OWNERS[0], title: 'T', version: { number: 4 }, body: { value: '<p>edited</p>' } } });
+    // Already the owner: no write.
+    apiQueue.push({ status: 200, body: { ownerId: OWNERS[0], title: 'T', version: { number: 4 }, body: { storage: { value: 'x' } } } });
+    expect(await demoConfluence.ensureOwner('9001', OWNERS[0] ?? '')).toEqual({ ok: true, value: true });
+    expect(apiCalls).toHaveLength(4);
+  });
+
+  it('finds a space by key with its plain description (the demo marker)', async () => {
+    apiReply = { status: 200, body: { results: [{ id: 5, key: 'NLHR', description: { plain: { value: `x ${DEMO_MARKER}` } }, _links: { webui: '/spaces/NLHR' } }], _links: { base: 'https://x.atlassian.net/wiki' } } };
+    expect(await demoConfluence.findSpace('NLHR')).toEqual({ ok: true, value: { id: '5', url: 'https://x.atlassian.net/wiki/spaces/NLHR', description: `x ${DEMO_MARKER}` } });
+    expect(apiCalls[0]?.path).toBe('/wiki/api/v2/spaces?keys=NLHR&description-format=plain&limit=1');
+  });
+});
+
+describe('sqlDemoRepo', () => {
+  it('takes and checks the lease with compare-and-swap on $.lease (never the JSON text)', async () => {
+    const state = { state: 'loading', spaces: {}, pages: {}, ownerAccountIds: [], errorCode: null, lease: 'lease-2', lockedUntil: 5, rev: 3 } as DemoState;
+    expect(await sqlDemoRepo.replaceDemoState(state, 'lease-1')).toBe(true);
+    expect(sqlCalls[0]?.statement).toBe("UPDATE settings SET v = ? WHERE k = ? AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(v, '$.lease')), '') = ?");
+    expect(sqlCalls[0]?.params).toEqual([JSON.stringify(state), 'demo', 'lease-1']);
+    sqlAffected = 0;
+    expect(await sqlDemoRepo.replaceDemoState(state, 'lease-1')).toBe(false);
+    expect(await sqlDemoRepo.createDemoState(state)).toBe(false);
+    expect(sqlCalls[2]?.statement).toBe('INSERT IGNORE INTO settings (k, v) VALUES (?, ?)');
+  });
+
+  it('reads M6 rows: ownerFailed becomes a failed owner state, no lease = free', () => {
+    const s = parseDemoState({ state: 'done', spaces: {}, pages: { a: { id: '1', url: null, ownerFailed: true }, b: { id: '2', url: 'u' } }, ownerAccountIds: ['x'], errorCode: null, ownerErrors: 1 });
+    expect(s).toEqual({ state: 'done', spaces: {}, pages: { a: { id: '1', url: null, ownerState: 'failed' }, b: { id: '2', url: 'u' } }, ownerAccountIds: ['x'], errorCode: null, lease: '', lockedUntil: 0, rev: 0 });
   });
 });

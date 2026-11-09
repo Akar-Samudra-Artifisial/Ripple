@@ -1,30 +1,40 @@
 /**
  * M6 "Load demo data" (Ripple settings page, Jira administrators only): creates the Nimbus Labs spaces and pages of
  * `src/demo/nimbus.ts` as the caller. Loads in steps within a time budget per resolver call and keeps its progress in
- * the `settings` table, so the UI calls again until `done`, and a repeated or concurrent load finds what exists
- * (spaces by key, pages by title) instead of creating it twice. Logs carry ids, counts and enums only.
+ * the `settings` table, so the UI calls again until `done`, and a repeated load finds what it created before (spaces
+ * by key carrying `DEMO_MARKER`, pages by title in those spaces) instead of creating it twice. A space with a demo key
+ * that Ripple did not create is never used (`space_key_taken`). One load runs at a time (a lease in the state, taken
+ * and checked with compare-and-swap). Logs carry ids, counts and enums only (never account ids).
  */
-import { demoConfluence, type DemoConfluence, type DemoRef } from '../adapters/demoConfluence';
-import { sqlDemoRepo, type DemoRepo, type DemoState } from '../adapters/demoRepo';
+import { randomUUID } from 'node:crypto';
+import { userAccounts, type UserAccount } from '../adapters/confluenceUsers';
+import { demoConfluence, type DemoConfluence, type DemoRef, type DemoSpaceRef } from '../adapters/demoConfluence';
+import { sqlDemoRepo, type DemoPage, type DemoRepo, type DemoState } from '../adapters/demoRepo';
 import { scrubErrorText } from '../adapters/teamworkGraph';
-import { NIMBUS_ALL_PAGES, NIMBUS_SOURCE, NIMBUS_SPACES, type NimbusPage, type NimbusSpace } from '../demo/nimbus';
+import { DEMO_MARKER, NIMBUS_ALL_PAGES, NIMBUS_SOURCE, NIMBUS_SPACES, type NimbusPage, type NimbusSpace } from '../demo/nimbus';
 import { SchemaSettingUpError } from '../core/schema';
-import type { AdminCheck, DemoStatus, ErrorReply, LoadDemoPayload } from '../core/views';
+import { adminErrorCode, type AdminCheck, type CheckDemoOwnersPayload, type DemoOwnersCheck, type DemoStatus, type ErrorReply, type LoadDemoPayload } from '../core/views';
 import { adminCheck, defaultSettingsDeps, SETTINGS_MODULE, type SettingsContext } from './changeIssues';
 
 /** Time one `loadDemoData` call may spend before it returns `loading` (resolvers time out at 25 s). */
 export const DEMO_BUDGET_MS = 18_000;
+/** How long a load holds the lease: at least a resolver's 25 s timeout, so a crashed load frees it after that. */
+export const DEMO_LEASE_MS = 25_000;
 export const MAX_DEMO_OWNERS = 6;
 /** Atlassian account ids (`557058:<uuid>`, 24 hex digits, …): letters, digits, `:` and `-` only. */
 const ACCOUNT_ID = /^[A-Za-z0-9][A-Za-z0-9:-]{5,127}$/;
 export const DEMO_TOTAL = NIMBUS_SPACES.length + NIMBUS_ALL_PAGES.length;
+const OWNED_PAGES = NIMBUS_ALL_PAGES.filter((p) => p.kind !== 'source');
 
 export interface DemoDeps {
   confluence: DemoConfluence;
   repo: DemoRepo;
   admin: (ctx: SettingsContext) => Promise<AdminCheck>;
+  /** users-bulk as the caller; throws when the lookup fails. */
+  users: (accountIds: readonly string[]) => Promise<Map<string, UserAccount>>;
   ensure: () => Promise<void>;
   now: () => number;
+  newLease: () => string;
   budgetMs: number;
 }
 
@@ -32,26 +42,31 @@ const defaultDemoDeps: DemoDeps = {
   confluence: demoConfluence,
   repo: sqlDemoRepo,
   admin: (ctx) => adminCheck(ctx, defaultSettingsDeps),
+  users: (ids) => userAccounts(ids),
   ensure: defaultSettingsDeps.ensure,
   now: () => Date.now(),
+  newLease: () => randomUUID(),
   budgetMs: DEMO_BUDGET_MS,
 };
 
-function statusOf(state: DemoState | undefined, canEdit: boolean, errorCode: string | null = null): DemoStatus {
+const ownerErrors = (state: DemoState | undefined): number => Object.values(state?.pages ?? {}).filter((p) => p.ownerState === 'failed').length;
+
+/** `busy`: another load holds the lease (reported as `loading`). */
+function statusOf(state: DemoState | undefined, canEdit: boolean, errorCode: string | null = null, busy = false): DemoStatus {
   const step = state ? Object.keys(state.spaces).length + Object.keys(state.pages).length : 0;
-  const ownerCode = state?.state === 'done' && state.ownerErrors > 0 ? 'owner_change_failed' : null;
+  const ownerCode = state?.state === 'done' && ownerErrors(state) > 0 ? 'owner_change_failed' : null;
   return {
-    state: state?.state ?? 'idle',
+    state: busy ? 'loading' : (state?.state ?? 'idle'),
     step: Math.min(step, DEMO_TOTAL),
     total: DEMO_TOTAL,
     spaces: NIMBUS_SPACES.filter((s) => state?.spaces[s.key]).map((s) => ({ key: s.key, name: s.name, url: state?.spaces[s.key]?.url ?? null })),
     sourcePageUrl: state?.pages[NIMBUS_SOURCE.slug]?.url ?? null,
     canEdit,
-    errorCode: errorCode ?? state?.errorCode ?? ownerCode,
+    errorCode: errorCode ?? (busy ? null : (state?.errorCode ?? ownerCode)),
   };
 }
 
-async function guard(ctx: SettingsContext, deps: DemoDeps, what: string, body: () => Promise<DemoStatus>): Promise<DemoStatus | ErrorReply> {
+async function guard<T>(ctx: SettingsContext, deps: DemoDeps, what: string, body: () => Promise<T>): Promise<T | ErrorReply> {
   if (ctx.moduleKey !== SETTINGS_MODULE) return { error: 'Open Ripple settings to do that.' };
   try {
     await deps.ensure();
@@ -66,13 +81,13 @@ async function guard(ctx: SettingsContext, deps: DemoDeps, what: string, body: (
 export async function getDemoStatus(ctx: SettingsContext, deps: DemoDeps = defaultDemoDeps): Promise<DemoStatus | ErrorReply> {
   return guard(ctx, deps, 'read the demo data status', async () => {
     const state = await deps.repo.getDemoState();
-    return statusOf(state, (await deps.admin(ctx)) === 'admin');
+    const busy = state !== undefined && state.lease !== '' && state.lockedUntil > deps.now();
+    return statusOf(state, (await deps.admin(ctx)) === 'admin', null, busy);
   });
 }
 
 /** Owner ids from the payload: undefined when absent, null when invalid (not an array, > 6, bad format). */
-function ownerIds(payload: Partial<LoadDemoPayload> | undefined): string[] | undefined | null {
-  const raw = payload?.ownerAccountIds;
+function ownerIds(raw: unknown): string[] | undefined | null {
   if (raw === undefined || raw === null) return undefined;
   if (!Array.isArray(raw) || raw.length > MAX_DEMO_OWNERS) return null;
   const ids = raw.map((x: unknown) => (typeof x === 'string' ? x.trim() : null));
@@ -80,94 +95,176 @@ function ownerIds(payload: Partial<LoadDemoPayload> | undefined): string[] | und
   return [...new Set(ids.filter((x): x is string => !!x))];
 }
 
+type OwnersResult = { ok: true; accounts: Map<string, UserAccount> } | { ok: false; code: 'owner_invalid' | 'owner_check_failed'; invalid: string[] };
+
+/** Every owner must be an active Atlassian (human) account the caller can see; logs counts only. */
+async function validateOwners(deps: DemoDeps, ids: string[]): Promise<OwnersResult> {
+  if (ids.length === 0) return { ok: true, accounts: new Map() };
+  let accounts: Map<string, UserAccount>;
+  try {
+    accounts = await deps.users(ids);
+  } catch (err) {
+    const status = /HTTP (\d{3})/.exec(err instanceof Error ? err.message : '')?.[1];
+    console.warn('ripple demo: owner check failed', { error: status ? `users_http_${status}` : 'error', owners: ids.length });
+    return { ok: false, code: 'owner_check_failed', invalid: [] };
+  }
+  const invalid = ids.filter((id) => {
+    const a = accounts.get(id);
+    return a?.accountType !== 'atlassian' || a.accountStatus !== 'active';
+  });
+  if (invalid.length > 0) {
+    console.info('ripple demo: owners rejected', { owners: ids.length, invalid: invalid.length });
+    return { ok: false, code: 'owner_invalid', invalid };
+  }
+  return { ok: true, accounts };
+}
+
+/** Looks the owners up for the UI's confirmation step; writes nothing. */
+export async function checkDemoOwners(ctx: SettingsContext, payload: Partial<CheckDemoOwnersPayload> | undefined, deps: DemoDeps = defaultDemoDeps): Promise<DemoOwnersCheck | ErrorReply> {
+  return guard(ctx, deps, 'check the owners', async () => {
+    const reply = (errorCode: DemoOwnersCheck['errorCode'], invalidAccountIds: string[] = []): DemoOwnersCheck => ({ owners: [], pages: OWNED_PAGES.length, invalidAccountIds, errorCode });
+    const admin = await deps.admin(ctx);
+    if (admin !== 'admin') return reply(adminErrorCode(admin));
+    const ids = ownerIds(payload?.ownerAccountIds);
+    if (!ids) return reply('invalid_owner_ids');
+    const v = await validateOwners(deps, ids);
+    if (!v.ok) return reply(v.code, v.invalid);
+    return { owners: ids.map((accountId) => ({ accountId, name: v.accounts.get(accountId)?.name || 'Unnamed user' })), pages: OWNED_PAGES.length, invalidAccountIds: [], errorCode: null };
+  });
+}
+
 type Step<T> = { ok: true; value: T } | { ok: false; code: string };
 
-/** Finds the space by key, else creates it; a failed create is looked up again (a concurrent load made it). */
+const ours = (s: DemoSpaceRef): Step<DemoRef> => (s.description.includes(DEMO_MARKER) ? { ok: true, value: { id: s.id, url: s.url } } : { ok: false, code: 'space_key_taken' });
+
+/**
+ * Finds the space by key, else creates it (its description carries `DEMO_MARKER`); a failed create is looked up again
+ * (a concurrent load made it). A found space without the marker belongs to someone else: `space_key_taken`.
+ */
 async function ensureSpace(c: DemoConfluence, s: NimbusSpace): Promise<Step<DemoRef>> {
   const found = await c.findSpace(s.key);
   if (!found.ok) return { ok: false, code: `space_find_http_${found.status}` };
-  if (found.value) return { ok: true, value: found.value };
+  if (found.value) return ours(found.value);
   const created = await c.createSpace(s.key, s.name, s.description);
   if (created.ok) return { ok: true, value: created.value };
   const again = await c.findSpace(s.key);
-  return again.ok && again.value ? { ok: true, value: again.value } : { ok: false, code: `space_create_http_${created.status}` };
+  return again.ok && again.value ? ours(again.value) : { ok: false, code: `space_create_http_${created.status}` };
 }
 
-async function ensurePage(c: DemoConfluence, spaceId: string, p: NimbusPage): Promise<Step<{ ref: DemoRef; created: boolean }>> {
+/** Pages are only looked up in spaces Ripple created (recorded or marked), so a found page is a demo page. */
+async function ensurePage(c: DemoConfluence, spaceId: string, p: NimbusPage): Promise<Step<DemoRef>> {
   const found = await c.findPage(spaceId, p.title);
   if (!found.ok) return { ok: false, code: `page_find_http_${found.status}` };
-  if (found.value) return { ok: true, value: { ref: found.value, created: false } };
+  if (found.value) return { ok: true, value: found.value };
   const created = await c.createPage(spaceId, p.title, p.storage);
-  if (created.ok) return { ok: true, value: { ref: created.value, created: true } };
+  if (created.ok) return { ok: true, value: created.value };
   const again = await c.findPage(spaceId, p.title);
-  return again.ok && again.value ? { ok: true, value: { ref: again.value, created: false } } : { ok: false, code: `page_create_http_${created.status}` };
+  return again.ok && again.value ? { ok: true, value: again.value } : { ok: false, code: `page_create_http_${created.status}` };
 }
+
+/** Another load took the lease over (ours expired): stop without writing. */
+class DemoLeaseLost extends Error {}
 
 /**
  * Creates the next spaces and pages until done, a step fails (`failed`, resumable by pressing again) or the budget is
- * spent (`loading`). Copy and history pages go round robin to `ownerAccountIds` (the source stays with the caller); a
- * failed owner change keeps the page with the caller and is counted, never fatal.
+ * spent (`loading`). Copy and history pages go round robin to the owners (the source stays with the caller); each
+ * page is saved as `pending` before its owner change, so a crash in between is resumed. A failed owner change keeps
+ * the page with the caller and is counted, never fatal; `retryOwners` tries those again (also after `done`).
  */
 export async function loadDemoData(ctx: SettingsContext, payload: Partial<LoadDemoPayload> | undefined, deps: DemoDeps = defaultDemoDeps): Promise<DemoStatus | ErrorReply> {
   return guard(ctx, deps, 'load the demo data', async () => {
     const started = deps.now();
     const current = await deps.repo.getDemoState();
     const admin = await deps.admin(ctx);
-    if (admin !== 'admin') return statusOf(current, false, admin === 'not_admin' ? 'not_allowed' : 'admin_check_failed');
-    const owners = ownerIds(payload);
+    if (admin !== 'admin') return statusOf(current, false, adminErrorCode(admin));
+    const owners = ownerIds(payload?.ownerAccountIds);
     if (owners === null) return statusOf(current, true, 'invalid_owner_ids');
-    if (current?.state === 'done') return statusOf(current, true);
+    const retry = payload?.retryOwners === true;
+    if (current && current.lease !== '' && current.lockedUntil > started) return statusOf(current, true, null, true);
+    if (current?.state === 'done' && !retry) return statusOf(current, true);
+    if (owners && owners.length > 0) {
+      const v = await validateOwners(deps, owners);
+      if (!v.ok) return statusOf(current, true, v.code);
+    }
 
-    const state: DemoState = current ?? { state: 'loading', spaces: {}, pages: {}, ownerAccountIds: [], errorCode: null, ownerErrors: 0 };
-    state.state = 'loading';
-    state.errorCode = null;
+    // Take the lease: insert the first state, or swap the stored one while its (expired or free) lease is unchanged.
+    const lease = deps.newLease();
+    const state: DemoState = {
+      ...(current ?? { spaces: {}, pages: {}, ownerAccountIds: [], rev: 0 }),
+      state: 'loading',
+      errorCode: null,
+      lease,
+      lockedUntil: started + DEMO_LEASE_MS,
+      rev: (current?.rev ?? 0) + 1,
+    };
     if (owners !== undefined) state.ownerAccountIds = owners;
+    const taken = current ? await deps.repo.replaceDemoState(state, current.lease) : await deps.repo.createDemoState(state);
+    if (!taken) return statusOf(await deps.repo.getDemoState(), true, null, true);
+
+    const save = async (): Promise<void> => {
+      state.rev += 1;
+      if (!(await deps.repo.replaceDemoState(state, lease))) throw new DemoLeaseLost();
+    };
+    /** Saves with the lease freed (pause, failure, done). */
+    const release = async (): Promise<DemoStatus> => {
+      state.lease = '';
+      state.lockedUntil = 0;
+      await save();
+      return statusOf(state, true);
+    };
     const fail = async (code: string): Promise<DemoStatus> => {
       state.state = 'failed';
       state.errorCode = code;
-      await deps.repo.saveDemoState(state);
       console.warn('ripple demo: load step failed', { error: code, step: Object.keys(state.spaces).length + Object.keys(state.pages).length });
-      return statusOf(state, true);
+      return release();
     };
     const spent = (): boolean => deps.now() - started >= deps.budgetMs;
 
-    for (const s of NIMBUS_SPACES) {
-      if (state.spaces[s.key]) continue;
-      if (spent()) return pause(deps, state);
-      const r = await ensureSpace(deps.confluence, s);
-      if (!r.ok) return fail(r.code);
-      state.spaces[s.key] = { id: r.value.id, url: r.value.url };
-      await deps.repo.saveDemoState(state);
-    }
-    const copies = NIMBUS_ALL_PAGES.filter((p) => p.kind !== 'source');
-    for (const p of NIMBUS_ALL_PAGES) {
-      if (state.pages[p.slug]) continue;
-      if (spent()) return pause(deps, state);
-      const space = state.spaces[p.space];
-      if (!space) return fail('space_missing');
-      const r = await ensurePage(deps.confluence, space.id, p);
-      if (!r.ok) return fail(r.code);
-      const entry: DemoState['pages'][string] = { id: r.value.ref.id, url: r.value.ref.url };
-      const owner = p.kind === 'source' || state.ownerAccountIds.length === 0 ? undefined : state.ownerAccountIds[copies.indexOf(p) % state.ownerAccountIds.length];
-      if (r.value.created && owner !== undefined && owner !== ctx.accountId) {
-        const set = await deps.confluence.setOwner(entry.id, p.title, p.storage, owner);
-        if (!set.ok) {
-          entry.ownerFailed = true;
-          state.ownerErrors += 1;
-          console.warn('ripple demo: page owner change failed', { pageId: entry.id, error: `owner_http_${set.status}` });
-        }
+    try {
+      for (const s of NIMBUS_SPACES) {
+        if (state.spaces[s.key]) continue;
+        if (spent()) return await release();
+        const r = await ensureSpace(deps.confluence, s);
+        if (!r.ok) return await fail(r.code);
+        state.spaces[s.key] = { id: r.value.id, url: r.value.url };
+        await save();
       }
-      state.pages[p.slug] = entry;
-      await deps.repo.saveDemoState(state);
+      const n = state.ownerAccountIds.length;
+      for (const p of NIMBUS_ALL_PAGES) {
+        const slot = p.kind === 'source' || n === 0 ? undefined : state.ownerAccountIds[OWNED_PAGES.indexOf(p) % n];
+        let entry: DemoPage | undefined = state.pages[p.slug];
+        const ownerWork = (e: DemoPage): boolean => slot !== undefined && (e.owner !== slot || e.ownerState === 'pending' || (retry && e.ownerState === 'failed'));
+        if (entry && !ownerWork(entry)) continue;
+        if (spent()) return await release();
+        if (!entry) {
+          const space = state.spaces[p.space];
+          if (!space) return await fail('space_missing');
+          const r = await ensurePage(deps.confluence, space.id, p);
+          if (!r.ok) return await fail(r.code);
+          entry = { id: r.value.id, url: r.value.url, ...(slot !== undefined ? { owner: slot, ownerState: 'pending' as const } : {}) };
+          state.pages[p.slug] = entry;
+          await save(); // before the owner change: a crash after it is resumed as `pending`
+        } else if (entry.ownerState !== 'pending' || entry.owner !== slot) {
+          entry.owner = slot;
+          entry.ownerState = 'pending';
+          await save();
+        }
+        if (slot === undefined) continue;
+        // Found and created pages alike: the page's current ownerId is read and only changed when it differs.
+        const set = await deps.confluence.ensureOwner(entry.id, slot);
+        entry.ownerState = set.ok ? 'done' : 'failed';
+        if (!set.ok) console.warn('ripple demo: page owner change failed', { pageId: entry.id, error: `owner_http_${set.status}` });
+        await save();
+      }
+      state.state = 'done';
+      state.errorCode = null;
+      const reply = await release();
+      console.info('ripple demo: loaded', { spaces: Object.keys(state.spaces).length, pages: Object.keys(state.pages).length, owners: n, ownerErrors: ownerErrors(state) });
+      return reply;
+    } catch (err) {
+      if (!(err instanceof DemoLeaseLost)) throw err;
+      console.info('ripple demo: lease lost, stopped', { step: Object.keys(state.spaces).length + Object.keys(state.pages).length });
+      return statusOf(await deps.repo.getDemoState(), true, null, true);
     }
-    state.state = 'done';
-    await deps.repo.saveDemoState(state);
-    console.info('ripple demo: loaded', { spaces: Object.keys(state.spaces).length, pages: Object.keys(state.pages).length, owners: state.ownerAccountIds.length, ownerErrors: state.ownerErrors });
-    return statusOf(state, true);
   });
-}
-
-async function pause(deps: DemoDeps, state: DemoState): Promise<DemoStatus> {
-  await deps.repo.saveDemoState(state);
-  return statusOf(state, true);
 }

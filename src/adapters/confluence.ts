@@ -238,38 +238,35 @@ export type PageOpenness = { open: true } | { open: false; reason: string };
  * failure counts as restricted (`reason` is a log-safe enum). Ancestors are walked up through `parentId` of REST v2
  * `GET pages/{id}` (`read:page:confluence`, at most `MAX_RESTRICTION_ANCESTORS` levels): the v2 `pages/{id}/ancestors`
  * needs `read:content.metadata:confluence` (not granted) and v1 `content/{id}?expand=ancestors` is gone (HTTP 410). A
- * parent that is not a page (folder, whiteboard, …) cannot be read with the app's scopes and counts as restricted.
- * Restrictions have no v2 API; the v1 `restriction/byOperation/read` is used. Space permissions themselves cannot be
- * read with the app's scopes (`read:space.permission:confluence` is not granted), so a page in a space only some groups
- * can view counts as open: see docs/PRIVACY.md.
+ * parent that is not a page (folder, whiteboard, …) counts as restricted (`parent_not_page`): v2 `GET folders/{id}`
+ * needs `read:folder:confluence`, which Ripple does not have. Restrictions have no v2 API; the v1
+ * `restriction/byOperation/read` is used. Space permissions themselves cannot be read with the app's scopes
+ * (`read:space.permission:confluence` is not granted), so a page in a space only some groups can view counts as open:
+ * see docs/PRIVACY.md.
+ *
+ * `check` caches every page, parent and space read within one invocation (pages of one owner share ancestors) and
+ * bounds the time: once its deadline passes the page counts as restricted (`budget_exceeded`).
  */
-export async function pageOpenness(pageId: string): Promise<PageOpenness> {
+export async function pageOpenness(pageId: string, check: OpenCheck = openCheck()): Promise<PageOpenness> {
   const closed = (reason: string): PageOpenness => ({ open: false, reason });
-  const ID = /^\d{1,32}$/;
   try {
-    if (!ID.test(pageId)) return closed('bad_id');
-    const app = api.asApp();
-    const json = { headers: { Accept: 'application/json' } };
+    if (!OPEN_ID.test(pageId)) return closed('bad_id');
     let id = pageId;
     for (let depth = 0; ; depth++) {
-      const step = depth === 0 ? 'page' : 'parent';
-      const pageRes = await app.requestConfluence(route`/wiki/api/v2/pages/${id}`, json);
-      if (!pageRes.ok) return closed(`${step}_http_${pageRes.status}`);
-      const page = (await pageRes.json()) as RawPage & { parentId?: string | number | null; parentType?: string | null };
+      if (check.now() > check.deadline) return closed('budget_exceeded');
+      const node = await cached(check.cache.nodes, id, () => readNode(id));
+      if (!node.ok) return closed(node.reason.replace(/^node_/, depth === 0 ? 'page_' : 'parent_'));
       if (depth === 0) {
-        if (page.spaceId === undefined) return closed('page_no_space');
-        const spaceRes = await app.requestConfluence(route`/wiki/api/v2/spaces/${String(page.spaceId)}`, json);
-        if (!spaceRes.ok) return closed(`space_http_${spaceRes.status}`);
+        if (node.spaceId === null) return closed('page_no_space');
+        const space = await cached(check.cache.spaces, node.spaceId, () => readSpace(node.spaceId as string));
+        if (space !== null) return closed(space);
       }
-      const res = await app.requestConfluence(route`/wiki/rest/api/content/${id}/restriction/byOperation/read?expand=restrictions.user,restrictions.group`, json);
-      if (!res.ok) return closed(`restrictions_http_${res.status}`);
-      if (restrictedBy((await res.json()) as RawRestrictions)) return closed(depth === 0 ? 'restricted' : 'ancestor_restricted');
-      if (page.parentId === undefined || page.parentId === null || page.parentId === '') return { open: true };
-      if (page.parentType !== undefined && page.parentType !== null && page.parentType !== 'page') return closed('parent_not_page');
-      const parent = String(page.parentId);
-      if (!ID.test(parent)) return closed('bad_ancestor_id');
+      if (node.restricted) return closed(depth === 0 ? 'restricted' : 'ancestor_restricted');
+      if (node.parentId === null) return { open: true };
+      if (node.parentType !== null && node.parentType !== 'page') return closed('parent_not_page');
+      if (!OPEN_ID.test(node.parentId)) return closed('bad_ancestor_id');
       if (depth + 1 > MAX_RESTRICTION_ANCESTORS) return closed('too_deep');
-      id = parent;
+      id = node.parentId;
     }
   } catch (err) {
     const name = (err as { name?: unknown } | null)?.name;
@@ -277,9 +274,69 @@ export async function pageOpenness(pageId: string): Promise<PageOpenness> {
   }
 }
 
+const OPEN_ID = /^\d{1,32}$/;
+/** Time one `pageOpenness` check may take in a resolver (default `openCheck`). */
+export const OPEN_CHECK_BUDGET_MS = 5_000;
+
+type OpenNode = { ok: false; reason: string } | { ok: true; spaceId: string | null; parentId: string | null; parentType: string | null; restricted: boolean };
+
+/** Reads of one invocation; never module-level (a warm runtime would keep stale restrictions). */
+export interface OpenCache {
+  nodes: Map<string, Promise<OpenNode>>;
+  /** Space id → null (readable) or the failure enum. */
+  spaces: Map<string, Promise<string | null>>;
+}
+
+export interface OpenCheck {
+  deadline: number;
+  now: () => number;
+  cache: OpenCache;
+}
+
+export const openCache = (): OpenCache => ({ nodes: new Map(), spaces: new Map() });
+
+/** A check context with its own deadline; pass `cache` to share reads between several checks of one invocation. */
+export function openCheck(budgetMs = OPEN_CHECK_BUDGET_MS, cache: OpenCache = openCache(), now: () => number = Date.now): OpenCheck {
+  return { deadline: now() + budgetMs, now, cache };
+}
+
+function cached<T>(map: Map<string, Promise<T>>, key: string, load: () => Promise<T>): Promise<T> {
+  let p = map.get(key);
+  if (!p) {
+    p = load();
+    map.set(key, p);
+  }
+  return p;
+}
+
+const JSON_ACCEPT = { headers: { Accept: 'application/json' } };
+
+/** A page (v2, parent and space) and its own read restrictions (v1), as the app. */
+async function readNode(id: string): Promise<OpenNode> {
+  const app = api.asApp();
+  const pageRes = await app.requestConfluence(route`/wiki/api/v2/pages/${id}`, JSON_ACCEPT);
+  if (!pageRes.ok) return { ok: false, reason: `node_http_${pageRes.status}` };
+  const page = (await pageRes.json()) as RawPage & { parentId?: string | number | null; parentType?: string | null };
+  const res = await app.requestConfluence(route`/wiki/rest/api/content/${id}/restriction/byOperation/read?expand=restrictions.user,restrictions.group`, JSON_ACCEPT);
+  if (!res.ok) return { ok: false, reason: `restrictions_http_${res.status}` };
+  const parent = page.parentId === undefined || page.parentId === null || page.parentId === '' ? null : String(page.parentId);
+  return {
+    ok: true,
+    spaceId: page.spaceId === undefined ? null : String(page.spaceId),
+    parentId: parent,
+    parentType: parent === null ? null : (page.parentType ?? null),
+    restricted: restrictedBy((await res.json()) as RawRestrictions),
+  };
+}
+
+async function readSpace(spaceId: string): Promise<string | null> {
+  const res = await api.asApp().requestConfluence(route`/wiki/api/v2/spaces/${spaceId}`, JSON_ACCEPT);
+  return res.ok ? null : `space_http_${res.status}`;
+}
+
 /** `pageOpenness` as a boolean; a failed check (not a restriction) is logged with its enum reason only. */
-export async function pageIsOpen(pageId: string): Promise<boolean> {
-  const r = await pageOpenness(pageId);
+export async function pageIsOpen(pageId: string, check?: OpenCheck): Promise<boolean> {
+  const r = await pageOpenness(pageId, check);
   if (!r.open && r.reason !== 'restricted' && r.reason !== 'ancestor_restricted') console.info('ripple page open check failed', { pageId, reason: r.reason });
   return r.open;
 }
