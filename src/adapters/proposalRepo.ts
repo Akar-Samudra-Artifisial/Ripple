@@ -283,13 +283,13 @@ export const sqlProposalRepo: ProposalRepo = {
     const inserted = await execute('INSERT IGNORE INTO propose_requeues (change_id, page_id, source_page_id) VALUES (?, ?, ?)', changeId, pageId, sourcePageId);
     if (inserted > 0) return 'now';
     const renewed = await execute(
-      `UPDATE propose_requeues SET requeued_at = CURRENT_TIMESTAMP, delayed = 0
+      `UPDATE propose_requeues SET requeued_at = CURRENT_TIMESTAMP, delay_queued = 0
        WHERE change_id = ? AND page_id = ? AND requeued_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL ${REQUEUE_WINDOW_SECONDS} SECOND)`,
       changeId,
       pageId,
     );
     if (renewed > 0) return 'now';
-    const delayed = await execute('UPDATE propose_requeues SET delayed = 1 WHERE change_id = ? AND page_id = ? AND delayed = 0', changeId, pageId);
+    const delayed = await execute('UPDATE propose_requeues SET delay_queued = 1 WHERE change_id = ? AND page_id = ? AND delay_queued = 0', changeId, pageId);
     return delayed > 0 ? 'delayed' : 'skip';
   },
 };

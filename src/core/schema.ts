@@ -16,6 +16,18 @@ export interface MigrationStore {
   createHistory(): Promise<void>;
   ddl(statement: string): Promise<void>;
   record(name: string): Promise<void>;
+  /** Last failed step (persisted outside the DDL path), if any. Optional: without it failures are only logged. */
+  failure?(): Promise<MigrationFailure | undefined>;
+  recordFailure?(failure: MigrationFailure): Promise<void>;
+  clearFailure?(): Promise<void>;
+}
+
+/** A migration step that failed with an error other than the DDL rate limit. Ids and error codes only. */
+export interface MigrationFailure {
+  migration: string;
+  code: string;
+  /** Failed runs of this step in a row. */
+  attempts: number;
 }
 
 export interface SchemaStatus {
@@ -33,6 +45,22 @@ export class SchemaSettingUpError extends Error {
   ) {
     super(`Ripple is setting up its database (${applied}/${total} steps). This takes a minute or two after install; try again shortly.`);
     this.name = 'SchemaSettingUpError';
+  }
+}
+
+/**
+ * The schema is stuck: a migration step failed (not the rate limit). A `SchemaSettingUpError`, so jobs keep
+ * retrying and resolvers keep answering "not ready", but the byline reports it as an error instead of "setting up".
+ */
+export class SchemaMigrationFailedError extends SchemaSettingUpError {
+  constructor(
+    applied: number,
+    total: number,
+    readonly failure: MigrationFailure,
+  ) {
+    super(applied, total);
+    this.message = `Ripple could not set up its database: step ${applied + 1} of ${total} (${failure.migration}) failed with ${failure.code} after ${failure.attempts} attempt(s). An app update is needed.`;
+    this.name = 'SchemaMigrationFailedError';
   }
 }
 
@@ -108,21 +136,45 @@ export async function schemaStatus(store: MigrationStore, migrations: readonly M
 export async function applyMigrations(store: MigrationStore, migrations: readonly Migration[]): Promise<string[]> {
   const ran: string[] = [];
   let status = await schemaStatus(store, migrations);
+  let step: string | undefined;
   try {
     if (status.historyMissing) await store.createHistory();
     while (status.pending.length > 0) {
       const next = status.pending[0]!;
+      step = next.name;
       await store.ddl(next.statement);
       await store.record(next.name);
       ran.push(next.name);
       status = await schemaStatus(store, migrations);
     }
+    step = undefined;
+    if (ran.length > 0 && store.clearFailure) {
+      await store.clearFailure().catch((e: unknown) => console.warn('ripple migrations: could not clear the failure record', { code: errorCode(e) }));
+    }
     return ran;
   } catch (err) {
-    if (!isSqlRateLimited(err)) throw err;
+    if (!isSqlRateLimited(err)) {
+      if (step !== undefined) await noteFailure(store, step, status, err);
+      throw err;
+    }
     const latest = await schemaStatus(store, migrations).catch(() => status);
     throw new SchemaSettingUpError(latest.applied, latest.total);
   }
+}
+
+function errorCode(err: unknown): string {
+  const info = sqlErrorInfo(err);
+  if (info?.code) return info.code;
+  const code = err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
+  return typeof code === 'string' ? code : 'UNKNOWN';
+}
+
+/** Persists and logs a failed step (name, error code, attempts in a row); never throws. */
+async function noteFailure(store: MigrationStore, migration: string, status: SchemaStatus, err: unknown): Promise<void> {
+  const previous = await store.failure?.().catch(() => undefined);
+  const failure: MigrationFailure = { migration, code: errorCode(err), attempts: previous?.migration === migration ? previous.attempts + 1 : 1 };
+  console.error('ripple migrations: step failed', { ...failure, applied: status.applied, total: status.total, sqlMessage: sqlErrorInfo(err)?.sqlMessage });
+  await store.recordFailure?.(failure).catch((e: unknown) => console.warn('ripple migrations: could not record the failure', { code: errorCode(e) }));
 }
 
 export interface PacingOptions {
@@ -160,12 +212,14 @@ export async function migrateWithPacing(
  * `SchemaSettingUpError`.
  */
 export function schemaGuard(
-  status: () => Promise<{ applied: number; total: number }>,
+  status: () => Promise<{ applied: number; total: number; failure?: MigrationFailure }>,
   requestMigration: () => Promise<unknown>,
-  options: { now?: () => number; requestEveryMs?: number } = {},
+  options: { now?: () => number; requestEveryMs?: number; failedRequestEveryMs?: number } = {},
 ): () => Promise<void> {
   const now = options.now ?? Date.now;
   const every = options.requestEveryMs ?? 60_000;
+  // A failed step fails again until an app update fixes it (the upgrade event queues a run), so retry it rarely.
+  const failedEvery = options.failedRequestEveryMs ?? 5 * 60_000;
   let ready = false;
   let lastRequest: number | undefined;
   return async () => {
@@ -175,13 +229,15 @@ export function schemaGuard(
       ready = true;
       return;
     }
-    if (lastRequest === undefined || now() - lastRequest >= every) {
+    const wait = s.failure ? failedEvery : every;
+    if (lastRequest === undefined || now() - lastRequest >= wait) {
       lastRequest = now();
       await requestMigration().catch((err: unknown) => {
         lastRequest = undefined;
         console.warn('ripple migrations: could not queue a migration run', { error: err instanceof Error ? err.message : String(err) });
       });
     }
+    if (s.failure) throw new SchemaMigrationFailedError(s.applied, s.total, s.failure);
     throw new SchemaSettingUpError(s.applied, s.total);
   };
 }

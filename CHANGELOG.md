@@ -50,6 +50,9 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Halaman arsip/draft tidak lagi menjadi kandidat salinan. Pengecualian space lewat pengaturan belum ada.
 
 ### Fixed
+- Migrasi `v025_create_propose_requeues` gagal di TiDB (`ER_PARSE_ERROR`) karena kolom `delayed` adalah kata cadangan, sehingga schema macet di langkah 24/25. Kolom diganti `delay_queued`; isi v025 diganti di tempat karena langkah ini belum pernah sukses di env mana pun (nama baru dicatat di `__migrations` hanya setelah DDL berhasil; produksi belum memuatnya). Test `sqlSafety` kini menolak nama tabel/kolom/index berupa kata cadangan MySQL/TiDB.
+- Edit halaman saat schema belum siap tidak lagi dibuang: trigger mengantrekan job diff dengan jeda 60 detik (job memeriksa sendiri apakah halaman sumber), dan job yang kehabisan retry antrean diantrekan ulang sebagai job baru hingga 15 kali.
+- Langkah migrasi yang gagal (selain rate limit) dicatat di `settings` beserta kode error dan jumlah percobaan berturut-turut, dan dilog (`ripple migrations: step failed`). Byline menampilkan error yang jelas (langkah, kode, percobaan), bukan "Setting up" terus-menerus; run ulang diminta paling sering tiap 5 menit dan catatan dihapus setelah migrasi berhasil.
 - Usulan suntingan M4 diperketat setelah review:
   - Approve memeriksa ulang bahwa perubahan masih `confirmed` dan nilai fakta sekarang = nilai baru perubahan; bila tidak, usulan `rejected` dengan kode `superseded`. Konfirmasi perubahan baru menandai usulan terbuka dari perubahan lama sebagai `superseded`; salinan `updated` ikut dibandingkan lagi dengan nilai baru.
   - Membatalkan konfirmasi wording-only menolak usulan terbuka perubahan itu (`reverted`).

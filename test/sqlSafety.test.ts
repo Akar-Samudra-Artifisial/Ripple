@@ -25,6 +25,7 @@ vi.mock('@forge/sql', () => ({
 }));
 
 import { sqlChangeRepo } from '../src/adapters/changeRepo';
+import { MIGRATIONS } from '../src/core/migrations';
 import { sqlProposalRepo } from '../src/adapters/proposalRepo';
 import { sqlRepo } from '../src/adapters/repo';
 import { sqlScanRepo } from '../src/adapters/scanRepo';
@@ -58,7 +59,7 @@ describe('M4 proposal writes', () => {
   it('claimRequeue: first claim now, then delayed once within 2 minutes, then skip', async () => {
     affected = () => 1;
     expect(await sqlProposalRepo.claimRequeue('ch-1', '9700001', '9600001')).toBe('now');
-    affected = (s) => (s.includes('delayed = 1') ? 1 : 0);
+    affected = (s) => (s.includes('delay_queued = 1') ? 1 : 0);
     expect(await sqlProposalRepo.claimRequeue('ch-1', '9700001', '9600001')).toBe('delayed');
     expect(calls.some((c) => c.statement.includes('INTERVAL 120 SECOND'))).toBe(true);
     affected = () => 0;
@@ -93,6 +94,79 @@ describe('Forge SQL LIMIT (TiDB rejects a bound LIMIT with ER_WRONG_ARGUMENTS)',
     expect(sqlInt(0, 1, 100)).toBe(1);
     expect(sqlInt(1000, 1, 100)).toBe(100);
     expect(() => sqlInt(Number.NaN, 1, 100)).toThrow('sqlInt');
+  });
+});
+
+/**
+ * MySQL 8 / TiDB reserved words that read like column or table names. An unquoted one fails the whole DDL with
+ * ER_PARSE_ERROR (v025 `delayed` stuck the dev schema at 24/25 steps).
+ */
+const RESERVED = new Set(
+  (
+    'accessible add all alter analyze and as asc before between bigint binary blob both by call cascade case change char character check collate column ' +
+    'condition constraint continue convert create cross cube cume_dist current_date current_time current_timestamp current_user cursor database databases ' +
+    'day_hour day_minute day_second dec decimal declare default delayed delete dense_rank desc describe distinct distinctrow div double drop dual each else ' +
+    'elseif empty enclosed escaped except exists exit explain false fetch first_value float for force foreign from fulltext function generated get grant ' +
+    'group grouping groups having high_priority if ignore in index infile inner inout insert int integer intersect interval into is iterate join json_table ' +
+    'key keys kill lag last_value lateral lead leading leave left like limit linear lines load localtime localtimestamp lock long loop low_priority match ' +
+    'maxvalue mod natural not nth_value ntile null of on optimize option optionally or order out outer outfile over partition percent_rank precision primary ' +
+    'procedure purge range rank read reads real recursive references regexp release rename repeat replace require restrict return revoke right rlike row ' +
+    'row_number rows schema schemas select separator set show signal smallint spatial sql sqlexception sqlstate sqlwarning ssl starting stored straight_join ' +
+    'system table terminated then tinyint to trailing trigger true union unique unlock unsigned until update usage use using utc_date utc_time utc_timestamp ' +
+    'values varbinary varchar varying virtual when where while window with write xor year_month zerofill'
+  ).split(' '),
+);
+
+/** Table, column and index names a migration statement defines (unquoted identifiers only; we never backquote). */
+function definedIdentifiers(statement: string): string[] {
+  const s = statement.replace(/\s+/g, ' ');
+  const names: string[] = [];
+  const table = /CREATE TABLE IF NOT EXISTS (\w+) \((.*)\)\s*$/i.exec(s);
+  if (table) {
+    names.push(table[1]!);
+    // Top-level definitions only: split on commas outside parentheses (VARCHAR(36), KEY idx (a, b)).
+    let depth = 0;
+    let part = '';
+    const parts: string[] = [];
+    for (const ch of table[2]!) {
+      if (ch === '(') depth++;
+      if (ch === ')') depth--;
+      if (ch === ',' && depth === 0) {
+        parts.push(part);
+        part = '';
+      } else part += ch;
+    }
+    parts.push(part);
+    for (const p of parts) {
+      const words = p.trim().split(' ');
+      const first = (words[0] ?? '').toUpperCase();
+      if (['PRIMARY', 'CONSTRAINT', 'FOREIGN', 'CHECK'].includes(first)) continue;
+      if (['KEY', 'INDEX', 'UNIQUE'].includes(first)) {
+        const name = words.find((w, i) => i > 0 && !/^(KEY|INDEX)$/i.test(w));
+        if (name && !name.startsWith('(')) names.push(name);
+        continue;
+      }
+      names.push(words[0] ?? '');
+    }
+  }
+  const column = /ADD COLUMN IF NOT EXISTS (\w+)/i.exec(s);
+  if (column) names.push(column[1]!);
+  const index = /CREATE (?:UNIQUE )?INDEX IF NOT EXISTS (\w+) ON (\w+)/i.exec(s);
+  if (index) names.push(index[1]!, index[2]!);
+  return names.filter(Boolean);
+}
+
+describe('migration identifiers (TiDB rejects unquoted reserved words with ER_PARSE_ERROR)', () => {
+  it('no migration names a table, column or index with a reserved word', () => {
+    const offenders = MIGRATIONS.flatMap((m) => definedIdentifiers(m.statement).filter((n) => RESERVED.has(n.toLowerCase())).map((n) => `${m.name}: ${n}`));
+    expect(offenders).toEqual([]);
+  });
+
+  it('catches the v025 mistake (`delayed` column) and finds the columns of every CREATE TABLE', () => {
+    const bad = 'CREATE TABLE IF NOT EXISTS t (id VARCHAR(36) NOT NULL, delayed TINYINT(1) NOT NULL DEFAULT 0, PRIMARY KEY (id, x), KEY idx_t (id))';
+    expect(definedIdentifiers(bad)).toEqual(['t', 'id', 'delayed', 'idx_t']);
+    expect(definedIdentifiers(bad).filter((n) => RESERVED.has(n))).toEqual(['delayed']);
+    for (const m of MIGRATIONS.filter((x) => /^CREATE TABLE/i.test(x.statement.trim()))) expect(definedIdentifiers(m.statement).length, m.name).toBeGreaterThan(2);
   });
 });
 

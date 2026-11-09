@@ -76,31 +76,47 @@ export interface PageUpdate {
 export interface TriggerDeps {
   facts: FactRepo;
   changes: ChangeRepo;
-  enqueueDiff: (pageId: string, version: number | null) => Promise<string>;
+  enqueueDiff: (pageId: string, version: number | null, options?: DiffQueueOptions) => Promise<string>;
   ensure: () => Promise<void>;
+}
+
+export interface DiffQueueOptions {
+  delaySeconds?: number;
+  /** Times the diff was already queued again because the schema was not ready. */
+  deferrals?: number;
 }
 
 const extractQueue = new Queue({ key: EXTRACT_QUEUE });
 
-const defaultTriggerDeps: TriggerDeps = {
-  facts: sqlRepo,
-  changes: sqlChangeRepo,
-  enqueueDiff: async (pageId, version) => {
-    const { jobId } = await extractQueue.push({ body: { pageId, kind: 'diff', version }, concurrency: { key: `extract-page-${pageId}`, limit: 1 } });
-    return jobId;
-  },
-  ensure: ensureSchema,
-};
+/** Queues change detection for a page (`extract` queue, body `{ pageId, kind: 'diff', version }`). */
+export async function enqueueDiff(pageId: string, version: number | null, options: DiffQueueOptions = {}): Promise<string> {
+  const { jobId } = await extractQueue.push({
+    body: { pageId, kind: 'diff', version, ...(options.deferrals ? { deferrals: options.deferrals } : {}) },
+    concurrency: { key: `extract-page-${pageId}`, limit: 1 },
+    ...(options.delaySeconds ? { delayInSeconds: options.delaySeconds } : {}),
+  });
+  return jobId;
+}
 
-export type TriggerOutcome = { status: 'queued'; jobId: string } | { status: 'ignored'; reason: string };
+const defaultTriggerDeps: TriggerDeps = { facts: sqlRepo, changes: sqlChangeRepo, enqueueDiff, ensure: ensureSchema };
 
-/** Queues a diff for a saved source page; no LLM here. Every other page, a repeat event and Ripple's own edits are ignored. */
+/** Delay of a diff queued while the schema is not ready (migrations need a minute or two). */
+export const SCHEMA_DEFER_SECONDS = 60;
+
+export type TriggerOutcome = { status: 'queued'; jobId: string } | { status: 'deferred'; jobId: string } | { status: 'ignored'; reason: string };
+
+/**
+ * Queues a diff for a saved source page; no LLM here. Every other page, a repeat event and Ripple's own edits are
+ * ignored. While the schema is not ready the source check cannot run, so the diff is queued with a delay instead of
+ * dropping the edit: the consumer waits for the schema and skips pages that are not a source.
+ */
 export async function handlePageUpdate(update: PageUpdate, deps: TriggerDeps = defaultTriggerDeps): Promise<TriggerOutcome> {
   try {
     await deps.ensure();
   } catch (err) {
-    if (err instanceof SchemaSettingUpError) return { status: 'ignored', reason: 'schema setting up' };
-    throw err;
+    if (!(err instanceof SchemaSettingUpError)) throw err;
+    if (isRippleVersion(update.message)) return { status: 'ignored', reason: 'ripple edit' };
+    return { status: 'deferred', jobId: await deps.enqueueDiff(update.pageId, update.version, { delaySeconds: SCHEMA_DEFER_SECONDS }) };
   }
   if (!(await deps.facts.getSource(update.pageId))) return { status: 'ignored', reason: 'not a source' };
   if (isRippleVersion(update.message)) return { status: 'ignored', reason: 'ripple edit' };

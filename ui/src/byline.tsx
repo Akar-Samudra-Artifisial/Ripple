@@ -108,7 +108,8 @@ function Byline() {
       ) : null}
       {schema.status === 'error' ? (
         <div className="alert" role="alert">
-          <p className="alert__text">Database check failed: {schema.error}</p>
+          {/* A failed migration step (applied > 0) already explains itself; other errors come from the check. */}
+          <p className="alert__text">{schema.applied > 0 ? schema.error : `Database check failed: ${schema.error ?? 'unknown error'}`}</p>
           <button type="button" className="button" onClick={retry}>
             Retry
           </button>

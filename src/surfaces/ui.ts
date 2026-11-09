@@ -3,7 +3,7 @@ import { ensureSchema } from '../adapters/sql';
 import { displayNames } from '../adapters/confluenceUsers';
 import { asUserGraph, fetchPageMeta, ownersFromPage, readSpaceTeams, scrubErrorText, type GraphRequest, type PageMeta } from '../adapters/teamworkGraph';
 import { LATEST_MIGRATION, MIGRATIONS } from '../core/migrations';
-import { SchemaSettingUpError } from '../core/schema';
+import { SchemaMigrationFailedError, SchemaSettingUpError } from '../core/schema';
 import { confirmChange, dismissChange, getLatestChange, getPendingChange, pendingChangeFlag, type ChangeContext } from './changes';
 import { getScanStatus, listCopies, startScan } from './copies';
 import { approveAll, approveProposal, listProposalsForPage, listRollout, markNotSameFact, pendingProposalCount, rejectProposal } from './proposals';
@@ -28,6 +28,7 @@ export async function schemaView(ensure: () => Promise<void> = ensureSchema): Pr
     await ensure();
     return { status: 'ready', applied: total, total, latest: LATEST_MIGRATION };
   } catch (err) {
+    if (err instanceof SchemaMigrationFailedError) return { status: 'error', applied: err.applied, total: err.total, latest: LATEST_MIGRATION, error: err.message };
     if (err instanceof SchemaSettingUpError) return { status: 'setting_up', applied: err.applied, total: err.total, latest: LATEST_MIGRATION };
     console.warn('ripple byline: schema check failed', { error: errorText(err) });
     return { status: 'error', applied: 0, total, latest: LATEST_MIGRATION, error: errorText(err) };

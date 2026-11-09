@@ -24,9 +24,9 @@ vi.mock('@forge/events', () => ({
 }));
 
 import { LATEST_MIGRATION, MIGRATIONS } from '../src/core/migrations';
-import { SchemaSettingUpError } from '../src/core/schema';
+import { SchemaMigrationFailedError, SchemaSettingUpError } from '../src/core/schema';
 import { ACTIONS, factKeeperAction } from '../src/surfaces/actions';
-import { onAppLifecycle, onPageEvent } from '../src/surfaces/background';
+import { MAX_SCHEMA_DEFERRALS, onAppLifecycle, onPageEvent, requeueDiffForSchema } from '../src/surfaces/background';
 import { bylineStatus, schemaView, type BylineDeps } from '../src/surfaces/ui';
 
 beforeEach(() => {
@@ -104,6 +104,15 @@ describe('schemaView', () => {
         throw new Error('db down');
       }),
     ).toMatchObject({ status: 'error', error: 'db down' });
+  });
+
+  it('reports a failed migration step as an error with the step, code and attempts, not "setting up"', async () => {
+    const view = await schemaView(async () => {
+      throw new SchemaMigrationFailedError(24, 25, { migration: 'v025_create_propose_requeues', code: 'ER_PARSE_ERROR', attempts: 4 });
+    });
+    expect(view).toMatchObject({ status: 'error', applied: 24, total: 25 });
+    expect(view.error).toContain('v025_create_propose_requeues');
+    expect(view.error).toContain('after 4 attempt(s)');
   });
 });
 
@@ -208,5 +217,15 @@ describe('background and Rovo stubs', () => {
     for (const key of ACTIONS) {
       expect(await factKeeperAction({ context: { moduleKey: key } })).toMatchObject({ status: 'not_implemented', feature: `Rovo action ${key}` });
     }
+  });
+
+  it('a diff still waiting for the schema after its queue retries is queued again as a new job, up to a cap', async () => {
+    const enqueue = vi.fn(async () => 'job-2');
+    await requeueDiffForSchema('9600001', 9, undefined, enqueue);
+    expect(enqueue).toHaveBeenLastCalledWith('9600001', 9, { delaySeconds: 60, deferrals: 1 });
+    await requeueDiffForSchema('9600001', 9, 4, enqueue);
+    expect(enqueue).toHaveBeenLastCalledWith('9600001', 9, { delaySeconds: 60, deferrals: 5 });
+    await requeueDiffForSchema('9600001', 'x', MAX_SCHEMA_DEFERRALS, enqueue);
+    expect(enqueue).toHaveBeenCalledTimes(2);
   });
 });

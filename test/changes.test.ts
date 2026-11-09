@@ -22,7 +22,8 @@ import { identityKey, type ExtractedFact, type MergePlan, type StoredFact } from
 import type { ChangeDecision, CopyStatus, ErrorReply, FactView, PendingChangeReply, SourceView } from '../src/core/views';
 import type { ChatToolFn } from '../src/llm/extract';
 import type { ToolSpec } from '../src/llm/index';
-import { confirmChange, dismissChange, getLatestChange, getPendingChange, handlePageUpdate, runDiffJob, type ChangeDeps, type DiffDeps, type TriggerDeps } from '../src/surfaces/changes';
+import { SchemaSettingUpError } from '../src/core/schema';
+import { confirmChange, dismissChange, getLatestChange, getPendingChange, handlePageUpdate, runDiffJob, SCHEMA_DEFER_SECONDS, type ChangeDeps, type DiffDeps, type TriggerDeps } from '../src/surfaces/changes';
 import { COPY_PAGES, SOURCE_PAGE_ID, type FactKey } from './fixtures/copies';
 import { TRAVEL_POLICY_FACTS, TRAVEL_POLICY_STORAGE } from './fixtures/travelPolicy';
 
@@ -293,6 +294,24 @@ describe('updated:page trigger', () => {
     expect(await handlePageUpdate({ pageId: '123', version: 2, message: null }, triggerDeps(pushes))).toEqual({ status: 'ignored', reason: 'not a source' });
     expect(pushes).toEqual([]);
     expect(store.events.size).toBe(0);
+  });
+
+  it('queues the diff with a delay instead of dropping the edit while the schema is not ready', async () => {
+    const queued: { pageId: string; version: number | null; delaySeconds?: number }[] = [];
+    const deps: TriggerDeps = {
+      ...triggerDeps([]),
+      ensure: async () => {
+        throw new SchemaSettingUpError(24, 25);
+      },
+      enqueueDiff: async (pageId, version, options) => {
+        queued.push({ pageId, version, delaySeconds: options?.delaySeconds });
+        return 'job-later';
+      },
+    };
+    expect(await handlePageUpdate({ pageId: SOURCE_PAGE_ID, version: 9, message: null }, deps)).toEqual({ status: 'deferred', jobId: 'job-later' });
+    expect(await handlePageUpdate({ pageId: SOURCE_PAGE_ID, version: 10, message: 'Updated by Ripple: per diem' }, deps)).toEqual({ status: 'ignored', reason: 'ripple edit' });
+    expect(queued).toEqual([{ pageId: SOURCE_PAGE_ID, version: 9, delaySeconds: SCHEMA_DEFER_SECONDS }]);
+    expect(store.events.size).toBe(0); // no SQL claim before the schema is ready
   });
 
   it('ignores versions saved by Ripple ("Updated by Ripple")', async () => {

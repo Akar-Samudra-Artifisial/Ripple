@@ -1,7 +1,8 @@
 import { InvocationError, InvocationErrorCode } from '@forge/events';
 import { requestMigration, runMigrations } from '../adapters/sql';
 import { scrubErrorText } from '../adapters/teamworkGraph';
-import { handlePageUpdate, runDiffJob } from './changes';
+import { sqlErrorInfo } from '../core/schema';
+import { enqueueDiff, handlePageUpdate, runDiffJob } from './changes';
 import { runJudgeJob, runSearchJob, type ScanOutcome } from './copies';
 import { runProposeJob } from './proposals';
 import { runExtractJob } from './sources';
@@ -33,7 +34,16 @@ export async function onAppLifecycle(event: { eventType?: string }): Promise<voi
 
 /** Consumer for `schema-migrate`: waits out the Forge SQL DDL rate limit and re-queues itself if out of time. */
 export async function migrateSchema(): Promise<InvocationError | void> {
-  const result = await runMigrations(MIGRATE_BUDGET_MS);
+  let result: Awaited<ReturnType<typeof runMigrations>>;
+  try {
+    result = await runMigrations(MIGRATE_BUDGET_MS);
+  } catch (err) {
+    // A failed step is also logged with its error code and attempt count (`applyMigrations`) and recorded for the byline.
+    console.warn('ripple migrations: run failed', { error: scrubErrorText(err instanceof Error ? err.message : String(err)), sql: sqlErrorInfo(err) });
+    // No queue retry: the same DDL fails again; `ensureSchema` re-queues a run every few minutes and an app update
+    // queues one on upgrade.
+    return;
+  }
   console.info('ripple migrations', result);
   if (result.status === 'pending') return retryLater(SCHEMA_RETRY_SECONDS, 'schema');
 }
@@ -54,6 +64,7 @@ export async function onPageEvent(event: PageEvent): Promise<void> {
     const outcome = await handlePageUpdate({ pageId, version, message: typeof v?.message === 'string' ? v.message : null });
     // Most saved pages are not sources: only queued diffs are logged.
     if (outcome.status === 'queued') console.info('ripple page update: diff queued', { pageId, version, jobId: outcome.jobId });
+    else if (outcome.status === 'deferred') console.info('ripple page update: schema not ready, diff queued with delay', { pageId, version, jobId: outcome.jobId });
     else if (outcome.reason !== 'not a source') console.info('ripple page update ignored', { pageId, version, reason: outcome.reason });
   } catch (err) {
     console.warn('ripple page update failed', { pageId, error: scrubErrorText(err instanceof Error ? err.message : String(err)) });
@@ -61,8 +72,33 @@ export async function onPageEvent(event: PageEvent): Promise<void> {
 }
 
 interface ExtractEvent {
-  body?: { pageId?: unknown; kind?: unknown; changeId?: unknown; copyId?: unknown; copyPageId?: unknown };
+  body?: { pageId?: unknown; kind?: unknown; changeId?: unknown; copyId?: unknown; copyPageId?: unknown; version?: unknown; deferrals?: unknown };
   retryContext?: { retryCount?: number };
+}
+
+/** Queue retries one diff job spends waiting for the schema before it is queued again as a fresh job. */
+export const SCHEMA_RETRIES_PER_JOB = 3;
+/** Fresh diff jobs queued while waiting for the schema (about 4 minutes each), so a failed migration ends the wait. */
+export const MAX_SCHEMA_DEFERRALS = 15;
+
+/**
+ * Queue retries are limited, and a schema can take longer than they last (rate-limited install, a failed step that
+ * needs an app update): the diff is queued again as a new job instead of being lost, up to `MAX_SCHEMA_DEFERRALS`.
+ */
+export async function requeueDiffForSchema(
+  pageId: string,
+  rawVersion: unknown,
+  rawDeferrals: unknown,
+  enqueue: typeof enqueueDiff = enqueueDiff,
+): Promise<void> {
+  const version = typeof rawVersion === 'number' && Number.isInteger(rawVersion) ? rawVersion : null;
+  const deferrals = typeof rawDeferrals === 'number' && Number.isInteger(rawDeferrals) && rawDeferrals > 0 ? rawDeferrals : 0;
+  if (deferrals >= MAX_SCHEMA_DEFERRALS) {
+    console.warn('ripple diff dropped: schema still not ready', { pageId, version, deferrals });
+    return;
+  }
+  const jobId = await enqueue(pageId, version, { delaySeconds: SCHEMA_RETRY_SECONDS, deferrals: deferrals + 1 });
+  console.info('ripple diff deferred: schema not ready', { pageId, version, deferrals: deferrals + 1, jobId });
 }
 
 /**
@@ -94,7 +130,11 @@ export async function extractFacts(event: ExtractEvent): Promise<InvocationError
     return;
   }
   if (event.body?.kind === 'diff') {
-    const diff = await runDiffJob(pageId, event.retryContext?.retryCount ?? 0);
+    const retryCount = event.retryContext?.retryCount ?? 0;
+    const diff = await runDiffJob(pageId, retryCount);
+    if (diff.status === 'retry' && diff.reason === 'schema' && retryCount >= SCHEMA_RETRIES_PER_JOB) {
+      return requeueDiffForSchema(pageId, event.body.version, event.body.deferrals);
+    }
     if (diff.status === 'retry') return retryLater(diff.seconds, diff.reason);
     if (diff.status === 'skipped') console.info('ripple diff skipped', { pageId, reason: diff.reason });
     return;

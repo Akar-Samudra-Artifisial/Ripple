@@ -3,9 +3,11 @@ import {
   applyMigrations,
   isSqlRateLimited,
   migrateWithPacing,
+  SchemaMigrationFailedError,
   SchemaSettingUpError,
   schemaGuard,
   type Migration,
+  type MigrationFailure,
   type MigrationStore,
 } from '../src/core/schema';
 
@@ -82,6 +84,32 @@ describe('applyMigrations', () => {
     };
     await expect(applyMigrations(store, migrations)).rejects.toThrow('SQL syntax');
   });
+
+  it('records a failed step with its error code and counts attempts in a row; a later success clears it', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { store, state } = fakeStore(100);
+    state.history = migrations.slice(0, 24).map((m) => m.name);
+    let failure: MigrationFailure | undefined;
+    store.failure = async () => failure;
+    store.recordFailure = async (f) => {
+      failure = f;
+    };
+    store.clearFailure = async () => {
+      failure = undefined;
+    };
+    const parseError = Object.assign(new Error('Unknown SQL execution error'), { code: 'SQL_EXECUTION_ERROR', context: { debug: { code: 'ER_PARSE_ERROR' } } });
+    const realDdl = store.ddl;
+    store.ddl = async () => {
+      throw parseError;
+    };
+    await expect(applyMigrations(store, migrations)).rejects.toBe(parseError);
+    await expect(applyMigrations(store, migrations)).rejects.toBe(parseError);
+    expect(failure).toEqual({ migration: 'v025', code: 'ER_PARSE_ERROR', attempts: 2 });
+    expect(console.error).toHaveBeenLastCalledWith('ripple migrations: step failed', expect.objectContaining({ migration: 'v025', attempts: 2, applied: 24, total: 30 }));
+    store.ddl = realDdl;
+    expect(await applyMigrations(store, migrations)).toHaveLength(6);
+    expect(failure).toBeUndefined();
+  });
 });
 
 describe('migrateWithPacing (new install, DDL limit per minute)', () => {
@@ -121,6 +149,23 @@ describe('schemaGuard (check only, no DDL)', () => {
     expect(request).toHaveBeenCalledTimes(1); // throttled
     clock = 60_000;
     await expect(ensure()).rejects.toBeInstanceOf(SchemaSettingUpError);
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it('reports a recorded failed step as SchemaMigrationFailedError and re-queues it less often', async () => {
+    let clock = 0;
+    const failure = { migration: 'v025', code: 'ER_PARSE_ERROR', attempts: 3 };
+    const request = vi.fn(async () => 'job-1');
+    const ensure = schemaGuard(async () => ({ applied: 24, total: 25, failure }), request, { now: () => clock, requestEveryMs: 60_000, failedRequestEveryMs: 300_000 });
+    const err = await ensure().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SchemaMigrationFailedError);
+    expect(err).toBeInstanceOf(SchemaSettingUpError); // jobs keep treating it as "not ready" (retry, defer)
+    expect((err as Error).message).toContain('step 25 of 25 (v025) failed with ER_PARSE_ERROR after 3 attempt(s)');
+    clock = 60_000;
+    await ensure().catch(() => undefined);
+    expect(request).toHaveBeenCalledTimes(1);
+    clock = 300_000;
+    await ensure().catch(() => undefined);
     expect(request).toHaveBeenCalledTimes(2);
   });
 

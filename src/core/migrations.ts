@@ -239,7 +239,9 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
   },
   { name: 'v024_proposals_change_copy_unique', statement: 'CREATE UNIQUE INDEX IF NOT EXISTS uq_proposals_change_copy ON proposals (change_id, copy_id)' },
   // M4: when stale proposals of a (change, copy page) were last queued again; at most one job per 2 minutes plus one
-  // delayed follow-up (`delayed`), so a page edited often does not flood the queue.
+  // delayed follow-up (`delay_queued`), so a page edited often does not flood the queue.
+  // Rewritten in place: the first version named the column `delayed`, a reserved word TiDB fails to parse, so it never
+  // applied anywhere (the runner records a name only after its DDL succeeds) and production never shipped it.
   {
     name: 'v025_create_propose_requeues',
     statement: `CREATE TABLE IF NOT EXISTS propose_requeues (
@@ -247,7 +249,7 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
       page_id VARCHAR(32) NOT NULL,
       source_page_id VARCHAR(32) NOT NULL,
       requeued_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      delayed TINYINT(1) NOT NULL DEFAULT 0,
+      delay_queued TINYINT(1) NOT NULL DEFAULT 0,
       PRIMARY KEY (change_id, page_id),
       KEY idx_propose_requeues_source (source_page_id)
     )`,
