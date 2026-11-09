@@ -1,9 +1,10 @@
 import Resolver from '@forge/resolver';
 import { ensureSchema } from '../adapters/sql';
-import { asUserGraph, fetchPageMeta, readSpaceTeams, scrubErrorText, type GraphRequest, type PageMeta } from '../adapters/teamworkGraph';
+import { displayNames } from '../adapters/confluenceUsers';
+import { asUserGraph, fetchPageMeta, ownersFromPage, readSpaceTeams, scrubErrorText, type GraphRequest, type PageMeta } from '../adapters/teamworkGraph';
 import { LATEST_MIGRATION, MIGRATIONS } from '../core/migrations';
 import { SchemaSettingUpError } from '../core/schema';
-import type { BylineStatus, SchemaView, SpaceTeamsView } from '../core/views';
+import type { BylineStatus, OwnerView, SchemaView, SpaceTeamsView } from '../core/views';
 import { notImplemented } from './stub';
 
 export type ResolverContext = {
@@ -31,20 +32,37 @@ export async function schemaView(ensure: () => Promise<void> = ensureSchema): Pr
 export interface BylineDeps {
   graph: (cloudId: string) => GraphRequest;
   pageMeta: (pageId: string) => Promise<PageMeta>;
+  names: (accountIds: readonly string[]) => Promise<Map<string, string>>;
   ensure: () => Promise<void>;
 }
 
-const defaultDeps: BylineDeps = { graph: asUserGraph, pageMeta: fetchPageMeta, ensure: ensureSchema };
+const defaultDeps: BylineDeps = { graph: asUserGraph, pageMeta: fetchPageMeta, names: (ids) => displayNames(ids), ensure: ensureSchema };
 
-/** Space id from the byline context, or from REST v2 when the context has none. */
-async function spaceIdOf(ctx: ResolverContext, deps: BylineDeps): Promise<string> {
+/** Space id from the byline context, or from the REST v2 page when the context has none. */
+async function spaceIdOf(ctx: ResolverContext, page: () => Promise<PageMeta>): Promise<string> {
   const fromContext = ctx.extension?.space?.id;
   if (fromContext !== undefined && String(fromContext) !== '') return String(fromContext);
-  const pageId = ctx.extension?.content?.id;
-  if (pageId === undefined || String(pageId) === '') throw new Error('no page id in context');
-  const spaceId = (await deps.pageMeta(String(pageId))).spaceId;
+  const spaceId = (await page()).spaceId;
   if (!spaceId) throw new Error('page has no space id');
   return spaceId;
+}
+
+/** Owner (else author) of the page from REST v2, with its display name from users-bulk. Never throws. */
+async function ownerOf(page: () => Promise<PageMeta>, deps: BylineDeps): Promise<OwnerView> {
+  let first;
+  try {
+    first = ownersFromPage(await page())[0];
+  } catch (err) {
+    return { accountId: null, role: null, displayName: null, errors: [errorText(err)] };
+  }
+  if (!first) return { accountId: null, role: null, displayName: null, errors: ['page has no owner or author'] };
+  try {
+    const names = await deps.names([first.accountId]);
+    return { accountId: first.accountId, role: first.role, displayName: names.get(first.accountId) ?? null, errors: [] };
+  } catch (err) {
+    console.warn('ripple byline: owner name lookup failed', { error: errorText(err) });
+    return { accountId: first.accountId, role: first.role, displayName: null, errors: [errorText(err)] };
+  }
 }
 
 /** Headline of the byline popup; "ready" only when the database schema is complete. */
@@ -57,19 +75,25 @@ export function bylineMessage(schema: SchemaView): string {
 /** M0 byline: readiness, schema progress and the space's owning teams via Teamwork Graph. Never throws. */
 export async function bylineStatus(ctx: ResolverContext, deps: BylineDeps = defaultDeps): Promise<BylineStatus> {
   const schema = await schemaView(deps.ensure);
+  // REST v2 page, fetched at most once (owner and, when the context lacks it, the space id).
+  const pageId = ctx.extension?.content?.id;
+  let pagePromise: Promise<PageMeta> | undefined;
+  const page = (): Promise<PageMeta> =>
+    (pagePromise ??= pageId === undefined || String(pageId) === '' ? Promise.reject(new Error('no page id in context')) : deps.pageMeta(String(pageId)));
+  const owner = await ownerOf(page, deps);
   let spaceTeams: SpaceTeamsView;
   if (!ctx.cloudId) {
     spaceTeams = { spaceId: null, teams: [], dataPresent: false, errors: ['no cloud id in context'] };
   } else {
     try {
-      const spaceId = await spaceIdOf(ctx, deps);
+      const spaceId = await spaceIdOf(ctx, page);
       const read = await readSpaceTeams(deps.graph(ctx.cloudId), ctx.cloudId, spaceId);
       spaceTeams = { spaceId, teams: read.teams, dataPresent: read.dataPresent, errors: read.errors };
     } catch (err) {
       spaceTeams = { spaceId: null, teams: [], dataPresent: false, errors: [errorText(err)] };
     }
   }
-  return { message: bylineMessage(schema), schema, spaceTeams };
+  return { message: bylineMessage(schema), schema, owner, spaceTeams };
 }
 
 const resolver = new Resolver();

@@ -7,7 +7,9 @@ function Byline() {
   const { data, error, loading } = useRemote<BylineStatus>('getBylineStatus');
   if (loading) return <p className="muted">Loading…</p>;
   if (error || !data) return <p className="error">Ripple could not load: {error ?? 'no data'}</p>;
-  const { schema, spaceTeams } = data;
+  const { schema, spaceTeams, owner } = data;
+  const ownerName = owner.displayName ?? (owner.accountId ? 'Unknown user' : 'none');
+  const teamNames = spaceTeams.teams.length > 0 ? spaceTeams.teams.map((t) => t.name).join(', ') : 'none';
   return (
     <>
       <h1 className={schema.status === 'error' ? 'shell__title error' : 'shell__title'}>{data.message}</h1>
@@ -21,6 +23,10 @@ function Byline() {
           <span className="error">check failed: {schema.error}</span>
         )}
       </p>
+      <p>
+        <strong>Owner: {ownerName}</strong> · Team: {teamNames} (via Teamwork Graph)
+      </p>
+      {owner.errors.length > 0 ? <p className="error">{owner.errors.join(' | ')}</p> : null}
       <p>Space owning team (via Teamwork Graph):</p>
       {spaceTeams.teams.length > 0 ? (
         <ul>

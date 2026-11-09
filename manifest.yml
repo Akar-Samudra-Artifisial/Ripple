@@ -210,7 +210,8 @@ permissions:
     - write:confluence-space
     - read:jira-work                  # update tasks and approval panel
     - write:jira-work                 # POST /rest/api/3/issue incl. assignee, one update task per owner per change
-    # Owner display names come from Teamwork Graph (AtlassianUser.name) and Jira ADF mentions: no user-read scope.
+    # Owner display names in Custom UI: POST /wiki/api/v2/users-bulk (TWG user nodes come back null; <User> is UI Kit only).
+    - read:user:confluence
     # Teamwork Graph (Preview, read-only; a missing scope returns empty data, not an error)
     - read:graph:page:confluence
     - read:graph:space:confluence

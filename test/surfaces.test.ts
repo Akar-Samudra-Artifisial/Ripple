@@ -70,7 +70,8 @@ describe('bylineStatus', () => {
   const graphWith = (body: unknown) => () => async () => ({ body });
   const deps = (over: Partial<BylineDeps> = {}): BylineDeps => ({
     graph: graphWith({ data: { atlassianTeamsBySpace: { edges: [{ node: { id: 't1', displayName: 'Platform Team' } }] } } }),
-    pageMeta: vi.fn(async () => ({ spaceId: '99' })),
+    pageMeta: vi.fn(async () => ({ spaceId: '99', ownerId: 'owner-1', authorId: 'author-1' })),
+    names: vi.fn(async () => new Map([['owner-1', 'Ana Owner']])),
     ensure: async () => undefined,
     ...over,
   });
@@ -81,7 +82,29 @@ describe('bylineStatus', () => {
     expect(r.message).toBe('Ripple is ready');
     expect(r.schema.status).toBe('ready');
     expect(r.spaceTeams).toEqual({ spaceId: '7', teams: [{ id: 't1', name: 'Platform Team' }], dataPresent: true, errors: [] });
-    expect(d.pageMeta).not.toHaveBeenCalled();
+    expect(d.pageMeta).toHaveBeenCalledTimes(1); // owner only; the space id came from the context
+  });
+
+  it('names the page owner from REST v2 ownerId via users-bulk', async () => {
+    const d = deps();
+    const r = await bylineStatus({ cloudId: 'c1', extension: { content: { id: 5 } } }, d);
+    expect(r.owner).toEqual({ accountId: 'owner-1', role: 'owner', displayName: 'Ana Owner', errors: [] });
+    expect(d.names).toHaveBeenCalledWith(['owner-1']);
+    expect(d.pageMeta).toHaveBeenCalledTimes(1); // shared by owner and space id lookups
+  });
+
+  it('keeps the owner id when the name lookup fails or the name is hidden', async () => {
+    const failing = await bylineStatus(
+      { cloudId: 'c1', extension: { content: { id: 5 } } },
+      deps({
+        names: async () => {
+          throw new Error('Confluence users-bulk failed: HTTP 403');
+        },
+      }),
+    );
+    expect(failing.owner).toEqual({ accountId: 'owner-1', role: 'owner', displayName: null, errors: ['Confluence users-bulk failed: HTTP 403'] });
+    const hidden = await bylineStatus({ cloudId: 'c1', extension: { content: { id: 5 } } }, deps({ names: async () => new Map() }));
+    expect(hidden.owner.displayName).toBeNull();
   });
 
   it('falls back to the REST v2 page for the space id', async () => {
