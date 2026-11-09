@@ -14,7 +14,7 @@ vi.mock('@forge/events', () => ({
 }));
 
 import type { Message } from '@forge/llm';
-import type { ChangeRepo, ChangeRouting, ChangeRow, CopyForChange } from '../src/adapters/changeRepo';
+import { dismissalKey, valueHash, type ChangeRepo, type ChangeRouting, type ChangeRow, type CopyForChange } from '../src/adapters/changeRepo';
 import type { SourcePage } from '../src/adapters/confluence';
 import type { FactRepo, PageVersionInfo } from '../src/adapters/repo';
 import { addWorkingDays, computeImpact, planDiff, type ChangeImpact, type FactChange } from '../src/core/changes';
@@ -113,8 +113,10 @@ class Store {
   audits: { action: string; detail?: Record<string, unknown> }[] = [];
   merges: MergePlan[] = [];
   events = new Set<string>();
-  changes = new Map<string, ChangeRow & { routing: ChangeRouting | null; deadlineDays: number | null }>();
+  changes = new Map<string, ChangeRow>();
   copies = fixtureCopies();
+  textHashes = new Map<string, string>();
+  dismissals: { sourcePageId: string; factId: string; valueHash: string }[] = [];
   private n = 0;
 
   factRepo(): FactRepo {
@@ -168,11 +170,25 @@ class Store {
         return n;
       },
       copiesForFacts: async (sourcePageId, factIds) => (sourcePageId === SOURCE_PAGE_ID ? this.copies.filter((c) => factIds.includes(c.factId)) : []),
-      decide: async (id, status, _actor, deadlineDays, routing) => {
+      releasePageEvent: async (pageId, version) => {
+        this.events.delete(`${pageId}:${version}`);
+      },
+      decide: async (id, version, status, _actor, deadlineDays, routing) => {
         const c = this.changes.get(id);
-        if (!c || c.status !== 'pending') return false;
+        if (!c || c.status !== 'pending' || c.pageVersion !== version) return false;
         Object.assign(c, { status, deadlineDays, routing });
         return true;
+      },
+      textHash: async (pageId) => this.textHashes.get(pageId) ?? null,
+      setTextHash: async (pageId, hash) => {
+        this.textHashes.set(pageId, hash);
+      },
+      dismissedValues: async (sourcePageId) => new Set(this.dismissals.filter((d) => d.sourcePageId === sourcePageId).map((d) => dismissalKey(d.factId, d.valueHash))),
+      saveDismissals: async (sourcePageId, factChanges) => {
+        for (const c of factChanges) {
+          const valueHashOf = valueHash(c.newValue, c.newUnit);
+          if (!this.dismissals.some((d) => d.factId === c.factId && d.valueHash === valueHashOf)) this.dismissals.push({ sourcePageId, factId: c.factId, valueHash: valueHashOf });
+        }
       },
       applyFactChange: async (sourcePageId, c: FactChange) => {
         const f = this.facts.find((x) => x.id === c.factId && x.status === 'confirmed' && x.value === c.oldValue);
@@ -248,6 +264,19 @@ describe('updated:page trigger', () => {
     expect(pushes).toEqual([SOURCE_PAGE_ID]);
   });
 
+  it('releases the claim when the diff cannot be queued, so the redelivered event is not a duplicate', async () => {
+    const pushes: string[] = [];
+    const failing: TriggerDeps = {
+      ...triggerDeps(pushes),
+      enqueueDiff: async () => {
+        throw new Error('queue unavailable');
+      },
+    };
+    await expect(handlePageUpdate({ pageId: SOURCE_PAGE_ID, version: 4, message: null }, failing)).rejects.toThrow('queue unavailable');
+    expect(store.events.size).toBe(0);
+    expect(await handlePageUpdate({ pageId: SOURCE_PAGE_ID, version: 4, message: null }, triggerDeps(pushes))).toEqual({ status: 'queued', jobId: 'job-1' });
+  });
+
   it('ignores pages that are not a source', async () => {
     const pushes: string[] = [];
     expect(await handlePageUpdate({ pageId: '123', version: 2, message: null }, triggerDeps(pushes))).toEqual({ status: 'ignored', reason: 'not a source' });
@@ -283,6 +312,7 @@ describe('diff consumer', () => {
       syncCopyIds: ['c-9600003-domestic'],
       unsure: 1,
       historical: 1,
+      needsCheck: 0,
     });
     // Nothing changes until the owner confirms; the flight fact is kept.
     const dom = store.facts.find((f) => f.id === FACT_IDS.domestic);
@@ -319,6 +349,36 @@ describe('diff consumer', () => {
     expect(store.changes.size).toBe(0);
   });
 
+  it('a failure before the change is stored leaves the version unread, so the retry records the change', async () => {
+    const failing = store.changeRepo();
+    failing.savePending = async () => {
+      throw new Error('SQL write failed');
+    };
+    expect(await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(4, '$75', { changes: failing }))).toMatchObject({ status: 'failed' });
+    expect(store.sources.get(SOURCE_PAGE_ID)?.pageVersion).toBe(3);
+    expect(store.textHashes.size).toBe(0);
+    const spaceFails = await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(4, '$75', { spaceOf: async () => Promise.reject(new Error('HTTP 500')) }));
+    expect(spaceFails).toMatchObject({ status: 'failed' });
+    expect(store.sources.get(SOURCE_PAGE_ID)?.pageVersion).toBe(3);
+    const retry = await runDiffJob(SOURCE_PAGE_ID, 1, diffDeps(4, '$75'));
+    expect(retry).toMatchObject({ status: 'done', changed: 1 });
+    expect([...store.changes.values()]).toEqual([expect.objectContaining({ status: 'pending', pageVersion: 4 })]);
+    expect(store.sources.get(SOURCE_PAGE_ID)?.pageVersion).toBe(4);
+  });
+
+  it('a new version with the same text (title or label edit) does not call the LLM', async () => {
+    await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(4, '$75'));
+    expect(llmCalls).toBe(1);
+    const renamed = await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(5, '$75', { page: async () => ({ ...page(5, '$75'), title: 'Travel Policy 2026' }) }));
+    expect(renamed).toEqual({ status: 'skipped', reason: 'text unchanged' });
+    expect(llmCalls).toBe(1);
+    expect(store.sources.get(SOURCE_PAGE_ID)?.pageVersion).toBe(5);
+    // The pending change of version 4 is kept; new text is read again.
+    expect([...store.changes.values()]).toEqual([expect.objectContaining({ status: 'pending', pageVersion: 4 })]);
+    await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(6, '$80'));
+    expect(llmCalls).toBe(2);
+  });
+
   it('skips a page that is not a source', async () => {
     store.sources.clear();
     expect(await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(4, '$75'))).toEqual({ status: 'skipped', reason: 'not a source' });
@@ -340,10 +400,37 @@ describe('planDiff / computeImpact / addWorkingDays', () => {
     expect(plan.merge.update).toEqual([expect.objectContaining({ refreshOnly: true, status: 'confirmed' })]);
   });
 
-  it('a copy without a stated value is propagated (cannot be shown to match)', () => {
+  it('a copy without a comparable stated value needs a check and is never propagated automatically', () => {
     const change: FactChange = { factId: 'a', oldValue: '$60', oldUnit: null, newValue: '$75', newUnit: null, newQuote: 'q', version: 2, versionAt: null };
-    const impact: ChangeImpact = computeImpact([change], [{ id: 'c', factId: 'a', pageId: '1', status: 'drifted', statedValue: null, statedUnit: null }], new Map());
-    expect(impact.copies).toEqual([{ copyId: 'c', factId: 'a', pageId: '1', spaceId: null, status: 'drifted' }]);
+    const copy = (id: string, status: CopyStatus, statedValue: string | null) => ({ id, factId: 'a', pageId: '1', status, statedValue, statedUnit: null });
+    const impact: ChangeImpact = computeImpact(
+      [change],
+      [
+        copy('null-sync', 'in_sync', null),
+        copy('null-drift', 'drifted', null),
+        // Another currency: unknown against both $60 and $75.
+        copy('unknown', 'in_sync', '€60'),
+        copy('old', 'in_sync', '$60'),
+        copy('other', 'drifted', '$50'),
+      ],
+      new Map(),
+    );
+    expect(impact.needsCheck).toBe(3);
+    expect(impact.copies.map((c) => c.copyId)).toEqual(['old', 'other']);
+  });
+
+  it('a change of value shape is a change: range, extra numbers, other unit; formatting alone is not', () => {
+    const changed = (from: string, to: string, fromUnit: string | null = null, toUnit: string | null = null) =>
+      planDiff([stored({ value: from, unit: fromUnit })], [ex(to, toUnit)], 2).changes.length === 1;
+    expect(changed('60', '60–90')).toBe(true);
+    expect(changed('60', '60-90')).toBe(true);
+    expect(changed('60', '60, max 3 days')).toBe(true);
+    expect(changed('60 USD', '60 EUR')).toBe(true);
+    expect(changed('60 days', '60 weeks')).toBe(true);
+    expect(changed('15 Jan 2026', '15 Jan 2026 – 20 Jan 2027')).toBe(true);
+    expect(changed('$60', '60 USD')).toBe(false);
+    expect(changed('$1,000', '$1000')).toBe(false);
+    expect(changed('2026-01-15', '15 Jan 2026')).toBe(false);
   });
 
   it('counts working days (Mon–Fri)', () => {
@@ -404,16 +491,17 @@ describe('change resolvers', () => {
 
   it('confirmChange needs edit permission on the source', async () => {
     const id = await pendingId();
-    expect(await confirmChange(ctx, { changeId: id }, changeDeps({ canEdit: async () => false }))).toEqual({ error: expect.stringContaining('edit permission') });
-    expect(await confirmChange({ ...ctx, accountId: undefined }, { changeId: id }, changeDeps())).toEqual({ error: expect.stringContaining('edit permission') });
+    expect(await confirmChange(ctx, { changeId: id, version: 4 }, changeDeps({ canEdit: async () => false }))).toEqual({ error: expect.stringContaining('edit permission') });
+    expect(await confirmChange({ ...ctx, accountId: undefined }, { changeId: id, version: 4 }, changeDeps())).toEqual({ error: expect.stringContaining('edit permission') });
+    expect(await confirmChange(ctx, { changeId: id }, changeDeps())).toEqual({ error: 'Missing or invalid page version.' });
     expect(store.changes.get(id)?.status).toBe('pending');
     expect(store.facts.find((f) => f.id === FACT_IDS.domestic)?.value).toBe('$60');
   });
 
   it('confirmChange sets the new value, keeps the old one, restatuses copies and audits owner/team sources', async () => {
     const id = await pendingId();
-    expect(await confirmChange(ctx, { changeId: id, deadlineDays: 31 }, changeDeps())).toEqual({ error: expect.stringContaining('1 to 30') });
-    expect(await confirmChange(ctx, { changeId: id, version: 3 }, changeDeps())).toEqual({ error: expect.stringContaining('changed again') });
+    expect(await confirmChange(ctx, { changeId: id, version: 4, deadlineDays: 31 }, changeDeps())).toEqual({ error: expect.stringContaining('1 to 30') });
+    expect(await confirmChange(ctx, { changeId: id, version: 3 }, changeDeps())).toEqual({ error: expect.stringContaining('Review it again') });
     const r = (await confirmChange(ctx, { changeId: id, deadlineDays: 3, version: 4 }, changeDeps())) as ChangeDecision;
     expect(r).toEqual({ changeId: id, status: 'confirmed', factsUpdated: 1, copiesDrifted: 1, deadline: '2026-11-12' });
     expect(store.facts.find((f) => f.id === FACT_IDS.domestic)).toMatchObject({ value: '$75', previousValue: '$60', status: 'confirmed', pageVersion: 4 });
@@ -429,21 +517,94 @@ describe('change resolvers', () => {
     });
     const audit = store.audits.find((a) => a.action === 'change.confirmed');
     expect(audit?.detail).toMatchObject({ factsUpdated: 1, deadlineDays: 3, ownerSource: { owner: 1 }, teamSource: { teamwork_graph: 1 } });
-    // Decided: a second confirm or a dismiss finds nothing pending.
-    expect(await confirmChange(ctx, { changeId: id }, changeDeps())).toEqual({ error: expect.stringContaining('already decided') });
-    expect(await dismissChange(ctx, { changeId: id }, changeDeps())).toEqual({ error: expect.stringContaining('already decided') });
+    // Decided: a repeated confirm (double click) succeeds without doing anything twice; a dismiss finds nothing pending.
+    const audits = store.audits.length;
+    expect(await confirmChange(ctx, { changeId: id, version: 4 }, changeDeps())).toEqual({ changeId: id, status: 'confirmed', factsUpdated: 0, copiesDrifted: 0, deadline: '2026-11-12' });
+    expect(store.audits).toHaveLength(audits);
+    expect(await dismissChange(ctx, { changeId: id, version: 4 }, changeDeps())).toEqual({ error: expect.stringContaining('already decided') });
+  });
+
+  it('confirm of a change replaced by a newer version meanwhile: "review it again", nothing applied', async () => {
+    const id = await pendingId();
+    // The user reviewed version 4 ($75); version 5 ($80) replaces the row before they click.
+    await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(5, '$80'));
+    expect(await confirmChange(ctx, { changeId: id, version: 4 }, changeDeps())).toEqual({ error: expect.stringContaining('Review it again') });
+    expect(await dismissChange(ctx, { changeId: id, version: 4 }, changeDeps())).toEqual({ error: expect.stringContaining('Review it again') });
+    expect(store.changes.get(id)).toMatchObject({ status: 'pending', pageVersion: 5 });
+    expect(store.facts.find((f) => f.id === FACT_IDS.domestic)?.value).toBe('$60');
+    // The version check is also in the status flip (a diff landing between read and write).
+    const base = changeDeps();
+    const racing: ChangeDeps = {
+      ...base,
+      changes: {
+        ...base.changes,
+        decide: async (...args) => {
+          await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(6, '$85'));
+          return base.changes.decide(...args);
+        },
+      },
+    };
+    expect(await confirmChange(ctx, { changeId: id, version: 5 }, racing)).toEqual({ error: expect.stringContaining('Review it again') });
+    expect(store.changes.get(id)).toMatchObject({ status: 'pending', pageVersion: 6 });
+    expect(store.facts.find((f) => f.id === FACT_IDS.domestic)?.value).toBe('$60');
+  });
+
+  it('confirm after a failure between the status flip and the copy updates: the repeat finishes the work', async () => {
+    const id = await pendingId();
+    const base = changeDeps();
+    const crashing: ChangeDeps = {
+      ...base,
+      changes: {
+        ...base.changes,
+        restatusCopies: async () => {
+          throw new Error('SQL down');
+        },
+      },
+    };
+    expect(await confirmChange(ctx, { changeId: id, version: 4 }, crashing)).toEqual({ error: expect.stringContaining('SQL down') });
+    expect(store.changes.get(id)?.status).toBe('confirmed');
+    expect(store.facts.find((f) => f.id === FACT_IDS.domestic)?.value).toBe('$75');
+    expect(store.copies.find((c) => c.id === 'c-9600001-domestic')?.status).toBe('in_sync');
+    // The retry: facts are already applied (factsUpdated 0) but the copy stating $60 still becomes drifted.
+    const r = (await confirmChange(ctx, { changeId: id, version: 4 }, changeDeps())) as ChangeDecision;
+    expect(r).toMatchObject({ status: 'confirmed', factsUpdated: 0, copiesDrifted: 1 });
+    expect(store.copies.find((c) => c.id === 'c-9600001-domestic')?.status).toBe('drifted');
+    expect(store.copies.find((c) => c.id === 'c-9600003-domestic')?.status).toBe('in_sync');
+  });
+
+  it('confirm routes every affected copy, also on pages the confirming user cannot open', async () => {
+    const id = await pendingId();
+    const visible = vi.fn(async () => new Set<string>());
+    const r = (await confirmChange(ctx, { changeId: id, version: 4 }, changeDeps({ visible, pageMeta: async () => Promise.reject(new Error('HTTP 404')) }))) as ChangeDecision;
+    expect(r).toMatchObject({ status: 'confirmed', copiesDrifted: 1 });
+    expect(visible).not.toHaveBeenCalled();
+    expect(store.changes.get(id)?.routing?.pages).toEqual([{ pageId: '9600001', spaceId: 'S-9600001', ownerAccountId: null, ownerRole: null, copies: 1 }]);
+    expect(store.copies.find((c) => c.id === 'c-9600001-domestic')?.status).toBe('drifted');
   });
 
   it('dismissChange: permission, then dismissed with an audit row; facts unchanged', async () => {
     const id = await pendingId();
-    expect(await dismissChange(ctx, { changeId: id }, changeDeps({ canEdit: async () => false }))).toEqual({ error: expect.stringContaining('edit permission') });
-    expect(await dismissChange(ctx, { changeId: 'nope' }, changeDeps())).toEqual({ error: 'Missing or invalid change id.' });
+    expect(await dismissChange(ctx, { changeId: id, version: 4 }, changeDeps({ canEdit: async () => false }))).toEqual({ error: expect.stringContaining('edit permission') });
+    expect(await dismissChange(ctx, { changeId: 'nope', version: 4 }, changeDeps())).toEqual({ error: 'Missing or invalid change id.' });
+    expect(await dismissChange(ctx, { changeId: id }, changeDeps())).toEqual({ error: 'Missing or invalid page version.' });
     // A change of another page is "gone" from this page's context.
-    expect(await dismissChange({ ...ctx, extension: { content: { id: '42' } } }, { changeId: id }, changeDeps())).toEqual({ error: expect.stringContaining('already decided') });
-    const r = (await dismissChange(ctx, { changeId: id }, changeDeps())) as ChangeDecision | ErrorReply;
+    expect(await dismissChange({ ...ctx, extension: { content: { id: '42' } } }, { changeId: id, version: 4 }, changeDeps())).toEqual({ error: expect.stringContaining('already decided') });
+    const r = (await dismissChange(ctx, { changeId: id, version: 4 }, changeDeps())) as ChangeDecision | ErrorReply;
     expect(r).toEqual({ changeId: id, status: 'dismissed', factsUpdated: 0, copiesDrifted: 0, deadline: null });
     expect(store.changes.get(id)?.status).toBe('dismissed');
     expect(store.facts.find((f) => f.id === FACT_IDS.domestic)?.value).toBe('$60');
     expect(store.audits.map((a) => a.action)).toContain('change.dismissed');
+  });
+
+  it('a dismissed value is not raised again by a later edit; another value still is', async () => {
+    const id = await pendingId();
+    await dismissChange(ctx, { changeId: id, version: 4 }, changeDeps());
+    // Version 5: the page still says $75 plus an unrelated edit (new text, so the LLM reads it).
+    const again = await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(5, '$75', { page: async () => ({ ...page(5, '$75'), body: `${bodyOf('$75')}<p>Ask Finance.</p>` }) }));
+    expect(again).toMatchObject({ status: 'done', changeId: null, changed: 0 });
+    expect([...store.changes.values()].filter((c) => c.status === 'pending')).toHaveLength(0);
+    const other = await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(6, '$80'));
+    expect(other).toMatchObject({ status: 'done', changed: 1 });
+    expect([...store.changes.values()].find((c) => c.status === 'pending')?.factChanges[0]?.newValue).toBe('$80');
   });
 });

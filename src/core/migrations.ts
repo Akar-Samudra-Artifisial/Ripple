@@ -195,6 +195,20 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
   { name: 'v019_facts_search_terms', statement: 'ALTER TABLE facts ADD COLUMN IF NOT EXISTS search_terms JSON NULL' },
   // Facts of a scan whose synonyms came from the cache (scan summary log).
   { name: 'v020_scan_jobs_synonyms_cached', statement: 'ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS synonyms_cached INT NOT NULL DEFAULT 0' },
+  // sha256 of the source text last read by a diff: a new version with the same text skips the LLM.
+  { name: 'v021_sources_text_hash', statement: 'ALTER TABLE sources ADD COLUMN IF NOT EXISTS text_hash VARCHAR(64) NULL' },
+  // Values the owner dismissed per fact (sha256 of the normalised value|unit): not raised again by later versions.
+  {
+    name: 'v022_create_change_dismissals',
+    statement: `CREATE TABLE IF NOT EXISTS change_dismissals (
+      fact_id VARCHAR(36) NOT NULL,
+      value_hash VARCHAR(64) NOT NULL,
+      source_page_id VARCHAR(32) NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (fact_id, value_hash),
+      KEY idx_change_dismissals_source (source_page_id)
+    )`,
+  },
 ];
 
 /** Name of the newest migration; the byline reports it so admins can confirm the schema is current. */

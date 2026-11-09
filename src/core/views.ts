@@ -276,6 +276,8 @@ export interface PendingChangeView {
   /** Not propagated, shown for context. */
   unsure: number;
   historical: number;
+  /** In-sync copies whose stated value could not be compared: not propagated automatically, check by hand. */
+  needsCheck: number;
   /** Copies that already state the new value. */
   alreadyNew: number;
   spaces: ChangeSpaceView[];
@@ -294,13 +296,13 @@ export interface PendingChangeReply {
 
 export interface ChangeIdPayload {
   changeId: string;
+  /** `PendingChangeView.version` the user reviewed; a change replaced by a newer version must be reviewed again. */
+  version: number;
 }
 
 export interface ConfirmChangePayload extends ChangeIdPayload {
   /** Working days the copy owners get (1–30); default 5. */
   deadlineDays?: number;
-  /** `PendingChangeView.version` the user saw; a newer detected version must be reviewed first. */
-  version?: number;
 }
 
 /** Reply of `confirmChange` / `dismissChange`. */

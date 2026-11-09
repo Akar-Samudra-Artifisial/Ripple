@@ -330,8 +330,10 @@ async function stableTerms(scanId: string, facts: readonly ScanFact[], deps: Sca
     await deps.scans.addLlmCalls(scanId, 1);
   }
   for (const { fact, key } of missing) {
-    terms[fact.id] = fresh?.[fact.id] ?? [];
-    if (fresh) await deps.scans.saveFactSearchTerms(fact.id, { key, terms: terms[fact.id] ?? [] });
+    const got = fresh?.[fact.id] ?? [];
+    terms[fact.id] = got;
+    // An empty answer is not cached: the next scan asks again instead of searching without synonyms forever.
+    if (got.length > 0) await deps.scans.saveFactSearchTerms(fact.id, { key, terms: got });
   }
   return { terms, cached };
 }

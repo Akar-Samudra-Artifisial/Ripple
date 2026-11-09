@@ -9,7 +9,7 @@
  * (facts take the new values; M4 proposes the copy edits) or dismiss it.
  */
 import { Queue } from '@forge/events';
-import { sqlChangeRepo, type ChangeRepo, type ChangeRouting, type ChangeRow } from '../adapters/changeRepo';
+import { dismissalKey, sha256, sqlChangeRepo, valueHash, type ChangeRepo, type ChangeRouting, type ChangeRow } from '../adapters/changeRepo';
 import { canEditPage, ConfluenceRetryableError, getSourcePage, pageSpaceIdAsApp, PageNotFoundError, visiblePageIds, type SourcePage } from '../adapters/confluence';
 import { displayNames } from '../adapters/confluenceUsers';
 import { sqlRepo, type FactRepo, type PageVersionInfo } from '../adapters/repo';
@@ -39,6 +39,8 @@ import { EXTRACT_QUEUE, type SourceContext } from './sources';
 const errorText = (err: unknown): string => scrubErrorText(err instanceof Error ? err.message : String(err));
 const NOT_ALLOWED = 'You need edit permission on this page to do that.';
 const GONE = 'This change was already decided or replaced by a newer one. Reload to see the latest.';
+/** The UI reloads the change when an error contains "Review it again". */
+export const STALE = 'This change was updated by a newer page version. Review it again.';
 const UUID = /^[0-9a-f-]{36}$/i;
 /** Copy pages whose owner is looked up per `getPendingChange` (REST v2 as the user); the rest show no owner. */
 export const MAX_OWNER_LOOKUPS = 50;
@@ -100,9 +102,17 @@ export async function handlePageUpdate(update: PageUpdate, deps: TriggerDeps = d
   }
   if (!(await deps.facts.getSource(update.pageId))) return { status: 'ignored', reason: 'not a source' };
   if (isRippleVersion(update.message)) return { status: 'ignored', reason: 'ripple edit' };
-  if (update.version !== null && !(await deps.changes.claimPageEvent(update.pageId, update.version))) return { status: 'ignored', reason: 'duplicate event' };
-  const jobId = await deps.enqueueDiff(update.pageId, update.version);
-  return { status: 'queued', jobId };
+  const version = update.version;
+  if (version !== null && !(await deps.changes.claimPageEvent(update.pageId, version))) return { status: 'ignored', reason: 'duplicate event' };
+  try {
+    return { status: 'queued', jobId: await deps.enqueueDiff(update.pageId, version) };
+  } catch (err) {
+    // Not queued: release the claim so a redelivered event is not taken for a duplicate.
+    if (version !== null) {
+      await deps.changes.releasePageEvent(update.pageId, version).catch((e: unknown) => console.warn('ripple trigger: claim release failed', { pageId: update.pageId, error: errorText(e) }));
+    }
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -149,44 +159,56 @@ export async function runDiffJob(pageId: string, retryCount: number, deps: DiffD
     if (isRippleVersion(page.versionMessage)) return { status: 'skipped', reason: 'ripple edit' };
     if (source.pageVersion !== null && page.version <= source.pageVersion) return { status: 'skipped', reason: 'version already read' };
     const text = storageToText(page.body);
+    const info: PageVersionInfo = { title: page.title, spaceId: page.spaceId, version: page.version, versionAt: page.versionCreatedAt, truncated: text.endsWith(TRUNCATED_MARK) };
+    const hash = sha256(text);
+    // Same text as the last diff (title or label edit only): no LLM call, the version is just marked as read.
+    if ((await deps.changes.textHash(pageId)) === hash) {
+      await deps.facts.finishExtraction(pageId, info);
+      return { status: 'skipped', reason: 'text unchanged' };
+    }
     const { args, model } = await runFactExtraction(text, { pageId, title: page.title }, deps.llm);
     const parsed = parseExtraction(args, text);
     if (!(await deps.facts.getSource(pageId))) return { status: 'skipped', reason: 'unmarked during diff' };
     const diff = planDiff(await deps.facts.storedFacts(pageId), parsed.facts, page.version, page.versionCreatedAt);
-    const info: PageVersionInfo = { title: page.title, spaceId: page.spaceId, version: page.version, versionAt: page.versionCreatedAt, truncated: text.endsWith(TRUNCATED_MARK) };
-    await deps.facts.applyMerge(pageId, diff.merge, info);
-    await deps.facts.finishExtraction(pageId, info);
+    // Values the owner already dismissed are not raised again (another value still is).
+    const dismissed = await deps.changes.dismissedValues(pageId);
+    const changes = diff.changes.filter((c) => !dismissed.has(dismissalKey(c.factId, valueHash(c.newValue, c.newUnit))));
     const base = { inserted: diff.merge.insert.length, missing: diff.missing.length };
-    if (diff.changes.length === 0) {
+    const log = { pageId, version: page.version, model, dismissed: diff.changes.length - changes.length, ...base, dropped: parsed.dropped.length };
+    // Order matters for retries: the change is stored before the version is marked as read (`finishExtraction`), so
+    // a failure in between re-reads the same version instead of skipping it as "already read".
+    await deps.facts.applyMerge(pageId, diff.merge, info);
+    if (changes.length === 0) {
       const superseded = await deps.changes.supersedePending(pageId);
-      console.info('ripple diff done', { pageId, version: page.version, model, changed: 0, superseded, ...base, dropped: parsed.dropped.length });
+      await deps.changes.setTextHash(pageId, hash);
+      await deps.facts.finishExtraction(pageId, info);
+      console.info('ripple diff done', { ...log, changed: 0, superseded });
       return { status: 'done', changeId: null, changed: 0, copies: 0, ...base };
     }
     const copies = await deps.changes.copiesForFacts(
       pageId,
-      diff.changes.map((c) => c.factId),
+      changes.map((c) => c.factId),
     );
     const affectedPages = [...new Set(copies.filter((c) => c.status === 'in_sync' || c.status === 'drifted').map((c) => c.pageId))];
     const spaces = await mapLimit(affectedPages, LOOKUP_CONCURRENCY, deps.spaceOf);
-    const impact = computeImpact(diff.changes, copies, new Map(affectedPages.map((id, i) => [id, spaces[i] ?? null])));
-    const { id: changeId, replaced } = await deps.changes.savePending(pageId, page.version, diff.changes, diff.missing, impact);
-    await deps.facts.audit('change.detected', null, 'page', pageId, { changeId, version: page.version, facts: diff.changes.length, missing: diff.missing.length, copies: impact.copies.length, replaced });
+    const impact = computeImpact(changes, copies, new Map(affectedPages.map((id, i) => [id, spaces[i] ?? null])));
+    const { id: changeId, replaced } = await deps.changes.savePending(pageId, page.version, changes, diff.missing, impact);
+    await deps.facts.audit('change.detected', null, 'page', pageId, { changeId, version: page.version, facts: changes.length, missing: diff.missing.length, copies: impact.copies.length, replaced });
+    await deps.changes.setTextHash(pageId, hash);
+    await deps.facts.finishExtraction(pageId, info);
     console.info('ripple diff done', {
-      pageId,
+      ...log,
       changeId,
-      version: page.version,
-      model,
-      changed: diff.changes.length,
+      changed: changes.length,
       replaced,
       copies: impact.copies.length,
       pages: new Set(impact.copies.map((c) => c.pageId)).size,
       alreadyNew: impact.alreadyNew,
       unsure: impact.unsure,
       historical: impact.historical,
-      ...base,
-      dropped: parsed.dropped.length,
+      needsCheck: impact.needsCheck,
     });
-    return { status: 'done', changeId, changed: diff.changes.length, copies: impact.copies.length, ...base };
+    return { status: 'done', changeId, changed: changes.length, copies: impact.copies.length, ...base };
   } catch (err) {
     if (retryCount < MAX_DIFF_RETRIES) {
       if (isLlmRateLimited(err)) return { status: 'retry', seconds: backoff(retryCount), reason: 'llm-rate-limited' };
@@ -266,8 +288,12 @@ interface Summary {
 
 const NO_OWNER: OwnerView = { accountId: null, role: null, displayName: null, errors: [] };
 
-/** The change as the viewer may see it: copies on pages they cannot open are one count; owners and teams resolved. */
-async function summarise(ctx: ChangeContext, pageId: string, change: ChangeRow, canDecide: boolean, deps: ChangeDeps): Promise<Summary> {
+/**
+ * The change as the viewer may see it: copies on pages they cannot open are one count; owners and teams resolved.
+ * `allPages` (confirm): the routing covers every affected page, also those the confirming user cannot open (their
+ * owner lookup fails as the user and is recorded as an owner error); the view is not returned to the user then.
+ */
+async function summarise(ctx: ChangeContext, pageId: string, change: ChangeRow, canDecide: boolean, deps: ChangeDeps, allPages = false): Promise<Summary> {
   const facts = new Map((await deps.facts.listFacts(pageId)).map((f) => [f.id, f]));
   const factViews: FactChangeView[] = change.factChanges.map((c) => {
     const f = facts.get(c.factId);
@@ -281,12 +307,12 @@ async function summarise(ctx: ChangeContext, pageId: string, change: ChangeRow, 
       newQuote: c.newQuote,
     };
   });
-  const impact = change.impact ?? { copies: [], alreadyNew: 0, syncCopyIds: [], unsure: 0, historical: 0 };
-  const allPages = [...new Set(impact.copies.map((c) => c.pageId))];
-  const seen = allPages.length > 0 ? await deps.visible(allPages) : new Set<string>();
+  const impact = change.impact ?? { copies: [], alreadyNew: 0, syncCopyIds: [], unsure: 0, historical: 0, needsCheck: 0 };
+  const affected = [...new Set(impact.copies.map((c) => c.pageId))];
+  const seen = allPages ? new Set(affected) : affected.length > 0 ? await deps.visible(affected) : new Set<string>();
   const visibleCopies = impact.copies.filter((c) => seen.has(c.pageId));
   const hiddenCount = impact.copies.length - visibleCopies.length;
-  const pageIds = allPages.filter((id) => seen.has(id));
+  const pageIds = affected.filter((id) => seen.has(id));
   const titles = new Map(
     (
       await deps.changes.copiesForFacts(
@@ -349,6 +375,7 @@ async function summarise(ctx: ChangeContext, pageId: string, change: ChangeRow, 
     hiddenCount,
     unsure: impact.unsure,
     historical: impact.historical,
+    needsCheck: impact.needsCheck ?? 0,
     alreadyNew: impact.alreadyNew,
     spaces,
     defaultDeadlineDays: DEFAULT_DEADLINE_DAYS,
@@ -373,72 +400,101 @@ export async function getPendingChange(ctx: ChangeContext, deps: ChangeDeps = de
   });
 }
 
-/** Loads a pending change of the viewed page for a decision; checks edit permission. */
-async function decidable(ctx: ChangeContext, deps: ChangeDeps, pageId: string, payload: Partial<ChangeIdPayload> | undefined): Promise<{ change: ChangeRow; actor: string } | ErrorReply> {
+/** Checks the payload and edit permission and loads the change of the viewed page (any status). */
+async function decidable(
+  ctx: ChangeContext,
+  deps: ChangeDeps,
+  pageId: string,
+  payload: Partial<ChangeIdPayload> | undefined,
+): Promise<{ change: ChangeRow; actor: string; version: number } | ErrorReply> {
   const changeId = typeof payload?.changeId === 'string' ? payload.changeId : '';
   if (!UUID.test(changeId)) return { error: 'Missing or invalid change id.' };
+  const version = payload?.version;
+  if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) return { error: 'Missing or invalid page version.' };
   if (!ctx.accountId || !(await deps.canEdit(pageId))) return { error: NOT_ALLOWED };
   const change = await deps.changes.getChange(changeId);
   // The page id comes from the context: a change of another source is "gone" here.
-  if (!change || change.sourcePageId !== pageId || change.status !== 'pending') return { error: GONE };
-  return { change, actor: ctx.accountId };
+  if (!change || change.sourcePageId !== pageId) return { error: GONE };
+  return { change, actor: ctx.accountId, version };
 }
+
+/** Why a decision did not apply: the reviewed change was replaced by a newer version (review again), or it is gone. */
+const notDecidable = (change: ChangeRow | undefined, version: number): ErrorReply => ({ error: change?.status === 'pending' && change.pageVersion !== version ? STALE : GONE });
 
 const count = <T extends string>(values: readonly T[]): Record<string, number> => values.reduce<Record<string, number>>((acc, v) => ({ ...acc, [v]: (acc[v] ?? 0) + 1 }), {});
 
 /**
- * FR-7 confirmation by an editor of the source: the facts take their new values (old value kept), copies stating the
- * old value count as drifted, and the routing (owners, teams, deadline) is stored for M4's edit proposals.
+ * FR-7 confirmation by an editor of the source, for the version they reviewed: the status flip (guarded by that
+ * version) decides the race first, then the facts take their new values (old value kept) and copies stating the old
+ * value count as drifted. The routing (owners, teams, deadline) covers every affected copy, also on pages the user
+ * cannot open, for M4's edit proposals. Repeat-safe: confirming an already confirmed change of the same version
+ * (e.g. after a failure halfway) finishes the fact and copy updates and succeeds.
  */
 export async function confirmChange(ctx: ChangeContext, payload: Partial<ConfirmChangePayload> | undefined, deps: ChangeDeps = defaultDeps): Promise<ChangeDecision | ErrorReply> {
   const days = payload?.deadlineDays ?? DEFAULT_DEADLINE_DAYS;
   if (typeof days !== 'number' || !Number.isInteger(days) || days < 1 || days > MAX_DEADLINE_DAYS) return { error: `The deadline must be 1 to ${MAX_DEADLINE_DAYS} working days.` };
-  if (payload?.version !== undefined && (typeof payload.version !== 'number' || !Number.isInteger(payload.version))) return { error: 'Invalid page version.' };
   return guarded(ctx, deps, 'confirm the change', async (pageId) => {
     const r = await decidable(ctx, deps, pageId, payload);
     if ('error' in r) return r;
-    const { change, actor } = r;
-    if (payload?.version !== undefined && payload.version !== change.pageVersion) return { error: 'The source page changed again. Review the latest change before confirming.' };
-    const { routing: base } = await summarise(ctx, pageId, change, true, deps);
-    const deadline = addWorkingDays(deps.now(), days);
-    const routing: ChangeRouting = { ...base, deadline };
-    // Facts first (guarded by their old value, so a repeat is a no-op), then the status flip decides the race.
-    let factsUpdated = 0;
-    const applied = new Set<string>();
-    for (const c of change.factChanges) {
-      if (await deps.changes.applyFactChange(pageId, c)) {
-        factsUpdated++;
-        applied.add(c.factId);
+    const { actor, version } = r;
+    let change = r.change;
+    let transitioned = false;
+    let routing: ChangeRouting | null = change.routing;
+    if (change.status === 'pending' && change.pageVersion === version) {
+      const { routing: base } = await summarise(ctx, pageId, change, true, deps, true);
+      routing = { ...base, deadline: addWorkingDays(deps.now(), days) };
+      transitioned = await deps.changes.decide(change.id, version, 'confirmed', actor, days, routing);
+      if (!transitioned) {
+        const now = await deps.changes.getChange(change.id);
+        if (!now || now.status !== 'confirmed' || now.pageVersion !== version) return notDecidable(now, version);
+        change = now;
+        routing = now.routing;
       }
-    }
-    if (!(await deps.changes.decide(change.id, 'confirmed', actor, days, routing))) return { error: GONE };
+    } else if (change.status !== 'confirmed' || change.pageVersion !== version) return notDecidable(change, version);
+    // Facts (guarded by their old value, so a repeat is a no-op), then the copies of every fact that now holds the
+    // new value: also those applied by an earlier, interrupted call.
+    let factsUpdated = 0;
+    for (const c of change.factChanges) if (await deps.changes.applyFactChange(pageId, c)) factsUpdated++;
+    const current = new Map((await deps.facts.listFacts(pageId)).map((f) => [f.id, f]));
+    const applied = new Set(change.factChanges.filter((c) => current.get(c.factId)?.status === 'confirmed' && current.get(c.factId)?.value === c.newValue).map((c) => c.factId));
     const impact = change.impact;
     const toDrift = (impact?.copies ?? []).filter((c) => c.status === 'in_sync' && applied.has(c.factId)).map((c) => c.copyId);
     const copiesDrifted = await deps.changes.restatusCopies(toDrift, impact?.syncCopyIds ?? []);
-    await deps.facts.audit('change.confirmed', actor, 'change', change.id, {
-      pageId,
-      version: change.pageVersion,
-      facts: change.factChanges.length,
-      factsUpdated,
-      copies: impact?.copies.length ?? 0,
-      pages: routing.pages.length,
-      deadlineDays: days,
-      ownerSource: count(routing.pages.map((p) => p.ownerRole ?? 'none')),
-      teamSource: count(routing.spaces.map((s) => s.teamSource)),
-    });
-    console.info('ripple change confirmed', { pageId, changeId: change.id, factsUpdated, copiesDrifted, pages: routing.pages.length, spaces: routing.spaces.length });
-    return { changeId: change.id, status: 'confirmed', factsUpdated, copiesDrifted, deadline };
+    const pages = routing?.pages ?? [];
+    const spaces = routing?.spaces ?? [];
+    if (transitioned || factsUpdated > 0) {
+      await deps.facts.audit('change.confirmed', actor, 'change', change.id, {
+        pageId,
+        version: change.pageVersion,
+        facts: change.factChanges.length,
+        factsUpdated,
+        copies: impact?.copies.length ?? 0,
+        pages: pages.length,
+        deadlineDays: change.deadlineDays ?? days,
+        ownerSource: count(pages.map((p) => p.ownerRole ?? 'none')),
+        teamSource: count(spaces.map((s) => s.teamSource)),
+        repeat: !transitioned,
+      });
+    }
+    console.info('ripple change confirmed', { pageId, changeId: change.id, repeat: !transitioned, factsUpdated, copiesDrifted, pages: pages.length, spaces: spaces.length });
+    return { changeId: change.id, status: 'confirmed', factsUpdated, copiesDrifted, deadline: routing?.deadline ?? null };
   });
 }
 
-/** The editor decides the change should not propagate; facts keep their confirmed values. */
+/**
+ * The editor decides the change (the version they reviewed) should not propagate; facts keep their confirmed values
+ * and the dismissed values are remembered so a later edit of the page does not raise them again.
+ */
 export async function dismissChange(ctx: ChangeContext, payload: Partial<ChangeIdPayload> | undefined, deps: ChangeDeps = defaultDeps): Promise<ChangeDecision | ErrorReply> {
   return guarded(ctx, deps, 'dismiss the change', async (pageId) => {
     const r = await decidable(ctx, deps, pageId, payload);
     if ('error' in r) return r;
-    if (!(await deps.changes.decide(r.change.id, 'dismissed', r.actor, null, null))) return { error: GONE };
-    await deps.facts.audit('change.dismissed', r.actor, 'change', r.change.id, { pageId, version: r.change.pageVersion, facts: r.change.factChanges.length });
-    console.info('ripple change dismissed', { pageId, changeId: r.change.id });
-    return { changeId: r.change.id, status: 'dismissed', factsUpdated: 0, copiesDrifted: 0, deadline: null };
+    const { change, actor, version } = r;
+    if (change.status !== 'pending' || change.pageVersion !== version) return notDecidable(change, version);
+    if (!(await deps.changes.decide(change.id, version, 'dismissed', actor, null, null))) return notDecidable(await deps.changes.getChange(change.id), version);
+    await deps.changes.saveDismissals(pageId, change.factChanges);
+    await deps.facts.audit('change.dismissed', actor, 'change', change.id, { pageId, version: change.pageVersion, facts: change.factChanges.length });
+    console.info('ripple change dismissed', { pageId, changeId: change.id });
+    return { changeId: change.id, status: 'dismissed', factsUpdated: 0, copiesDrifted: 0, deadline: null };
   });
 }

@@ -831,9 +831,16 @@ describe('copy scan (search + judge consumers)', () => {
     expect(pushes[1]).toEqual({ queue: JUDGE_QUEUE, scanId });
   });
 
+  /** Synonyms for every fact of the terms call (the default fake answers for fact 1 only). */
+  const allTerms = (async (messages: Message[], tool: ToolSpec) => {
+    if (tool.name !== 'record_search_terms') return fakeLlm(llmCalls)(messages, tool);
+    llmCalls.push({ tool: tool.name });
+    return { args: { facts: FACTS.map((_, i) => ({ fact: i + 1, terms: [`synonym ${i + 1}`] })) }, model: 'claude-sonnet-5' };
+  }) as unknown as ChatToolFn;
+
   it('generates CQL synonyms once per fact and reuses them in the next scan (stable candidates)', async () => {
     const first = await newScan();
-    await runSearchJob(first, 0, jobDeps());
+    await runSearchJob(first, 0, jobDeps({ llm: allTerms }));
     const firstCql = searchCalls.map((c) => c.cql);
     expect(llmCalls.filter((c) => c.tool === 'record_search_terms')).toHaveLength(1);
     expect(scans.searchTerms.size).toBe(FACTS.length);
@@ -842,7 +849,7 @@ describe('copy scan (search + judge consumers)', () => {
 
     searchCalls.length = 0;
     const second = await newScan();
-    await runSearchJob(second, 0, jobDeps());
+    await runSearchJob(second, 0, jobDeps({ llm: allTerms }));
     expect(llmCalls.filter((c) => c.tool === 'record_search_terms')).toHaveLength(1);
     expect(scans.scans.get(second)?.synonymsCached).toBe(FACTS.length);
     expect(searchCalls.map((c) => c.cql)).toEqual(firstCql);
@@ -852,10 +859,21 @@ describe('copy scan (search + judge consumers)', () => {
     scans.searchTerms.set(one, { key: 'stale|key|', terms: ['old'] });
     await scans.finishScan(second, SOURCE_PAGE_ID, false);
     const third = await newScan();
-    await runSearchJob(third, 0, jobDeps());
+    await runSearchJob(third, 0, jobDeps({ llm: allTerms }));
     expect(llmCalls.filter((c) => c.tool === 'record_search_terms')).toHaveLength(2);
     expect(scans.scans.get(third)?.synonymsCached).toBe(FACTS.length - 1);
     expect(scans.searchTerms.get(one)?.key).not.toBe('stale|key|');
+  });
+
+  it('does not cache an empty synonym answer: the next scan asks again for those facts only', async () => {
+    const first = await newScan();
+    await runSearchJob(first, 0, jobDeps()); // terms for fact 1 only
+    expect(scans.searchTerms.size).toBe(1);
+    await scans.finishScan(first, SOURCE_PAGE_ID, false);
+    const second = await newScan();
+    await runSearchJob(second, 0, jobDeps());
+    expect(llmCalls.filter((c) => c.tool === 'record_search_terms')).toHaveLength(2);
+    expect(scans.scans.get(second)?.synonymsCached).toBe(1);
   });
 
   it('does not cache synonyms when the suggestion fails', async () => {

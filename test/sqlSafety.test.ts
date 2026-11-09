@@ -21,6 +21,8 @@ vi.mock('@forge/sql', () => ({
   },
 }));
 
+import { sqlChangeRepo } from '../src/adapters/changeRepo';
+import { sqlRepo } from '../src/adapters/repo';
 import { sqlScanRepo } from '../src/adapters/scanRepo';
 import { sqlErrorInfo, sqlInt, sqlOp } from '../src/core/schema';
 
@@ -56,6 +58,21 @@ describe('Forge SQL LIMIT (TiDB rejects a bound LIMIT with ER_WRONG_ARGUMENTS)',
     expect(sqlInt(0, 1, 100)).toBe(1);
     expect(sqlInt(1000, 1, 100)).toBe(100);
     expect(() => sqlInt(Number.NaN, 1, 100)).toThrow('sqlInt');
+  });
+});
+
+describe('page_events stays bounded', () => {
+  it('claimPageEvent drops events older than 30 days before inserting; unmarkSource removes the page rows', async () => {
+    await sqlChangeRepo.claimPageEvent('9600001', 4);
+    expect(calls[0]?.statement).toBe('DELETE FROM page_events WHERE created_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 30 DAY)');
+    expect(calls[0]?.params).toEqual([]);
+    expect(calls[1]).toEqual({ statement: 'INSERT IGNORE INTO page_events (page_id, version) VALUES (?, ?)', params: ['9600001', 4] });
+    calls.length = 0;
+    await sqlRepo.unmarkSource('9600001');
+    const deletes = calls.map((c) => c.statement);
+    expect(deletes).toContain('DELETE FROM page_events WHERE page_id = ?');
+    expect(deletes).toContain('DELETE FROM change_dismissals WHERE source_page_id = ?');
+    expect(deletes.at(-1)).toBe('DELETE FROM sources WHERE page_id = ?');
   });
 });
 

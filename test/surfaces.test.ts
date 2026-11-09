@@ -81,14 +81,16 @@ describe('migrations', () => {
       'v018_create_page_events',
       'v019_facts_search_terms',
       'v020_scan_jobs_synonyms_cached',
+      'v021_sources_text_hash',
+      'v022_create_change_dismissals',
     ]);
-    expect(LATEST_MIGRATION).toBe('v020_scan_jobs_synonyms_cached');
+    expect(LATEST_MIGRATION).toBe('v022_create_change_dismissals');
   });
 });
 
 describe('schemaView', () => {
   it('reports ready, setting up and errors', async () => {
-    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 20, total: 20, latest: LATEST_MIGRATION });
+    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 22, total: 22, latest: LATEST_MIGRATION });
     expect(
       await schemaView(async () => {
         throw new SchemaSettingUpError(1, 4);

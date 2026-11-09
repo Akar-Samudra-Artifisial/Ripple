@@ -44,6 +44,19 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Halaman arsip/draft tidak lagi menjadi kandidat salinan. Pengecualian space lewat pengaturan belum ada.
 
 ### Fixed
+- Deteksi perubahan M3 diperkeras setelah review:
+  - Job diff menyimpan perubahan dulu, baru menandai versi halaman sudah dibaca, sehingga retry setelah gagal tidak kehilangan perubahan.
+  - `confirmChange`/`dismissChange` wajib membawa `version` dan status hanya berubah untuk versi itu. Bila versi lebih baru sudah menggantikannya, muncul error "Review it again" dan panel memuat ulang.
+  - Konfirmasi ulang untuk versi yang sama aman diulang: menyelesaikan update fakta dan salinan dari fakta yang sudah bernilai baru.
+  - Routing konfirmasi mencakup semua salinan terdampak, termasuk halaman yang tidak bisa dibuka pengonfirmasi.
+  - Claim event dilepas bila enqueue gagal.
+  - Perubahan bentuk nilai (rentang, angka tambahan, satuan lain) dihitung sebagai perubahan.
+  - Salinan in sync tanpa nilai yang bisa dibandingkan masuk "needs check" (`needsCheck`, tidak dipropagasi otomatis).
+  - Hasil sinonim kosong tidak di-cache.
+- Hemat LLM:
+  - Versi baru dengan teks sama (hash `sources.text_hash`) tidak memanggil LLM.
+  - Nilai yang di-dismiss (`change_dismissals`) tidak dimunculkan lagi; nilai lain tetap memunculkan perubahan.
+  - `page_events` dibatasi 30 hari dan dibersihkan saat unmark (migrasi v021–v022).
 - Aturan fakta saudara dan kondisi lebih ketat: `sibling_fact` hanya membuang mention bila sumber memang punya fakta saudara (selain itu Tidak pasti, drift tidak hilang); jawaban "no" menjadi Tidak pasti hanya dengan `reason_code` `different_condition`; kartu Tidak pasti untuk kondisi yang tidak ada di sumber (mis. pelatihan) dipasang pada fakta pilihan keluarga saudara (tanpa kondisi dulu, lalu urutan di sumber) menggantikan heuristik nilai terdekat, satu kartu per kalimat per halaman (kutipan yang dipotong berbeda tetap dianggap satu kalimat); enum `reason_code` diurutkan netral.
 - Salinan dengan nilai sama kembali In sync walaupun judge ragu (`reason_code` value_matches, nilai sama, kondisi tidak berbeda), bukan "not sure this is the same fact".
 - Satu kalimat tidak lagi menghasilkan kartu Tidak pasti untuk fakta saudara (atribut sama, kondisi lain yang juga ada di sumber, mis. per diem domestik vs internasional): kode baru `sibling_fact` di prompt judge, kondisi yang cocok dengan fakta saudara diabaikan, dan per kutipan di halaman yang sama hanya satu kartu per kelompok saudara (yang cocok/menyimpang menang; bila semuanya Tidak pasti, fakta dengan nilai resmi terdekat). Kondisi yang tidak ada di sumber (mis. pelatihan) tetap Tidak pasti.

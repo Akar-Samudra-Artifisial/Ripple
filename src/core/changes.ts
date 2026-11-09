@@ -4,7 +4,7 @@
  * confirms before anything propagates), new facts are proposed as in M1, and facts no longer on the page are only
  * reported (never deleted automatically).
  */
-import { compareValues } from './copies';
+import { compareValues, normaliseValue, parseDate } from './copies';
 import { planMerge, normaliseKeyPart, type ExtractedFact, type MergePlan, type StoredFact } from './facts';
 import type { CopyStatus } from './views';
 
@@ -40,9 +40,33 @@ export interface DiffPlan {
 
 const sameText = (a: string | null, b: string | null): boolean => normaliseKeyPart(a) === normaliseKeyPart(b);
 
-/** Same text, or (values with digits only) the same number/date by the copy comparison rules ("$60" / "60 USD"). */
-const sameValue = (a: { value: string; unit: string | null }, b: { value: string; unit: string | null }): boolean =>
-  (sameText(a.value, b.value) && sameText(a.unit, b.unit)) || (/\d/.test(a.value) && /\d/.test(b.value) && compareValues(a, b) === 'same');
+type Valued = { value: string; unit: string | null };
+
+const sortedKey = (items: readonly (number | string)[]): string => [...new Set(items.map(String))].sort().join('|');
+const YEAR = /\b\d{4}\b/g;
+
+/**
+ * Same text, or (values with digits only) the same value written differently: "$60" / "60 USD" / "60" (unit not
+ * written), "2026-01-15" / "15 Jan 2026". Any change of shape counts as a change: a range ("60" → "60–90"), extra
+ * numbers ("60, max 3 days"), another unit (USD → EUR) or other words. Stricter than `compareValues`, which tolerates
+ * extra numbers in a copy.
+ */
+export function sameValue(a: Valued, b: Valued): boolean {
+  if (sameText(a.value, b.value) && sameText(a.unit, b.unit)) return true;
+  if (!/\d/.test(a.value) || !/\d/.test(b.value)) return false;
+  const da = parseDate(a.value);
+  const db = parseDate(b.value);
+  if (da !== undefined || db !== undefined) {
+    // One full date each (a second year means a range or another date).
+    return da !== undefined && da !== 'ambiguous' && da === db && (a.value.match(YEAR) ?? []).length === 1 && (b.value.match(YEAR) ?? []).length === 1;
+  }
+  const x = normaliseValue(a.value, a.unit);
+  const y = normaliseValue(b.value, b.unit);
+  const unitOk = x.unit === y.unit || x.unit === null || y.unit === null;
+  // Tokens with digits ("$60") are already covered by `numbers`.
+  const words = (w: readonly string[]): string => sortedKey(w.filter((t) => !/\d/.test(t)));
+  return x.numbers.length > 0 && x.numbers.length === y.numbers.length && sortedKey(x.numbers) === sortedKey(y.numbers) && unitOk && words(x.words) === words(y.words);
+}
 
 /**
  * Like `planMerge`, except for confirmed facts: a different value or unit (also on a reviewer-edited fact) becomes a
@@ -73,6 +97,9 @@ export function planDiff(existing: readonly StoredFact[], extracted: readonly Ex
   return { merge: { insert: plan.insert, update, remove: [] }, changes, missing: missing.sort() };
 }
 
+/** Text a dismissed value is remembered by (hashed in SQL): the same value written the same way is not raised again. */
+export const dismissedValueText = (value: string, unit: string | null): string => `${normaliseKeyPart(value)}|${normaliseKeyPart(unit)}`;
+
 /** A copy from the last scan, as far as impact needs it. */
 export interface CopyForImpact {
   id: string;
@@ -102,23 +129,38 @@ export interface ChangeImpact {
   /** Shown, never propagated. */
   unsure: number;
   historical: number;
+  /**
+   * In-sync copies whose stated value is missing or cannot be compared with the old or new value: shown, never
+   * propagated automatically (like `unsure`). Absent in impacts stored before it existed (read as 0).
+   */
+  needsCheck: number;
 }
 
 /** Which copies a confirmed change would update (PRD "Aturan propagasi"). `spaceOf` maps page id → space id. */
 export function computeImpact(changes: readonly FactChange[], copies: readonly CopyForImpact[], spaceOf: ReadonlyMap<string, string | null>): ChangeImpact {
   const byFact = new Map(changes.map((c) => [c.factId, c]));
-  const impact: ChangeImpact = { copies: [], alreadyNew: 0, syncCopyIds: [], unsure: 0, historical: 0 };
+  const impact: ChangeImpact = { copies: [], alreadyNew: 0, syncCopyIds: [], unsure: 0, historical: 0, needsCheck: 0 };
   for (const copy of copies) {
     const change = byFact.get(copy.factId);
     if (!change) continue;
     if (copy.status === 'unsure') impact.unsure++;
     else if (copy.status === 'historical') impact.historical++;
     else if (copy.status === 'in_sync' || copy.status === 'drifted') {
-      const stated = copy.statedValue === null ? 'unknown' : compareValues({ value: change.newValue, unit: change.newUnit }, { value: copy.statedValue, unit: copy.statedUnit });
-      if (stated === 'same') {
+      if (copy.statedValue === null) {
+        impact.needsCheck++;
+        continue;
+      }
+      const stated = { value: copy.statedValue, unit: copy.statedUnit };
+      const vsNew = compareValues({ value: change.newValue, unit: change.newUnit }, stated);
+      if (vsNew === 'same') {
         impact.alreadyNew++;
         if (copy.status === 'drifted') impact.syncCopyIds.push(copy.id);
-      } else impact.copies.push({ copyId: copy.id, factId: copy.factId, pageId: copy.pageId, spaceId: spaceOf.get(copy.pageId) ?? null, status: copy.status });
+        continue;
+      }
+      // An in-sync copy is only propagated when it provably states something else than the new value (or the old one).
+      const propagate = copy.status === 'drifted' || vsNew === 'different' || compareValues({ value: change.oldValue, unit: change.oldUnit }, stated) === 'same';
+      if (propagate) impact.copies.push({ copyId: copy.id, factId: copy.factId, pageId: copy.pageId, spaceId: spaceOf.get(copy.pageId) ?? null, status: copy.status });
+      else impact.needsCheck++;
     }
   }
   impact.copies.sort((a, b) => (a.pageId === b.pageId ? (a.copyId < b.copyId ? -1 : 1) : a.pageId < b.pageId ? -1 : 1));

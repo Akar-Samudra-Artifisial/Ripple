@@ -3,8 +3,8 @@
  * copies a change affects and the writes of a confirmation. Parameterised statements only; writes carry status guards
  * so a repeated or concurrent call converges (Forge SQL has no multi-statement transactions here).
  */
-import { randomUUID } from 'node:crypto';
-import type { ChangeImpact, CopyForImpact, FactChange } from '../core/changes';
+import { createHash, randomUUID } from 'node:crypto';
+import { dismissedValueText, type ChangeImpact, type CopyForImpact, type FactChange } from '../core/changes';
 import type { CopyStatus } from '../core/views';
 import { execute, query } from './sql';
 
@@ -25,6 +25,9 @@ export interface ChangeRow {
   factChanges: FactChange[];
   missingFactIds: string[];
   impact: ChangeImpact | null;
+  /** Set once confirmed. */
+  routing: ChangeRouting | null;
+  deadlineDays: number | null;
   createdAt: string | null;
 }
 
@@ -47,13 +50,32 @@ export interface ChangeRepo {
   supersedePending(sourcePageId: string): Promise<number>;
   /** Copies of the last scan(s) for these facts of the source. */
   copiesForFacts(sourcePageId: string, factIds: readonly string[]): Promise<CopyForChange[]>;
-  /** Pending → `status`; false when the change was decided meanwhile. */
-  decide(changeId: string, status: 'confirmed' | 'dismissed', actor: string, deadlineDays: number | null, routing: ChangeRouting | null): Promise<boolean>;
+  /** Lets a redelivered event through again (the diff could not be queued). */
+  releasePageEvent(pageId: string, version: number): Promise<void>;
+  /**
+   * Pending → `status`, only while the row still holds `version` (the version the user reviewed); false when it was
+   * decided or replaced by a newer version meanwhile.
+   */
+  decide(changeId: string, version: number, status: 'confirmed' | 'dismissed', actor: string, deadlineDays: number | null, routing: ChangeRouting | null): Promise<boolean>;
   /** Sets a confirmed fact to its new value (old value kept in `previous_value`); false when the fact changed meanwhile. */
   applyFactChange(sourcePageId: string, change: FactChange): Promise<boolean>;
   /** After a confirmed change: copies stating the old value become drifted, drifted ones stating the new value in sync. */
   restatusCopies(toDrift: readonly string[], toSync: readonly string[]): Promise<number>;
+  /** sha256 of the source text the last diff read; null before the first diff. */
+  textHash(pageId: string): Promise<string | null>;
+  setTextHash(pageId: string, hash: string): Promise<void>;
+  /** `dismissalKey(factId, valueHash(value, unit))` of every value dismissed for the source. */
+  dismissedValues(sourcePageId: string): Promise<Set<string>>;
+  /** Remembers the new values of a dismissed change (repeat-safe). */
+  saveDismissals(sourcePageId: string, changes: readonly FactChange[]): Promise<void>;
 }
+
+export const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex');
+export const valueHash = (value: string, unit: string | null): string => sha256(dismissedValueText(value, unit));
+export const dismissalKey = (factId: string, hash: string): string => `${factId}:${hash}`;
+
+/** page_events rows are only needed while Confluence may redeliver an event. */
+export const PAGE_EVENT_RETENTION_DAYS = 30;
 
 interface ChangeDbRow {
   id: string;
@@ -63,6 +85,8 @@ interface ChangeDbRow {
   fact_changes: unknown;
   missing_fact_ids: unknown;
   impact: unknown;
+  routing: unknown;
+  deadline_days: number | null;
   created_at: unknown;
 }
 
@@ -82,10 +106,12 @@ const toChange = (r: ChangeDbRow): ChangeRow => ({
   factChanges: (json(r.fact_changes) as FactChange[] | null) ?? [],
   missingFactIds: (json(r.missing_fact_ids) as string[] | null) ?? [],
   impact: (json(r.impact) as ChangeImpact | null) ?? null,
+  routing: (json(r.routing) as ChangeRouting | null) ?? null,
+  deadlineDays: r.deadline_days === null || r.deadline_days === undefined ? null : Number(r.deadline_days),
   createdAt: iso(r.created_at),
 });
 
-const CHANGE_COLUMNS = 'id, source_page_id, status, page_version, fact_changes, missing_fact_ids, impact, created_at';
+const CHANGE_COLUMNS = 'id, source_page_id, status, page_version, fact_changes, missing_fact_ids, impact, routing, deadline_days, created_at';
 const placeholders = (n: number): string => Array.from({ length: n }, () => '?').join(', ');
 
 const DRIFT_REASON = 'The official value changed; this copy states the old value.';
@@ -93,7 +119,13 @@ const SAME_REASON = 'Already states the new official value.';
 
 export const sqlChangeRepo: ChangeRepo = {
   async claimPageEvent(pageId, version) {
+    // Bounded table: events older than the retention are dropped on every insert.
+    await execute(`DELETE FROM page_events WHERE created_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL ${PAGE_EVENT_RETENTION_DAYS} DAY)`);
     return (await execute('INSERT IGNORE INTO page_events (page_id, version) VALUES (?, ?)', pageId, version)) > 0;
+  },
+
+  async releasePageEvent(pageId, version) {
+    await execute('DELETE FROM page_events WHERE page_id = ? AND version = ?', pageId, version);
   },
 
   async pendingChange(sourcePageId) {
@@ -165,14 +197,15 @@ export const sqlChangeRepo: ChangeRepo = {
     }));
   },
 
-  async decide(changeId, status, actor, deadlineDays, routing) {
+  async decide(changeId, version, status, actor, deadlineDays, routing) {
     const n = await execute(
-      "UPDATE changes SET status = ?, decided_by = ?, decided_at = CURRENT_TIMESTAMP, deadline_days = ?, routing = ? WHERE id = ? AND status = 'pending'",
+      "UPDATE changes SET status = ?, decided_by = ?, decided_at = CURRENT_TIMESTAMP, deadline_days = ?, routing = ? WHERE id = ? AND status = 'pending' AND page_version = ?",
       status,
       actor,
       deadlineDays,
       routing ? JSON.stringify(routing) : null,
       changeId,
+      version,
     );
     return n > 0;
   },
@@ -204,5 +237,25 @@ export const sqlChangeRepo: ChangeRepo = {
       await execute(`UPDATE copies SET status = 'in_sync', reason = ? WHERE status = 'drifted' AND id IN (${placeholders(toSync.length)})`, SAME_REASON, ...toSync);
     }
     return n;
+  },
+
+  async textHash(pageId) {
+    const rows = await query<{ text_hash: string | null }>('SELECT text_hash FROM sources WHERE page_id = ?', pageId);
+    return rows[0]?.text_hash ?? null;
+  },
+
+  async setTextHash(pageId, hash) {
+    await execute('UPDATE sources SET text_hash = ? WHERE page_id = ?', hash, pageId);
+  },
+
+  async dismissedValues(sourcePageId) {
+    const rows = await query<{ fact_id: string; value_hash: string }>('SELECT fact_id, value_hash FROM change_dismissals WHERE source_page_id = ?', sourcePageId);
+    return new Set(rows.map((r) => dismissalKey(r.fact_id, r.value_hash)));
+  },
+
+  async saveDismissals(sourcePageId, changes) {
+    for (const c of changes) {
+      await execute('INSERT IGNORE INTO change_dismissals (fact_id, value_hash, source_page_id) VALUES (?, ?, ?)', c.factId, valueHash(c.newValue, c.newUnit), sourcePageId);
+    }
   },
 };

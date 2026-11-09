@@ -114,11 +114,14 @@ function ChangeReview({ mode, onDecided }: ChangeReviewProps) {
     setPending(action);
     setError(undefined);
     try {
-      const payload = action === 'confirmChange' ? { changeId: change.id, deadlineDays: days, version: change.version } : { changeId: change.id };
+      const payload = action === 'confirmChange' ? { changeId: change.id, deadlineDays: days, version: change.version } : { changeId: change.id, version: change.version };
       setDone(await call<ChangeDecision>(action, payload));
       onDecided?.();
     } catch (e) {
-      setError(errorOf(e));
+      const message = errorOf(e);
+      setError(message);
+      // A newer page version replaced the reviewed change: show the latest one.
+      if (message.includes('Review it again')) load();
     } finally {
       setPending(undefined);
       setConfirmDismiss(false);
@@ -194,6 +197,7 @@ function ChangeReview({ mode, onDecided }: ChangeReviewProps) {
   const deadlineId = `${headingId}-deadline`;
   const notIncluded: string[] = [
     change.unsure > 0 ? `${plural(change.unsure, 'unsure copy', 'unsure copies')} (needs a human check)` : '',
+    change.needsCheck > 0 ? `${plural(change.needsCheck, 'copy', 'copies')} whose value could not be compared (check by hand)` : '',
     change.hiddenCount > 0 ? `${plural(change.hiddenCount, 'copy', 'copies')} in pages you can't view` : '',
     change.alreadyNew > 0 ? `${plural(change.alreadyNew, 'copy', 'copies')} already showing the new value` : '',
     change.historical > 0 ? `${plural(change.historical, 'historical mention', 'historical mentions')}` : '',
