@@ -353,7 +353,7 @@ export interface SettingsDeps {
   ensure: () => Promise<void>;
 }
 
-const defaultSettingsDeps: SettingsDeps = { repo: sqlChangeIssueRepo, jira, ensure: ensureSchema };
+export const defaultSettingsDeps: SettingsDeps = { repo: sqlChangeIssueRepo, jira, ensure: ensureSchema };
 
 /**
  * Who may change the settings: Jira administrators (global ADMINISTER of the calling user, read as that user via
@@ -361,7 +361,7 @@ const defaultSettingsDeps: SettingsDeps = { repo: sqlChangeIssueRepo, jira, ensu
  * expand=operations`) needs a scope Ripple does not have, and the global settings page is not limited to admins.
  * Fails closed: a check that cannot be made (401/403, no consent, Jira down) is `check_failed`, never "admin".
  */
-async function adminCheck(ctx: SettingsContext, deps: SettingsDeps): Promise<AdminCheck> {
+export async function adminCheck(ctx: SettingsContext, deps: Pick<SettingsDeps, 'jira'>): Promise<AdminCheck> {
   if (ctx.moduleKey !== SETTINGS_MODULE || !ctx.accountId) return 'not_admin';
   try {
     return (await deps.jira.isCurrentUserAdmin()) ? 'admin' : 'not_admin';

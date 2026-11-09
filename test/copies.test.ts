@@ -45,6 +45,7 @@ import { getScanStatus, JUDGE_CONCURRENCY, JUDGE_QUEUE, listCopies, MAX_LLM_CALL
 import type { SourceContext } from '../src/surfaces/sources';
 import { COPY_PAGES, FACT_KEYS, SOURCE_PAGE_ID, type FactKey, type JudgeMention } from './fixtures/copies';
 import { TRAVEL_POLICY_FACTS } from './fixtures/travelPolicy';
+import { NIMBUS_EXPECTED, NIMBUS_PAGES, NIMBUS_SOURCE, TRAP_SLUG, type NimbusMention } from '../src/demo/nimbus';
 
 // ---------------------------------------------------------------------------------------------------------------
 // Fixtures and fakes
@@ -1198,5 +1199,51 @@ describe('M2 review: resolvers', () => {
     scans.unconfirmed.add(factId('claims'));
     const after = await getScanStatus(ctx, copyDeps());
     expect(after).toMatchObject({ counts: { drifted: 1, in_sync: 4 } });
+  });
+});
+
+describe('M6 Nimbus Labs demo data through the scan rules (simulated judge)', () => {
+  /** What a careful judge answers for one demo sentence; the trap sentence is also judged against the international per diem. */
+  const judged = (n: NimbusMention): Judgement[] => {
+    const base = { statedValue: n.statedValue, statedUnit: n.statedUnit, statedCondition: n.statedCondition, quote: n.quote };
+    if (n.status === 'historical') return [judgement(n.fact, { ...base, mention: 'historical', reasonCode: 'historical' })];
+    if (n.status === 'unsure') {
+      return [
+        judgement('domestic', { ...base, sameFact: 'unsure', reasonCode: 'different_condition' }),
+        judgement('international', { ...base, sameFact: 'no', reasonCode: 'different_condition' }),
+      ];
+    }
+    return [judgement(n.fact, { ...base, reasonCode: n.status === 'in_sync' ? 'value_matches' : 'value_differs' })];
+  };
+  const pageResults = (p: (typeof NIMBUS_PAGES)[number]) => {
+    const items = p.mentions.flatMap(judged).map((j) => {
+      const f = FACTS.find((x) => x.id === j.factId) as ScanFact;
+      return { fact: f, judgement: j, ...judgeOutcome(f, j, siblingsOf(f, FACTS)) };
+    });
+    return settleSiblings(items, FACTS).filter((i) => i.decision);
+  };
+
+  it('the demo source states the five Travel Policy facts verbatim', () => {
+    for (const f of TRAVEL_POLICY_FACTS) expect(NIMBUS_SOURCE.storage).toContain(f.quote);
+  });
+
+  it('every sentence gets the status the demo expects; the trap is one unsure card on the domestic per diem', () => {
+    for (const p of NIMBUS_PAGES) {
+      const got = pageResults(p).map((i) => [i.fact.id, i.decision?.status]);
+      expect(got, p.slug).toEqual(p.mentions.map((m) => [factId(m.fact), m.status]));
+    }
+    const trap = pageResults(NIMBUS_PAGES.find((p) => p.slug === TRAP_SLUG) as (typeof NIMBUS_PAGES)[number]);
+    expect(trap.map((i) => [i.fact.id, i.decision?.status])).toEqual([[factId('domestic'), 'unsure']]);
+  });
+
+  it('byline counts: "23 copies, 4 out of date"; the historical mention is not a copy', () => {
+    const statuses = NIMBUS_PAGES.flatMap((p) => pageResults(p).map((i) => i.decision?.status));
+    const count = (s: CopyStatus) => statuses.filter((x) => x === s).length;
+    expect(count('in_sync')).toBe(NIMBUS_EXPECTED.inSync);
+    expect(count('drifted')).toBe(NIMBUS_EXPECTED.outOfDate);
+    expect(count('unsure')).toBe(NIMBUS_EXPECTED.unsure);
+    expect(count('historical')).toBe(NIMBUS_EXPECTED.historical);
+    expect(count('in_sync') + count('drifted') + count('unsure')).toBe(NIMBUS_EXPECTED.copies);
+    expect(NIMBUS_EXPECTED).toMatchObject({ copies: 23, outOfDate: 4 });
   });
 });

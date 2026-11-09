@@ -1,0 +1,91 @@
+/**
+ * M6 "Load demo data": Confluence calls as the admin who pressed the button (resolvers only). Spaces are created with
+ * REST v1 `POST /wiki/rest/api/space` (`write:confluence-space`; v2 space creation needs a scope Ripple does not
+ * have), pages with REST v2 (`write:page:confluence`). Every call returns the HTTP status only, never a body.
+ */
+import api, { route } from '@forge/api';
+import type { UserResult } from './confluence';
+
+export interface DemoRef {
+  id: string;
+  /** Absolute link (`_links.base` + `webui`); null when Confluence returned none. */
+  url: string | null;
+}
+
+export interface DemoConfluence {
+  findSpace(key: string): Promise<UserResult<DemoRef | null>>;
+  createSpace(key: string, name: string, description: string): Promise<UserResult<DemoRef>>;
+  findPage(spaceId: string, title: string): Promise<UserResult<DemoRef | null>>;
+  createPage(spaceId: string, title: string, storage: string): Promise<UserResult<DemoRef>>;
+  /** Hands the new page (version 1) to another owner by saving version 2 with the same title and body. */
+  setOwner(pageId: string, title: string, storage: string, ownerAccountId: string): Promise<UserResult<true>>;
+}
+
+interface Links {
+  base?: string;
+  webui?: string;
+}
+
+const json = { Accept: 'application/json' };
+const send = { Accept: 'application/json', 'Content-Type': 'application/json' };
+const link = (base: string | undefined, webui: string | undefined): string | null => (base && webui ? `${base}${webui}` : null);
+
+export const demoConfluence: DemoConfluence = {
+  async findSpace(key) {
+    const res = await api.asUser().requestConfluence(route`/wiki/api/v2/spaces?keys=${key}&limit=1`, { headers: json });
+    if (!res.ok) return { ok: false, status: res.status };
+    const body = (await res.json()) as { results?: { id?: string | number; key?: string; _links?: Links }[]; _links?: Links };
+    const space = body.results?.find((s) => s.key === key);
+    if (!space || space.id === undefined) return { ok: true, value: null };
+    return { ok: true, value: { id: String(space.id), url: link(body._links?.base, space._links?.webui) } };
+  },
+
+  async createSpace(key, name, description) {
+    const res = await api.asUser().requestConfluence(route`/wiki/rest/api/space`, {
+      method: 'POST',
+      headers: send,
+      body: JSON.stringify({ key, name, description: { plain: { value: description, representation: 'plain' } } }),
+    });
+    if (!res.ok) return { ok: false, status: res.status };
+    const body = (await res.json()) as { id?: string | number; _links?: Links };
+    if (body.id === undefined) return { ok: false, status: 502 };
+    return { ok: true, value: { id: String(body.id), url: link(body._links?.base, body._links?.webui) } };
+  },
+
+  async findPage(spaceId, title) {
+    const res = await api.asUser().requestConfluence(route`/wiki/api/v2/spaces/${spaceId}/pages?title=${title}&status=current&limit=1`, { headers: json });
+    if (!res.ok) return { ok: false, status: res.status };
+    const body = (await res.json()) as { results?: { id?: string | number; title?: string; _links?: Links }[]; _links?: Links };
+    const page = body.results?.find((r) => r.title === title);
+    if (!page || page.id === undefined) return { ok: true, value: null };
+    return { ok: true, value: { id: String(page.id), url: link(body._links?.base, page._links?.webui) } };
+  },
+
+  async createPage(spaceId, title, storage) {
+    const res = await api.asUser().requestConfluence(route`/wiki/api/v2/pages`, {
+      method: 'POST',
+      headers: send,
+      body: JSON.stringify({ spaceId, status: 'current', title, body: { representation: 'storage', value: storage } }),
+    });
+    if (!res.ok) return { ok: false, status: res.status };
+    const page = (await res.json()) as { id?: string | number; _links?: Links };
+    if (page.id === undefined) return { ok: false, status: 502 };
+    return { ok: true, value: { id: String(page.id), url: link(page._links?.base, page._links?.webui) } };
+  },
+
+  async setOwner(pageId, title, storage, ownerAccountId) {
+    const res = await api.asUser().requestConfluence(route`/wiki/api/v2/pages/${pageId}`, {
+      method: 'PUT',
+      headers: send,
+      body: JSON.stringify({
+        id: pageId,
+        status: 'current',
+        title,
+        ownerId: ownerAccountId,
+        body: { representation: 'storage', value: storage },
+        version: { number: 2, message: 'Ripple demo data: page owner' },
+      }),
+    });
+    return res.ok ? { ok: true, value: true } : { ok: false, status: res.status };
+  },
+};

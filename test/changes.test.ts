@@ -26,6 +26,7 @@ import { SchemaSettingUpError } from '../src/core/schema';
 import { confirmChange, dismissChange, getLatestChange, getPendingChange, handlePageUpdate, healSource, runDiffJob, SCHEMA_DEFER_SECONDS, type ChangeDeps, type HealDeps, type DiffDeps, type TriggerDeps } from '../src/surfaces/changes';
 import { COPY_PAGES, SOURCE_PAGE_ID, type FactKey } from './fixtures/copies';
 import { TRAVEL_POLICY_FACTS, TRAVEL_POLICY_STORAGE } from './fixtures/travelPolicy';
+import { NIMBUS_EXPECTED, NIMBUS_PAGES } from '../src/demo/nimbus';
 
 const CHANGE_RE = /^[0-9a-f-]{36}$/i;
 
@@ -1064,5 +1065,21 @@ describe('change resolvers', () => {
     const other = await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(6, '$80'));
     expect(other).toMatchObject({ status: 'done', changed: 1 });
     expect([...store.changes.values()].find((c) => c.status === 'pending')?.factChanges[0]?.newValue).toBe('$80');
+  });
+});
+
+describe('M6 Nimbus Labs demo: domestic per diem $60 → $75', () => {
+  it('the change modal shows 14 affected copies; the $40 trap and the history mention are shown, never propagated', () => {
+    const domestic = TRAVEL_POLICY_FACTS[0];
+    expect(domestic?.condition).toBe('Domestic travel');
+    const change: FactChange = { factId: 'f-domestic', oldValue: domestic?.value ?? '', oldUnit: domestic?.unit ?? null, newValue: '75', newUnit: domestic?.unit ?? null, newQuote: 'The per diem for domestic travel is $75 per day.', version: 2, versionAt: null };
+    const copies = NIMBUS_PAGES.flatMap((p, pi) =>
+      p.mentions.map((m, mi) => ({ id: `c-${pi}-${mi}`, factId: m.fact === 'domestic' ? 'f-domestic' : `f-${m.fact}`, pageId: String(9800000 + pi), status: m.status, statedValue: m.statedValue, statedUnit: m.statedUnit })),
+    );
+    const impact = computeImpact([change], copies, new Map());
+    expect(impact.copies).toHaveLength(NIMBUS_EXPECTED.domesticCopies);
+    expect(NIMBUS_EXPECTED.domesticCopies).toBe(14);
+    expect(impact.copies.filter((c) => c.status === 'drifted')).toHaveLength(1);
+    expect(impact).toMatchObject({ unsure: 1, historical: 1, needsCheck: 0, alreadyNew: 0 });
   });
 });

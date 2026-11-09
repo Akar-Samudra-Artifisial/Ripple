@@ -482,6 +482,33 @@ export interface ApprovalView {
   } | null;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// M6: "Load demo data" (Ripple settings page, Jira administrators)
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Progress of the Nimbus Labs demo data; `loadDemoData` loads in steps, the UI calls it again while `loading`. */
+export interface DemoStatus {
+  state: 'idle' | 'loading' | 'done' | 'failed';
+  /** Spaces and pages created or found so far, out of `total`. */
+  step: number;
+  total: number;
+  spaces: { key: string; name: string; url: string | null }[];
+  /** The "Travel Policy" page to mark as the source (Ripple never marks it itself). */
+  sourcePageUrl: string | null;
+  /** The viewer may load the demo data (Jira administrators). */
+  canEdit: boolean;
+  /**
+   * `not_allowed`, `admin_check_failed`, `invalid_owner_ids`, `owner_change_failed` (some pages kept the admin as
+   * owner), or the failing step (`space_create_http_403`, `page_find_http_404`, …).
+   */
+  errorCode: string | null;
+}
+
+export interface LoadDemoPayload {
+  /** Optional page owners (Atlassian account ids, at most 6), given out round robin; default: the caller. */
+  ownerAccountIds?: string[];
+}
+
 /** Resolver name → payload and success reply. Every resolver may also answer `ErrorReply`. */
 export interface ResolverContract {
   /** Proposals for the copy page being viewed. */
@@ -501,6 +528,10 @@ export interface ResolverContract {
   saveSettings: { payload: SaveSettingsPayload; reply: SaveSettingsResult };
   /** Jira issue panel: the update task's pages (read-only). */
   getApproval: { payload: undefined; reply: ApprovalView };
+  /** M6, Ripple settings page: progress of the Nimbus Labs demo data. */
+  getDemoStatus: { payload: undefined; reply: DemoStatus };
+  /** Jira administrators only: creates (or resumes creating) the demo spaces and pages as the caller; idempotent. */
+  loadDemoData: { payload: LoadDemoPayload; reply: DemoStatus };
   /** On the source page: the latest confirmed change (for the Rollout tab). */
   getLatestChange: { payload: undefined; reply: LatestChangeReply };
   getPendingChange: { payload: undefined; reply: PendingChangeReply };

@@ -1,7 +1,9 @@
+import { router } from '@forge/bridge';
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from 'react';
-import type { SaveSettingsResult, SettingsView } from '../../src/core/views';
+import type { DemoStatus, SaveSettingsResult, SettingsView } from '../../src/core/views';
 import { call } from './bridge';
 import { Alert, LoadingRows, errorOf } from './components';
+import { httpsUrl } from './links';
 import { mount } from './mount';
 
 /** Jira project keys: start with a letter, then uppercase letters, digits or underscores (Jira default 2–10). */
@@ -145,4 +147,165 @@ function Settings() {
   );
 }
 
-mount(<Settings />);
+const DEMO_ERROR: Record<string, string> = {
+  not_allowed: 'Only Jira administrators can load demo data.',
+  admin_check_failed: "Couldn't check your Jira permissions. Try again in a moment.",
+  invalid_owner_ids: 'Enter up to 6 Atlassian account IDs, separated by commas or new lines.',
+  owner_change_failed: 'Demo data loaded, but some pages could not be given to the other owners. You own those pages.',
+};
+
+function demoErrorText(code: string): string {
+  if (DEMO_ERROR[code]) return DEMO_ERROR[code];
+  if (code.startsWith('space_create_http_403')) return 'You need permission to create spaces in Confluence to load demo data.';
+  return `Loading stopped (${code}). Press the button again to continue where it stopped.`;
+}
+
+function ExternalLink({ url, children }: { url: string; children: string }) {
+  return (
+    <a
+      className="copy__link"
+      href={url}
+      target="_blank"
+      rel="noreferrer"
+      onClick={(e) => {
+        e.preventDefault();
+        void router.open(url).catch(() => undefined);
+      }}
+    >
+      {children}
+      <span className="sr-only"> (opens in a new tab)</span>
+    </a>
+  );
+}
+
+/**
+ * M6 "Load demo data": creates the Nimbus Labs spaces and pages as the administrator, calling `loadDemoData` again
+ * while it reports `loading` (each call works within a time budget). Pressing again after a stop resumes.
+ */
+function DemoData() {
+  const [status, setStatus] = useState<DemoStatus>();
+  const [loadError, setLoadError] = useState<string>();
+  const [owners, setOwners] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState<string>();
+  const id = useId();
+
+  const refresh = useCallback(async () => {
+    setLoadError(undefined);
+    try {
+      setStatus(await call<DemoStatus>('getDemoStatus'));
+    } catch (e) {
+      setLoadError(errorOf(e));
+    }
+  }, []);
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const start = async () => {
+    if (busy) return;
+    const ids = owners
+      .split(/[\s,]+/)
+      .map((x) => x.trim())
+      .filter((x) => x !== '');
+    if (ids.length > 6) {
+      setProblem(DEMO_ERROR.invalid_owner_ids);
+      return;
+    }
+    setProblem(undefined);
+    setBusy(true);
+    try {
+      let s = await call<DemoStatus>('loadDemoData', { ownerAccountIds: ids });
+      setStatus(s);
+      for (let i = 0; s.state === 'loading' && i < 10; i++) {
+        s = await call<DemoStatus>('loadDemoData', {});
+        setStatus(s);
+      }
+    } catch (e) {
+      setProblem(`Loading stopped. ${errorOf(e)} Press the button again to continue.`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!status) {
+    return loadError ? <Alert message={`Could not load the demo data status: ${loadError}`} onRetry={() => void refresh()} /> : <LoadingRows label="Loading demo data status…" />;
+  }
+  const source = httpsUrl(status.sourcePageUrl);
+  const error = problem ?? (status.errorCode ? demoErrorText(status.errorCode) : undefined);
+
+  return (
+    <section className="settings__form" aria-labelledby={`${id}-title`}>
+      <h2 id={`${id}-title`}>Demo data</h2>
+      <p className="muted">
+        Creates five Nimbus Labs spaces with an official Travel Policy and pages that repeat its facts, some of them out of date. Open the Travel Policy and mark it as a
+        source of truth to try Ripple.
+      </p>
+      {status.canEdit && status.state !== 'done' ? (
+        <>
+          <label className="field" htmlFor={`${id}-owners`}>
+            <span className="field__label">Owner account IDs (optional, up to 6)</span>
+            <input
+              id={`${id}-owners`}
+              className="field__input"
+              value={owners}
+              disabled={busy}
+              autoComplete="off"
+              spellCheck={false}
+              aria-describedby={`${id}-owners-help`}
+              onChange={(e) => {
+                setOwners(e.target.value);
+                setProblem(undefined);
+              }}
+            />
+          </label>
+          <p id={`${id}-owners-help`} className="muted source__meta">
+            Copy pages are shared among these accounts. Leave empty to own every page yourself.
+          </p>
+          <div className="actions">
+            <button type="button" className="button button--primary" disabled={busy} aria-busy={busy} onClick={() => void start()}>
+              {busy ? 'Loading…' : status.state === 'idle' ? 'Load demo data' : 'Continue loading'}
+            </button>
+          </div>
+        </>
+      ) : !status.canEdit ? (
+        <p className="muted">Only Jira administrators can load demo data.</p>
+      ) : null}
+      <div aria-live="polite" className="settings__result">
+        {status.state === 'loading' || busy ? (
+          <p className="muted">
+            Created {status.step} of {status.total} spaces and pages…
+          </p>
+        ) : null}
+        {status.state === 'done' ? (
+          <p className="ok">
+            Demo data is ready.{' '}
+            {source ? <ExternalLink url={source}>Open the Travel Policy</ExternalLink> : null}
+          </p>
+        ) : null}
+        {error ? <p className="field__error">{error}</p> : null}
+      </div>
+      {status.spaces.length > 0 ? (
+        <ul className="settings__spaces">
+          {status.spaces.map((s) => {
+            const url = httpsUrl(s.url);
+            return <li key={s.key}>{url ? <ExternalLink url={url}>{s.name}</ExternalLink> : s.name}</li>;
+          })}
+        </ul>
+      ) : null}
+    </section>
+  );
+}
+
+function SettingsPage() {
+  return (
+    <>
+      <Settings />
+      <div className="shell settings">
+        <DemoData />
+      </div>
+    </>
+  );
+}
+
+mount(<SettingsPage />);

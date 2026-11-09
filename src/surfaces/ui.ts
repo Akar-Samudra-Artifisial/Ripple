@@ -12,7 +12,8 @@ import type { ApproveProposalPayload, ChangeIdOnlyPayload, ProposalIdPayload } f
 import type { BylineStatus, ChangeIdPayload, ConfirmChangePayload, CopyListPayload, PendingChangeFlag, FactEditPayload, FactIdPayload, OwnerView, SchemaView, SpaceTeamsView } from '../core/views';
 import { confirmFact, editFact, getSourceStatus, listFacts, markSource, rejectFact, unmarkSource, type SourceContext } from './sources';
 import { getApproval, getSettings, saveSettings, type ApprovalContext, type SettingsContext } from './changeIssues';
-import type { SaveSettingsPayload } from '../core/views';
+import type { LoadDemoPayload, SaveSettingsPayload } from '../core/views';
+import { getDemoStatus, loadDemoData } from './demo';
 
 export type ResolverContext = {
   accountId?: string;
@@ -167,5 +168,8 @@ resolver.define('listRollout', ({ context, payload }) => listRollout(context as 
 resolver.define('getSettings', ({ context }) => getSettings(context as SettingsContext));
 resolver.define('saveSettings', ({ context, payload }) => saveSettings(context as SettingsContext, payload as Partial<SaveSettingsPayload>));
 resolver.define('getApproval', ({ context }) => getApproval(context as ApprovalContext));
+// M6: "Load demo data" on the settings page (Jira administrators).
+resolver.define('getDemoStatus', ({ context }) => getDemoStatus(context as SettingsContext));
+resolver.define('loadDemoData', ({ context, payload }) => loadDemoData(context as SettingsContext, payload as Partial<LoadDemoPayload>));
 
 export const handler = resolver.getDefinitions();

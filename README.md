@@ -11,7 +11,16 @@ owning team via Teamwork Graph; every other module is declared and answers "not 
 ## Permissions
 
 See `docs/PRIVACY.md`. `write:confluence-space` is used only by the "Load demo data" button (creates the demo
-spaces HR/ONB/FIN/SALES/HELP); no other code path creates or changes spaces.
+spaces NLHR/NLONB/NLFIN/NLSALES/NLHELP); no other code path creates or changes spaces.
+
+## Demo data (M6)
+
+Ripple settings → **Load demo data** (Jira administrators) creates the Nimbus Labs scenario of `src/demo/nimbus.ts`
+as the admin: five spaces, the "Travel Policy" page (not marked as a source: do that yourself) and 17 copy pages plus
+one history page. Expected after marking the source and scanning: "23 copies, 4 out of date"; changing the domestic
+per diem $60 → $75 affects 14 copies. Loading runs in steps (~18 s per call, the page continues by itself) and is
+idempotent: spaces are found by key, pages by title. Optional "Owner account IDs" (up to 6) share the copy pages
+round robin. Removing demo data is not available yet.
 
 ## Layout
 

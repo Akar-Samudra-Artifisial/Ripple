@@ -19,7 +19,11 @@ and an audit trail of who confirmed, approved or rejected what and when.
   `read:label:confluence`, `read:space:confluence`, `search:confluence`): find source-of-truth facts and their copies.
 - **Write pages** (`write:page:confluence`): apply an edit only after its page owner approves it, as that user.
 - **Create spaces** (`write:confluence-space`): used **only** by the admin's "Load demo data" button, which creates
-  the Nimbus Labs demo spaces (HR, ONB, FIN, SALES, HELP). Ripple never creates or changes spaces otherwise.
+  the Nimbus Labs demo spaces (`NLHR`, `NLONB`, `NLFIN`, `NLSALES`, `NLHELP`) and their pages as that admin (Jira
+  administrators only). Ripple never creates or changes spaces otherwise. Its progress (space and page ids and links,
+  and the optional owner account ids the admin entered, at most 6) is stored in the `settings` table under `demo`;
+  logs carry only ids, counts and error codes, never an account id. Copy pages are handed to those owners by saving
+  the page once more with a new owner; if that fails, the admin stays the owner.
 - **User display names** (`read:user:confluence`): show the page owner's name next to their update (as the viewing
   user, so profile visibility settings apply). Names are not stored.
 - **Jira** (`read:jira-work`, `write:jira-work`): one update task per page owner per change, and the approval panel.
