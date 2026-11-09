@@ -4,8 +4,9 @@ import { displayNames } from '../adapters/confluenceUsers';
 import { asUserGraph, fetchPageMeta, ownersFromPage, readSpaceTeams, scrubErrorText, type GraphRequest, type PageMeta } from '../adapters/teamworkGraph';
 import { LATEST_MIGRATION, MIGRATIONS } from '../core/migrations';
 import { SchemaSettingUpError } from '../core/schema';
+import { confirmChange, dismissChange, getPendingChange, pendingChangeFlag, type ChangeContext } from './changes';
 import { getScanStatus, listCopies, startScan } from './copies';
-import type { BylineStatus, CopyListPayload, FactEditPayload, FactIdPayload, OwnerView, SchemaView, SpaceTeamsView } from '../core/views';
+import type { BylineStatus, ChangeIdPayload, ConfirmChangePayload, CopyListPayload, PendingChangeFlag, FactEditPayload, FactIdPayload, OwnerView, SchemaView, SpaceTeamsView } from '../core/views';
 import { confirmFact, editFact, getSourceStatus, listFacts, markSource, rejectFact, unmarkSource, type SourceContext } from './sources';
 import { notImplemented } from './stub';
 
@@ -35,10 +36,12 @@ export interface BylineDeps {
   graph: (cloudId: string) => GraphRequest;
   pageMeta: (pageId: string) => Promise<PageMeta>;
   names: (accountIds: readonly string[]) => Promise<Map<string, string>>;
+  /** M3 pending change of the page; must not throw (null on failure). */
+  pendingChange: (pageId: string) => Promise<PendingChangeFlag | null>;
   ensure: () => Promise<void>;
 }
 
-const defaultDeps: BylineDeps = { graph: asUserGraph, pageMeta: fetchPageMeta, names: (ids) => displayNames(ids), ensure: ensureSchema };
+const defaultDeps: BylineDeps = { graph: asUserGraph, pageMeta: fetchPageMeta, names: (ids) => displayNames(ids), pendingChange: (id) => pendingChangeFlag(id), ensure: ensureSchema };
 
 /** Space id from the byline context, or from the REST v2 page when the context has none. */
 async function spaceIdOf(ctx: ResolverContext, page: () => Promise<PageMeta>): Promise<string> {
@@ -95,7 +98,8 @@ export async function bylineStatus(ctx: ResolverContext, deps: BylineDeps = defa
       spaceTeams = { spaceId: null, teams: [], dataPresent: false, errors: [errorText(err)] };
     }
   }
-  return { message: bylineMessage(schema), schema, owner, spaceTeams };
+  const pendingChange = schema.status === 'ready' && pageId !== undefined && String(pageId) !== '' ? await deps.pendingChange(String(pageId)) : null;
+  return { message: bylineMessage(schema), schema, owner, spaceTeams, pendingChange };
 }
 
 const resolver = new Resolver();
@@ -113,6 +117,10 @@ resolver.define('editFact', ({ context, payload }) => editFact(context as Source
 resolver.define('getScanStatus', ({ context }) => getScanStatus(context as SourceContext));
 resolver.define('startScan', ({ context }) => startScan(context as SourceContext));
 resolver.define('listCopies', ({ context, payload }) => listCopies(context as SourceContext, payload as Partial<CopyListPayload>));
+// M3 (FR-7).
+resolver.define('getPendingChange', ({ context }) => getPendingChange(context as ChangeContext));
+resolver.define('confirmChange', ({ context, payload }) => confirmChange(context as ChangeContext, payload as Partial<ConfirmChangePayload>));
+resolver.define('dismissChange', ({ context, payload }) => dismissChange(context as ChangeContext, payload as Partial<ChangeIdPayload>));
 resolver.define('getSettings', () => notImplemented('settings'));
 resolver.define('getApproval', () => notImplemented('approval panel'));
 

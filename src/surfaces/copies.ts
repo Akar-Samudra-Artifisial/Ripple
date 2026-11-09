@@ -32,6 +32,7 @@ import {
   type PageMention,
   type ScanFact,
 } from '../core/copies';
+import { identityKey } from '../core/facts';
 import { storageToText } from '../core/pageText';
 import { isSqlRateLimited, SchemaSettingUpError, sqlErrorInfo, type SqlErrorInfo } from '../core/schema';
 import { COPY_STATUSES, type CopyList, type CopyListPayload, type CopyStatus, type ErrorReply, type ScanStatus, type ScanView } from '../core/views';
@@ -291,16 +292,48 @@ async function discardUnmarked(scan: ScanRow, deps: ScanJobDeps): Promise<ScanOu
   return { status: 'skipped', reason: 'source unmarked' };
 }
 
-/** Search phrases per fact from the LLM (once per scan). A failed suggestion only means fewer terms. */
-async function termsFor(facts: readonly ScanFact[], deps: ScanJobDeps): Promise<Record<string, string[]>> {
+/** Search phrases per fact from the LLM. Undefined when the suggestion failed (fewer terms, nothing cached). */
+async function termsFor(facts: readonly ScanFact[], deps: ScanJobDeps): Promise<Record<string, string[]> | undefined> {
   try {
     const { args } = await suggestSearchTerms(facts, deps.llm);
     return parseTermSuggestions(args, facts.map((f) => f.id));
   } catch (err) {
     if (isLlmRetryable(err)) throw err;
     console.warn('ripple search: no synonym terms', { error: errorText(err) });
-    return {};
+    return undefined;
   }
+}
+
+/**
+ * Synonyms per fact: reused from the per-fact cache while the fact's subject/attribute/condition are unchanged, so
+ * repeated scans search with the same CQL; one LLM call only for facts without (current) cached terms.
+ */
+async function stableTerms(scanId: string, facts: readonly ScanFact[], deps: ScanJobDeps): Promise<{ terms: Record<string, string[]>; cached: number }> {
+  const cache = await deps.scans.factSearchTerms(facts.map((f) => f.id));
+  const terms: Record<string, string[]> = {};
+  const missing: { fact: ScanFact; key: string }[] = [];
+  for (const fact of facts) {
+    const key = identityKey(fact.subject, fact.attribute, fact.condition);
+    const hit = cache.get(fact.id);
+    if (hit && hit.key === key) terms[fact.id] = hit.terms;
+    else missing.push({ fact, key });
+  }
+  const cached = facts.length - missing.length;
+  if (missing.length === 0) return { terms, cached };
+  let fresh: Record<string, string[]> | undefined;
+  try {
+    fresh = await termsFor(
+      missing.map((m) => m.fact),
+      deps,
+    );
+  } finally {
+    await deps.scans.addLlmCalls(scanId, 1);
+  }
+  for (const { fact, key } of missing) {
+    terms[fact.id] = fresh?.[fact.id] ?? [];
+    if (fresh) await deps.scans.saveFactSearchTerms(fact.id, { key, terms: terms[fact.id] ?? [] });
+  }
+  return { terms, cached };
 }
 
 /**
@@ -325,12 +358,9 @@ export async function runSearchJob(scanId: string, retryCount: number, deps: Sca
     }
     let terms = scan.terms;
     if (!terms) {
-      try {
-        terms = await termsFor(facts, deps);
-      } finally {
-        await deps.scans.addLlmCalls(scanId, 1);
-      }
-      await deps.scans.setTerms(scanId, terms);
+      const stable = await stableTerms(scanId, facts, deps);
+      terms = stable.terms;
+      await deps.scans.setTerms(scanId, terms, stable.cached);
     }
     let searched = 0;
     for (let i = scan.factCursor; i < ids.length; i++) {
@@ -589,6 +619,7 @@ export async function runJudgeJob(scanId: string, retryCount: number, deps: Scan
       pagesJudged: final?.pagesJudged ?? pages,
       pagesSkipped: final?.pagesSkipped ?? skipped,
       llmCalls: budget.used,
+      synonymsCached: final?.synonymsCached ?? scan.synonymsCached ?? 0,
       partial,
       dropped,
       counts,

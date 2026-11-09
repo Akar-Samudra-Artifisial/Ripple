@@ -17,6 +17,8 @@ export interface ScanRow extends ScanView {
   /** Fact id → extra search phrases, decided once per scan; null until the search consumer set them. */
   terms: Record<string, string[]> | null;
   llmCalls: number;
+  /** Facts whose synonyms came from the per-fact cache when the terms were set. */
+  synonymsCached?: number;
 }
 
 export interface HitInput {
@@ -55,6 +57,12 @@ export interface ChunkResult {
 }
 
 /** Storage of scans, candidate hits and copies (an in-memory fake implements it in tests). */
+/** Synonyms generated once for a fact; reused while the fact's identity key (subject|attribute|condition) is `key`. */
+export interface CachedTerms {
+  key: string;
+  terms: string[];
+}
+
 export interface ScanRepo {
   latestScan(sourcePageId: string): Promise<ScanRow | undefined>;
   getScan(scanId: string): Promise<ScanRow | undefined>;
@@ -62,7 +70,11 @@ export interface ScanRepo {
   createScan(sourcePageId: string, factIds: readonly string[], actor: string): Promise<string | undefined>;
   /** Bumps `updated_at` (resume of a stalled scan). */
   touchScan(scanId: string): Promise<void>;
-  setTerms(scanId: string, terms: Record<string, string[]>): Promise<void>;
+  /** `synonymsCached`: facts whose terms came from the per-fact cache (summary log). */
+  setTerms(scanId: string, terms: Record<string, string[]>, synonymsCached?: number): Promise<void>;
+  /** Cached CQL synonyms per fact id (only facts that have them), with the identity key they were made for. */
+  factSearchTerms(factIds: readonly string[]): Promise<Map<string, CachedTerms>>;
+  saveFactSearchTerms(factId: string, cached: CachedTerms): Promise<void>;
   addLlmCalls(scanId: string, n: number): Promise<void>;
   /** Idempotent (a resumed batch inserts the same hits again). */
   addHits(scanId: string, hits: readonly HitInput[]): Promise<void>;
@@ -117,6 +129,7 @@ interface ScanDbRow {
   pages_judged: number;
   pages_skipped: number | null;
   llm_calls: number | null;
+  synonyms_cached?: number | null;
   partial: number | boolean | null;
   error: string | null;
   started_at: unknown;
@@ -165,6 +178,7 @@ const toScan = (r: ScanDbRow): ScanRow => {
     pagesJudged: Number(r.pages_judged),
     pagesSkipped: Number(r.pages_skipped ?? 0),
     llmCalls: Number(r.llm_calls ?? 0),
+    synonymsCached: Number(r.synonyms_cached ?? 0),
     partial: Boolean(Number(r.partial ?? 0)),
     startedAt: iso(r.started_at) ?? '',
     finishedAt: iso(r.finished_at),
@@ -173,7 +187,7 @@ const toScan = (r: ScanDbRow): ScanRow => {
 };
 
 const SCAN_COLUMNS =
-  'id, source_page_id, status, facts_total, fact_cursor, fact_ids, terms, candidates, pages_judged, pages_skipped, llm_calls, partial, error, started_at, finished_at, TIMESTAMPDIFF(SECOND, updated_at, CURRENT_TIMESTAMP) AS idle_seconds';
+  'id, source_page_id, status, facts_total, fact_cursor, fact_ids, terms, candidates, pages_judged, pages_skipped, llm_calls, synonyms_cached, partial, error, started_at, finished_at, TIMESTAMPDIFF(SECOND, updated_at, CURRENT_TIMESTAMP) AS idle_seconds';
 
 interface CopyDbRow {
   id: string;
@@ -257,8 +271,26 @@ export const sqlScanRepo: ScanRepo = {
     await execute('UPDATE scan_jobs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', scanId);
   },
 
-  async setTerms(scanId, terms) {
-    await execute('UPDATE scan_jobs SET terms = ? WHERE id = ?', JSON.stringify(terms), scanId);
+  async setTerms(scanId, terms, synonymsCached = 0) {
+    await execute('UPDATE scan_jobs SET terms = ?, synonyms_cached = ? WHERE id = ?', JSON.stringify(terms), synonymsCached, scanId);
+  },
+
+  async factSearchTerms(factIds) {
+    const out = new Map<string, CachedTerms>();
+    if (factIds.length === 0) return out;
+    const rows = await query<{ id: string; search_terms: unknown }>(
+      `SELECT id, search_terms FROM facts WHERE search_terms IS NOT NULL AND id IN (${factIds.map(() => '?').join(', ')})`,
+      ...factIds,
+    );
+    for (const r of rows) {
+      const v = json(r.search_terms) as { key?: unknown; terms?: unknown } | null;
+      if (v && typeof v.key === 'string' && Array.isArray(v.terms)) out.set(r.id, { key: v.key, terms: v.terms.filter((t): t is string => typeof t === 'string') });
+    }
+    return out;
+  },
+
+  async saveFactSearchTerms(factId, cached) {
+    await execute('UPDATE facts SET search_terms = ? WHERE id = ?', JSON.stringify(cached), factId);
   },
 
   async addLlmCalls(scanId, n) {

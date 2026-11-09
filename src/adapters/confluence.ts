@@ -8,6 +8,8 @@ export interface SourcePage {
   version: number;
   /** ISO date-time the current version was created ("effective since" of its facts). */
   versionCreatedAt: string | null;
+  /** Version comment ("Updated by Ripple: …" for Ripple's own edits); null/absent when empty. */
+  versionMessage?: string | null;
   body: string;
 }
 
@@ -35,7 +37,7 @@ interface RawPage {
   id?: string | number;
   title?: string;
   spaceId?: string | number;
-  version?: { number?: number; createdAt?: string };
+  version?: { number?: number; createdAt?: string; message?: string };
   body?: { storage?: { value?: string } };
 }
 
@@ -52,8 +54,21 @@ export async function getSourcePage(pageId: string): Promise<SourcePage> {
     spaceId: page.spaceId === undefined ? '' : String(page.spaceId),
     version: page.version?.number ?? 0,
     versionCreatedAt: page.version?.createdAt ?? null,
+    versionMessage: page.version?.message ? page.version.message : null,
     body: page.body?.storage?.value ?? '',
   };
+}
+
+/** Space id of a page as the app (no body); null when the page cannot be read. Never throws. */
+export async function pageSpaceIdAsApp(pageId: string): Promise<string | null> {
+  try {
+    const res = await api.asApp().requestConfluence(route`/wiki/api/v2/pages/${pageId}`, { headers: { Accept: 'application/json' } });
+    if (!res.ok) return null;
+    const page = (await res.json()) as RawPage;
+    return page.spaceId === undefined ? null : String(page.spaceId);
+  } catch {
+    return null;
+  }
 }
 
 /** A page found by CQL. */

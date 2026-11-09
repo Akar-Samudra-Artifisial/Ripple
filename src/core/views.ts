@@ -45,6 +45,14 @@ export interface BylineStatus {
   schema: SchemaView;
   owner: OwnerView;
   spaceTeams: SpaceTeamsView;
+  /** M3: a detected change of this source's facts waits for confirmation (open `getPendingChange`). */
+  pendingChange: PendingChangeFlag | null;
+}
+
+export interface PendingChangeFlag {
+  id: string;
+  /** Number of changed facts. */
+  facts: number;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -218,8 +226,99 @@ export interface CopyList {
   hiddenCount: number;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// M3: change detection (FR-7). Saving a source page queues a re-extraction; confirmed facts whose value changed form
+// one pending change per source, which an editor of the source confirms (with a deadline) or dismisses.
+// ---------------------------------------------------------------------------------------------------------------
+
+export interface FactChangeView {
+  factId: string;
+  /** "Travel per diem · Amount per day · Domestic travel". */
+  factLabel: string;
+  oldValue: string;
+  oldUnit: string | null;
+  newValue: string;
+  newUnit: string | null;
+  /** Verbatim sentence of the new page version. */
+  newQuote: string;
+}
+
+/** A page holding copies to update, with its owner (REST v2 `ownerId`, else `authorId`). */
+export interface ChangePageView {
+  pageId: string;
+  pageTitle: string | null;
+  pageUrl: string | null;
+  spaceId: string | null;
+  copies: number;
+  owner: OwnerView;
+}
+
+export interface ChangeSpaceView {
+  spaceId: string;
+  teams: TeamView[];
+  /** Where the teams came from; `none` = Teamwork Graph had no team for the space (or could not be read). */
+  teamSource: 'teamwork_graph' | 'none';
+}
+
+export interface PendingChangeView {
+  id: string;
+  /** Source page version the change was read from. Send it back with `confirmChange`. */
+  version: number;
+  detectedAt: string | null;
+  facts: FactChangeView[];
+  /** Confirmed facts no longer found on the page (reported only, never deleted). */
+  missingFacts: number;
+  /** Copies to update on pages the viewer may open. */
+  copies: number;
+  pages: ChangePageView[];
+  /** Copies to update on pages the viewer cannot open (NFR-3). */
+  hiddenCount: number;
+  /** Not propagated, shown for context. */
+  unsure: number;
+  historical: number;
+  /** Copies that already state the new value. */
+  alreadyNew: number;
+  spaces: ChangeSpaceView[];
+  defaultDeadlineDays: number;
+  /** `YYYY-MM-DD`, today + `defaultDeadlineDays` working days. */
+  defaultDeadline: string;
+  /** Edit permission on the source (required to confirm or dismiss). */
+  canDecide: boolean;
+}
+
+/** Reply of `getPendingChange`; `change` is null when nothing waits. */
+export interface PendingChangeReply {
+  pageId: string;
+  change: PendingChangeView | null;
+}
+
+export interface ChangeIdPayload {
+  changeId: string;
+}
+
+export interface ConfirmChangePayload extends ChangeIdPayload {
+  /** Working days the copy owners get (1–30); default 5. */
+  deadlineDays?: number;
+  /** `PendingChangeView.version` the user saw; a newer detected version must be reviewed first. */
+  version?: number;
+}
+
+/** Reply of `confirmChange` / `dismissChange`. */
+export interface ChangeDecision {
+  changeId: string;
+  status: 'confirmed' | 'dismissed';
+  factsUpdated: number;
+  /** Copies that now count as drifted from the new value (confirm only). */
+  copiesDrifted: number;
+  deadline: string | null;
+}
+
 /** Resolver name → payload and success reply. Every resolver may also answer `ErrorReply`. */
 export interface ResolverContract {
+  getPendingChange: { payload: undefined; reply: PendingChangeReply };
+  /** Edit permission on the source; sets the facts to their new values and records the deadline (M4 proposes edits). */
+  confirmChange: { payload: ConfirmChangePayload; reply: ChangeDecision };
+  dismissChange: { payload: ChangeIdPayload; reply: ChangeDecision };
   getScanStatus: { payload: undefined; reply: ScanStatus };
   /** Starts a scan (edit permission; source ready with ≥1 confirmed fact), or resumes a stalled one. */
   startScan: { payload: undefined; reply: ScanStatus };

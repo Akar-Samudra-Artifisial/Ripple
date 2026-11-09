@@ -17,7 +17,7 @@ import { ForgeLlmError, type Message } from '@forge/llm';
 import { JUDGE_SYSTEM_PROMPT, JUDGE_TOOL } from '../src/llm/judge';
 import type { SearchHit } from '../src/adapters/confluence';
 import type { FactRepo } from '../src/adapters/repo';
-import { EMPTY_COPY_COUNTS, type ChunkResult, type CopyInput, type HitInput, type PendingPage, type ScanRepo, type ScanRow } from '../src/adapters/scanRepo';
+import { EMPTY_COPY_COUNTS, type CachedTerms, type ChunkResult, type CopyInput, type HitInput, type PendingPage, type ScanRepo, type ScanRow } from '../src/adapters/scanRepo';
 import {
   buildCql,
   chunkPage,
@@ -145,8 +145,15 @@ class FakeScans implements ScanRepo {
     for (const [k, v] of this.active) if (v === id) this.active.delete(k);
   }
   async touchScan() {}
-  async setTerms(id: string, terms: Record<string, string[]>) {
-    this.patch(id, { terms });
+  searchTerms = new Map<string, CachedTerms>();
+  async setTerms(id: string, terms: Record<string, string[]>, synonymsCached = 0) {
+    this.patch(id, { terms, synonymsCached });
+  }
+  async factSearchTerms(factIds: readonly string[]) {
+    return new Map([...this.searchTerms].filter(([id]) => factIds.includes(id)));
+  }
+  async saveFactSearchTerms(factId: string, cached: CachedTerms) {
+    this.searchTerms.set(factId, cached);
   }
   async addLlmCalls(id: string, n: number) {
     const s = this.scans.get(id);
@@ -822,6 +829,43 @@ describe('copy scan (search + judge consumers)', () => {
     expect(searchCalls).toHaveLength(5);
     expect(llmCalls.filter((c) => c.tool === 'record_search_terms')).toHaveLength(1);
     expect(pushes[1]).toEqual({ queue: JUDGE_QUEUE, scanId });
+  });
+
+  it('generates CQL synonyms once per fact and reuses them in the next scan (stable candidates)', async () => {
+    const first = await newScan();
+    await runSearchJob(first, 0, jobDeps());
+    const firstCql = searchCalls.map((c) => c.cql);
+    expect(llmCalls.filter((c) => c.tool === 'record_search_terms')).toHaveLength(1);
+    expect(scans.searchTerms.size).toBe(FACTS.length);
+    expect(scans.scans.get(first)?.synonymsCached).toBe(0);
+    await scans.finishScan(first, SOURCE_PAGE_ID, false);
+
+    searchCalls.length = 0;
+    const second = await newScan();
+    await runSearchJob(second, 0, jobDeps());
+    expect(llmCalls.filter((c) => c.tool === 'record_search_terms')).toHaveLength(1);
+    expect(scans.scans.get(second)?.synonymsCached).toBe(FACTS.length);
+    expect(searchCalls.map((c) => c.cql)).toEqual(firstCql);
+
+    // An edited subject/attribute/condition (key no longer matches) regenerates only that fact's terms.
+    const one = FACTS[0]?.id as string;
+    scans.searchTerms.set(one, { key: 'stale|key|', terms: ['old'] });
+    await scans.finishScan(second, SOURCE_PAGE_ID, false);
+    const third = await newScan();
+    await runSearchJob(third, 0, jobDeps());
+    expect(llmCalls.filter((c) => c.tool === 'record_search_terms')).toHaveLength(2);
+    expect(scans.scans.get(third)?.synonymsCached).toBe(FACTS.length - 1);
+    expect(scans.searchTerms.get(one)?.key).not.toBe('stale|key|');
+  });
+
+  it('does not cache synonyms when the suggestion fails', async () => {
+    const failing = (async (messages: Message[], tool: ToolSpec) => {
+      if (tool.name === 'record_search_terms') throw new Error('bad output');
+      return fakeLlm(llmCalls)(messages, tool);
+    }) as ChatToolFn;
+    const scanId = await newScan();
+    await runSearchJob(scanId, 0, jobDeps({ llm: failing }));
+    expect(scans.searchTerms.size).toBe(0);
   });
 
   it('resumes judging with the first unfinished page and reads no page twice', async () => {

@@ -160,6 +160,41 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
       PRIMARY KEY (scan_id, page_id, chunk_hash)
     )`,
   },
+  // M3 (FR-7): a detected change of a source's confirmed facts, waiting for the owner's confirmation. At most one
+  // pending row per source (enforced in code); JSON columns hold ids, old/new values and per-copy page/space ids.
+  {
+    name: 'v017_create_changes',
+    statement: `CREATE TABLE IF NOT EXISTS changes (
+      id VARCHAR(36) PRIMARY KEY,
+      source_page_id VARCHAR(32) NOT NULL,
+      status VARCHAR(16) NOT NULL,
+      page_version INT NOT NULL,
+      fact_changes JSON NOT NULL,
+      missing_fact_ids JSON NULL,
+      impact JSON NULL,
+      routing JSON NULL,
+      deadline_days INT NULL,
+      decided_by VARCHAR(128) NULL,
+      decided_at TIMESTAMP NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      KEY idx_changes_source_status (source_page_id, status)
+    )`,
+  },
+  // Page versions already handled by the updated:page trigger (dedup of redelivered events).
+  {
+    name: 'v018_create_page_events',
+    statement: `CREATE TABLE IF NOT EXISTS page_events (
+      page_id VARCHAR(32) NOT NULL,
+      version INT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (page_id, version)
+    )`,
+  },
+  // CQL synonyms of a fact, generated once: `{ key: identity key when generated, terms: string[] }`.
+  { name: 'v019_facts_search_terms', statement: 'ALTER TABLE facts ADD COLUMN IF NOT EXISTS search_terms JSON NULL' },
+  // Facts of a scan whose synonyms came from the cache (scan summary log).
+  { name: 'v020_scan_jobs_synonyms_cached', statement: 'ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS synonyms_cached INT NOT NULL DEFAULT 0' },
 ];
 
 /** Name of the newest migration; the byline reports it so admins can confirm the schema is current. */

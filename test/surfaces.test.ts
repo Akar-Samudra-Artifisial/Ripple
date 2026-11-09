@@ -77,14 +77,18 @@ describe('migrations', () => {
       'v014_scan_jobs_active_source',
       'v015_scan_jobs_active_unique',
       'v016_create_scan_chunks',
+      'v017_create_changes',
+      'v018_create_page_events',
+      'v019_facts_search_terms',
+      'v020_scan_jobs_synonyms_cached',
     ]);
-    expect(LATEST_MIGRATION).toBe('v016_create_scan_chunks');
+    expect(LATEST_MIGRATION).toBe('v020_scan_jobs_synonyms_cached');
   });
 });
 
 describe('schemaView', () => {
   it('reports ready, setting up and errors', async () => {
-    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 16, total: 16, latest: LATEST_MIGRATION });
+    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 20, total: 20, latest: LATEST_MIGRATION });
     expect(
       await schemaView(async () => {
         throw new SchemaSettingUpError(1, 4);
@@ -104,6 +108,7 @@ describe('bylineStatus', () => {
     graph: graphWith({ data: { atlassianTeamsBySpace: { edges: [{ node: { id: 't1', displayName: 'Platform Team' } }] } } }),
     pageMeta: vi.fn(async () => ({ spaceId: '99', ownerId: 'owner-1', authorId: 'author-1' })),
     names: vi.fn(async () => new Map([['owner-1', 'Ana Owner']])),
+    pendingChange: async () => null,
     ensure: async () => undefined,
     ...over,
   });
@@ -191,9 +196,10 @@ describe('background and Rovo stubs', () => {
     expect(forge.push).toHaveBeenCalledWith({ body: { reason: 'avi:forge:installed:app' } });
   });
 
-  it('page events and actions reply "not implemented" and log', async () => {
+  it('page events never throw; actions reply "not implemented"', async () => {
+    // The schema check fails here (SQL is mocked away): the trigger logs and returns instead of throwing.
     await expect(onPageEvent({ eventType: 'avi:confluence:updated:page', content: { id: 1 } })).resolves.toBeUndefined();
-    expect(console.info).toHaveBeenCalledWith('ripple stub', expect.objectContaining({ feature: 'page change detection', pageId: '1' }));
+    await expect(onPageEvent({ eventType: 'avi:confluence:updated:page', content: { id: 'x' } })).resolves.toBeUndefined();
     for (const key of ACTIONS) {
       expect(await factKeeperAction({ context: { moduleKey: key } })).toMatchObject({ status: 'not_implemented', feature: `Rovo action ${key}` });
     }

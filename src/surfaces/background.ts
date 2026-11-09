@@ -1,5 +1,7 @@
 import { InvocationError, InvocationErrorCode } from '@forge/events';
 import { requestMigration, runMigrations } from '../adapters/sql';
+import { scrubErrorText } from '../adapters/teamworkGraph';
+import { handlePageUpdate, runDiffJob } from './changes';
 import { runJudgeJob, runSearchJob, type ScanOutcome } from './copies';
 import { runExtractJob } from './sources';
 import { notImplemented } from './stub';
@@ -37,24 +39,45 @@ export async function migrateSchema(): Promise<InvocationError | void> {
 
 interface PageEvent {
   eventType?: string;
-  content?: { id?: string | number };
+  content?: { id?: string | number; version?: { number?: unknown; message?: unknown } };
 }
 
-/** `avi:confluence:updated:page`: will queue fact re-extraction for source-of-truth pages (M2). */
+/** `avi:confluence:updated:page`: queues change detection for source-of-truth pages (M3, see `handlePageUpdate`). */
 export async function onPageEvent(event: PageEvent): Promise<void> {
-  notImplemented('page change detection', { eventType: event.eventType, pageId: event.content?.id !== undefined ? String(event.content.id) : undefined });
+  const raw = event.content?.id;
+  const pageId = raw === undefined ? '' : String(raw);
+  if (!/^\d{1,32}$/.test(pageId)) return;
+  const v = event.content?.version;
+  const version = typeof v?.number === 'number' && Number.isInteger(v.number) ? v.number : null;
+  try {
+    const outcome = await handlePageUpdate({ pageId, version, message: typeof v?.message === 'string' ? v.message : null });
+    // Most saved pages are not sources: only queued diffs are logged.
+    if (outcome.status === 'queued') console.info('ripple page update: diff queued', { pageId, version, jobId: outcome.jobId });
+    else if (outcome.reason !== 'not a source') console.info('ripple page update ignored', { pageId, version, reason: outcome.reason });
+  } catch (err) {
+    console.warn('ripple page update failed', { pageId, error: scrubErrorText(err instanceof Error ? err.message : String(err)) });
+  }
 }
 
 interface ExtractEvent {
-  body?: { pageId?: unknown };
+  body?: { pageId?: unknown; kind?: unknown };
   retryContext?: { retryCount?: number };
 }
 
-/** Consumer for `extract`: facts of one source page (body `{ pageId }`), see `runExtractJob`. */
+/**
+ * Consumer for `extract`: facts of one source page (body `{ pageId }`, see `runExtractJob`), or change detection
+ * after the page was saved (body `{ pageId, kind: 'diff' }`, see `runDiffJob`).
+ */
 export async function extractFacts(event: ExtractEvent): Promise<InvocationError | void> {
   const pageId = event.body?.pageId;
   if (typeof pageId !== 'string' || !/^\d{1,32}$/.test(pageId)) {
     console.warn('ripple extract: ignoring event without a valid page id');
+    return;
+  }
+  if (event.body?.kind === 'diff') {
+    const diff = await runDiffJob(pageId, event.retryContext?.retryCount ?? 0);
+    if (diff.status === 'retry') return retryLater(diff.seconds, diff.reason);
+    if (diff.status === 'skipped') console.info('ripple diff skipped', { pageId, reason: diff.reason });
     return;
   }
   const outcome = await runExtractJob(pageId, event.retryContext?.retryCount ?? 0);

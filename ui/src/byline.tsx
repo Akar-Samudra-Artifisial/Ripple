@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { BylineStatus } from '../../src/core/views';
 import { call } from './bridge';
+import { ChangePanel } from './changePanel';
 import { mount } from './mount';
 import { SourcePanel } from './sourcePanel';
 
@@ -115,6 +116,7 @@ function Byline() {
         <p className="muted">{spaceTeams.dataPresent ? 'No team is linked to this space.' : 'Teamwork Graph returned no data.'}</p>
       ) : null}
       {spaceTeams.errors.length > 0 ? <p className="error">{spaceTeams.errors.join(' | ')}</p> : null}
+      {schema.status === 'ready' && data.pendingChange ? <ChangePanel /> : null}
       {schema.status === 'ready' ? <SourcePanel /> : null}
     </>
   );
