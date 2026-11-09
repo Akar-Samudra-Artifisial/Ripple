@@ -13,14 +13,14 @@ import { createHash } from 'node:crypto';
 import { Queue } from '@forge/events';
 import { canEditPage, ConfluenceRetryableError, getSourcePage, PageNotFoundError, searchPagesAsApp, visiblePageIds, type SearchHit, type SourcePage } from '../adapters/confluence';
 import { sqlRepo, type FactRepo } from '../adapters/repo';
-import { EMPTY_COPY_COUNTS, sqlScanRepo, type ChunkResult, type CopyInput, type PendingPage, type ScanRepo, type ScanRow } from '../adapters/scanRepo';
+import { ALL_FILTER_STATUSES, EMPTY_COPY_COUNTS, sqlScanRepo, type ChunkResult, type CopyInput, type PendingPage, type ScanRepo, type ScanRow } from '../adapters/scanRepo';
 import { ensureSchema } from '../adapters/sql';
 import { scrubErrorText } from '../adapters/teamworkGraph';
 import {
   buildCql,
   chunkPage,
-  decideStatus,
   factTerms,
+  judgeOutcome,
   MAX_CANDIDATES_PER_FACT,
   MAX_COPY_PAGE_CHARS,
   parseJudgement,
@@ -208,7 +208,7 @@ export async function listCopies(ctx: SourceContext, payload: Partial<CopyListPa
     let hiddenCount = 0;
     if (hidden.length > 0) {
       const counts = await deps.scans.countCopies(pageId, hidden);
-      hiddenCount = status ? counts[status] : COPY_STATUSES.filter((s) => s !== 'historical').reduce((n, s) => n + counts[s], 0);
+      hiddenCount = status ? counts[status] : ALL_FILTER_STATUSES.reduce((n, s) => n + counts[s], 0);
     }
     return { pageId, copies, hiddenCount };
   });
@@ -435,6 +435,7 @@ async function judgePage(scan: ScanRow, page: PendingPage, facts: readonly ScanF
   let capped = false;
   let refused: string | undefined;
   let calls = 0;
+  const dropReasons: Record<string, number> = {};
   try {
     await forEachLimit(todo, JUDGE_CONCURRENCY, async ({ chunk, key }) => {
       if (capped || refused !== undefined) return;
@@ -454,12 +455,14 @@ async function judgePage(scan: ScanRow, page: PendingPage, facts: readonly ScanF
           chunkFacts.map((f) => f.id),
         );
         result = { judgements: parsed.judgements, dropped: parsed.dropped.length };
+        for (const d of parsed.dropped) dropReasons[d.reason] = (dropReasons[d.reason] ?? 0) + 1;
       } catch (err) {
         if (isLlmRetryable(err)) throw err;
         if (isUnusableAnswer(err)) {
           // An unusable answer for one chunk loses that chunk only.
           console.warn('ripple judge: unusable answer for a chunk', { scanId: scan.id, pageId: page.pageId, line: chunk.firstLine, error: errorText(err) });
           result = { judgements: [], dropped: 1 };
+          dropReasons.unusable_answer = (dropReasons.unusable_answer ?? 0) + 1;
         } else if (isLlmApiError(err)) {
           refused = errorText(err);
           return;
@@ -476,12 +479,16 @@ async function judgePage(scan: ScanRow, page: PendingPage, facts: readonly ScanF
 
   let dropped = 0;
   const found = new Map<string, CopyInput[]>();
+  // Per fact of this page: why it did or did not become a copy (ids and outcome labels only, for the page log).
+  const chunked = new Set(chunks.flatMap((c) => c.factIds));
+  const outcomes = new Map<string, string[]>(pageFacts.map((f) => [f.id, chunked.has(f.id) ? [] : ['no_chunk']]));
   for (const r of results) {
     dropped += r.dropped;
     for (const j of r.judgements) {
       const fact = byId.get(j.factId);
       if (!fact) continue;
-      const decision = decideStatus(fact, j, siblingsOf(fact, facts));
+      const { decision, reason } = judgeOutcome(fact, j, siblingsOf(fact, facts));
+      outcomes.get(fact.id)?.push(decision ? decision.status : (reason ?? 'not_copy'));
       if (!decision) continue;
       const list = found.get(fact.id) ?? [];
       list.push({
@@ -502,6 +509,14 @@ async function judgePage(scan: ScanRow, page: PendingPage, facts: readonly ScanF
     }
   }
   const copies = [...found.values()].map((list) => strongest(list)).filter((c): c is CopyInput => c !== undefined);
+  console.info('ripple judge page', {
+    scanId: scan.id,
+    pageId: page.pageId,
+    chunks: chunks.length,
+    facts: [...outcomes].map(([factId, list]) => ({ factId, outcome: list.length > 0 ? list.join('+') : 'no_match' })),
+    dropped,
+    dropReasons,
+  });
   return savePage(scan, page.pageId, copies, dropped, deps);
 }
 

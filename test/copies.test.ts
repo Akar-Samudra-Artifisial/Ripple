@@ -24,6 +24,7 @@ import {
   compareValues,
   decideStatus,
   factTerms,
+  judgeOutcome,
   MAX_CANDIDATES_PER_FACT,
   normaliseValue,
   parseJudgement,
@@ -37,7 +38,7 @@ import type { ChatToolFn } from '../src/llm/extract';
 import type { ToolSpec } from '../src/llm/index';
 import { getScanStatus, JUDGE_CONCURRENCY, JUDGE_QUEUE, listCopies, MAX_LLM_CALLS_PER_SCAN, runJudgeJob, runSearchJob, SEARCH_QUEUE, startScan, type CopyDeps, type ScanJobDeps, type ScanQueue } from '../src/surfaces/copies';
 import type { SourceContext } from '../src/surfaces/sources';
-import { COPY_PAGES, FACT_KEYS, SOURCE_PAGE_ID, type FactKey } from './fixtures/copies';
+import { COPY_PAGES, FACT_KEYS, SOURCE_PAGE_ID, type FactKey, type JudgeMention } from './fixtures/copies';
 import { TRAVEL_POLICY_FACTS } from './fixtures/travelPolicy';
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -233,7 +234,7 @@ class FakeScans implements ScanRepo {
   }
   async listCopies(sourcePageId: string, status: CopyStatus | undefined, pageIds: readonly string[]): Promise<CopyView[]> {
     return this.live(sourcePageId)
-      .filter((c) => pageIds.includes(c.pageId) && (status ? c.status === status : c.status !== 'historical'))
+      .filter((c) => pageIds.includes(c.pageId) && (status ? c.status === status : c.status !== 'historical' && c.status !== 'ignored'))
       .map((c) => ({ id: `${c.factId}|${c.pageId}`, factId: c.factId, factLabel: '', officialValue: '', officialUnit: null, pageId: c.pageId, pageTitle: c.pageTitle, pageUrl: c.pageUrl, status: c.status, statedValue: c.statedValue, statedUnit: c.statedUnit, statedCondition: c.statedCondition, quote: c.quote, reason: c.reason, judgedAt: null }));
   }
   statusOf(k: FactKey, pageId: string): CopyStatus | null {
@@ -245,7 +246,7 @@ const MENTIONS = COPY_PAGES.flatMap((p) => p.judge);
 const FACT_LINE = /^(\d+)\. (.+?) \| .+? \| official value: .+? \| condition: (.+)$/gm;
 
 /** Fake LLM: synonyms for the terms call; for a chunk, the fixture mentions whose quote is in it (numbered as in the prompt). */
-function fakeLlm(calls: { tool: string; chunk?: string }[], override?: (chunk: string) => unknown): ChatToolFn {
+function fakeLlm(calls: { tool: string; chunk?: string }[], override?: (chunk: string) => unknown, tweak?: (m: JudgeMention) => JudgeMention): ChatToolFn {
   return (async (messages: Message[], tool: ToolSpec) => {
     const user = String(messages[1]?.content ?? '');
     if (tool.name === 'record_search_terms') {
@@ -261,7 +262,9 @@ function fakeLlm(calls: { tool: string; chunk?: string }[], override?: (chunk: s
       const key = KEYS.find((k) => FACT_KEYS[k].subject === m[2] && FACT_KEYS[k].condition === condition);
       if (key) numbers.set(key, Number(m[1]));
     }
-    const mentions = MENTIONS.filter((x) => chunk.includes(x.quote) && numbers.has(x.fact)).map(({ fact: k, ...rest }) => ({ fact: numbers.get(k), ...rest }));
+    const mentions = MENTIONS.filter((x) => chunk.includes(x.quote) && numbers.has(x.fact))
+      .map((x) => (tweak ? tweak(x) : x))
+      .map(({ fact: k, ...rest }) => ({ fact: numbers.get(k), ...rest }));
     return { args: { mentions }, model: 'claude-sonnet-5' };
   }) as unknown as ChatToolFn;
 }
@@ -346,11 +349,27 @@ async function fullScan(deps: ScanJobDeps = jobDeps()): Promise<string> {
 // Pure rules
 // ---------------------------------------------------------------------------------------------------------------
 
+/**
+ * Rough model of Confluence `text ~` for the CQL from `buildCql`: word match with plural -s (Confluence stems English
+ * words), quoted phrases as phrases, groups in parentheses all required.
+ */
+function cqlMatches(cql: string, html: string, opts: { withoutNumbers?: boolean } = {}): boolean {
+  const text = ` ${html.replace(/<[^>]+>/g, ' ').toLowerCase().replace(/[^\p{L}\p{N},]+/gu, ' ').replace(/,(?!\d)/g, ' ')} `;
+  const has = (term: string) => [term, `${term}s`].some((t) => text.includes(` ${t.toLowerCase()} `));
+  const clauses = (/AND \((.*)\)$/.exec(cql)?.[1]?.split(' OR ') ?? []).filter((c) => !opts.withoutNumbers || !/^text ~ "[\d,]+"$/.test(c));
+  return clauses.some((c) =>
+    c
+      .replace(/^\(|\)$/g, '')
+      .split(' AND ')
+      .every((t) => has(/^text ~ "(?:\\")?(.*?)(?:\\")?"$/.exec(t)?.[1] ?? '\u0000')),
+  );
+}
+
 describe('CQL builder', () => {
   it('searches phrases and long numbers, excludes the source and ripple-ignore pages', () => {
     const cql = buildCql(SOURCE_PAGE_ID, factTerms(fact('approval'), ['manager sign off']));
     expect(cql).toBe(
-      'type = page AND id != 9502721 AND label != "ripple-ignore" AND (text ~ "\\"Trip approval\\"" OR text ~ "\\"manager sign off\\"" OR text ~ "approval" OR text ~ "2000" OR text ~ "2,000")',
+      'type = page AND id != 9502721 AND label != "ripple-ignore" AND (text ~ "\\"Trip approval\\"" OR text ~ "\\"manager sign off\\"" OR text ~ "approval" OR (text ~ "manager" AND text ~ "sign") OR (text ~ "manager" AND text ~ "off") OR (text ~ "sign" AND text ~ "off") OR text ~ "2000" OR text ~ "2,000")',
     );
     // "60" alone is too common to search.
     expect(buildCql(SOURCE_PAGE_ID, factTerms(fact('domestic')))).not.toContain('text ~ "60"');
@@ -360,32 +379,35 @@ describe('CQL builder', () => {
     expect(cleanTerm('meal "allowance") OR space = X')).toBe('meal allowance OR space X');
     const cql = buildCql(SOURCE_PAGE_ID, factTerms(fact('domestic'), ['daily "allowance" ) OR type = blog']));
     expect(cql).toContain('text ~ "\\"daily allowance OR type blog\\""');
-    expect(cql.match(/(?<!\\)"/g)?.length).toBe(8); // label value + the two phrase clauses + the subject-word clause
+    expect(cql.match(/(?<!\\)"/g)?.length).toBe(20); // label value + 2 phrase clauses + 7 single-word clauses (diem, 3 pairs of daily/allowance/type)
+    // Word clauses hold one letter/digit word each, so no operator survives into them.
+    for (const m of cql.matchAll(/text ~ "([^"\\]*)"/g)) expect(m[1]).toMatch(/^[\p{L}\p{N},]+$/u);
     expect(() => buildCql('12 OR 1=1', factTerms(fact('domestic')))).toThrow('invalid source page id');
   });
 
-  it('also searches the distinctive subject words, so a copy without the exact subject phrase is found', () => {
-    expect(factTerms(fact('domestic')).subjectWords).toEqual(['diem']);
-    expect(factTerms(fact('approval')).subjectWords).toEqual(['approval']);
-    expect(factTerms(fact('flight')).subjectWords).toEqual(['flight', 'class']);
+  it('also searches word groups of the subject, so a copy without the exact subject phrase is found', () => {
+    expect(factTerms(fact('domestic')).wordGroups).toEqual([['diem']]);
+    expect(factTerms(fact('approval')).wordGroups).toEqual([['approval']]);
+    expect(factTerms(fact('flight')).wordGroups).toEqual([['flight', 'class']]);
+    expect(factTerms({ ...fact('claims'), subject: 'Expense claim deadline' }).wordGroups).toEqual([
+      ['expense', 'claim'],
+      ['expense', 'deadline'],
+      ['claim', 'deadline'],
+    ]);
     expect(buildCql(SOURCE_PAGE_ID, factTerms(fact('flight')))).toContain(' OR (text ~ "flight" AND text ~ "class")');
-    // Without any LLM synonym, every fixture copy is a candidate of each fact it states (CQL `text ~` ≈ word match).
-    const plain = (html: string) => ` ${html.replace(/<[^>]+>/g, ' ').toLowerCase().replace(/[^\p{L}\p{N},]+/gu, ' ').replace(/,(?!\d)/g, ' ')} `;
-    // Confluence search stems English words ("flight" finds "flights"); only plural -s is modelled here.
-    const has = (text: string, term: string) => [term, `${term}s`].some((t) => text.includes(` ${t.toLowerCase()} `));
-    const matches = (cql: string, html: string) => {
-      const text = plain(html);
-      const clauses = /AND \((.*)\)$/.exec(cql)?.[1]?.split(' OR ') ?? [];
-      return clauses.some((c) =>
-        c
-          .replace(/^\(|\)$/g, '')
-          .split(' AND ')
-          .every((t) => has(text, /^text ~ "(?:\\")?(.*?)(?:\\")?"$/.exec(t)?.[1] ?? '\u0000')),
-      );
-    };
+    // Synonyms add their own groups (capped, never the value).
+    expect(factTerms(fact('domestic'), ['daily allowance']).wordGroups).toEqual([['diem'], ['daily', 'allowance']]);
+  });
+
+  it('finds every fixture copy by subject words alone, also the drifted ones (value not searched)', () => {
     for (const page of COPY_PAGES)
       for (const [k, status] of Object.entries(page.expect))
-        if (status) expect(matches(buildCql(SOURCE_PAGE_ID, factTerms(fact(k as FactKey))), page.storage), `${page.title} / ${k}`).toBe(true);
+        if (status) expect(cqlMatches(buildCql(SOURCE_PAGE_ID, factTerms(fact(k as FactKey))), page.storage, { withoutNumbers: true }), `${page.title} / ${k}`).toBe(true);
+    // Finance FAQ (claims 45 days vs 30) with the subject worded as the live extraction may word it, no synonyms.
+    const finance = COPY_PAGES.find((p) => p.title === 'Finance FAQ')?.storage ?? '';
+    for (const subject of ['Expense claims', 'Expense claim deadline', 'Expense claim submission']) {
+      expect(cqlMatches(buildCql(SOURCE_PAGE_ID, factTerms({ ...fact('claims'), subject })), finance, { withoutNumbers: true }), subject).toBe(true);
+    }
   });
 
   it('searches 4+ digit numbers also with a thousands separator', () => {
@@ -492,7 +514,11 @@ describe('decideStatus', () => {
       const d = decideStatus(fact('domestic'), judgement('domestic', { sameFact, statedValue: '$40', statedCondition: 'External training', quote: 'The per diem for external training is $40 per day.' }), siblings);
       expect(d?.status).toBe('unsure');
     }
-    expect(decideStatus(fact('domestic'), judgement('domestic', { sameFact: 'no', statedValue: '$40', statedCondition: 'External training', quote: 'x' }))).toBeNull();
+    // The judge is told to say "no" for another condition: still unsure (L&D budget page), not dropped.
+    expect(judgeOutcome(fact('domestic'), judgement('domestic', { sameFact: 'no', statedValue: '$40', statedCondition: 'External training', quote: 'x' }), siblings).decision?.status).toBe('unsure');
+    // An unrelated "no" (same condition or none, or a value of another kind) is not a copy.
+    expect(judgeOutcome(fact('domestic'), judgement('domestic', { sameFact: 'no', statedValue: '$40', statedCondition: null, quote: 'x' }))).toEqual({ decision: null, reason: 'not_same_fact' });
+    expect(judgeOutcome(fact('domestic'), judgement('domestic', { sameFact: 'no', statedValue: 'economy', statedCondition: 'External training', quote: 'x' }))).toEqual({ decision: null, reason: 'not_same_fact' });
     // The international value without a condition is not a domestic drift.
     expect(decideStatus(fact('domestic'), judgement('domestic', { statedValue: '$90', quote: 'Per diem is $90 per day.' }), siblings)?.status).toBe('unsure');
   });
@@ -539,6 +565,26 @@ describe('copy scan (search + judge consumers)', () => {
       });
       expect((line?.[1] as { candidatesPerFact: number[] }).candidatesPerFact).toHaveLength(FACTS.length);
       expect(JSON.stringify(line?.[1])).not.toMatch(/accountId|per diem|\$60/i);
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it('logs the outcome of every fact on every judged page (ids and labels only)', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    try {
+      // The real judge answers "no" for the training per diem (another condition), as its prompt tells it to.
+      await fullScan(jobDeps({ llm: fakeLlm(llmCalls, undefined, (m) => (m.stated_condition === 'External training' ? { ...m, same_fact: 'no' } : m)) }));
+      const pageLog = (title: string) => {
+        const id = COPY_PAGES.find((p) => p.title === title)?.id;
+        return info.mock.calls.find((c) => c[0] === 'ripple judge page' && (c[1] as { pageId: string }).pageId === id)?.[1] as { facts: { factId: string; outcome: string }[]; dropReasons: Record<string, number> };
+      };
+      expect(pageLog('Finance FAQ').facts).toContainEqual({ factId: factId('claims'), outcome: 'drifted' });
+      const training = COPY_PAGES.find((p) => p.kind === 'trap' && p.expect.domestic === 'unsure');
+      expect(pageLog(training?.title ?? '').facts).toContainEqual({ factId: factId('domestic'), outcome: 'unsure' });
+      expect(scans.statusOf('domestic', training?.id ?? '')).toBe('unsure');
+      const logged = JSON.stringify(info.mock.calls.filter((c) => c[0] === 'ripple judge page'));
+      expect(logged).not.toMatch(/acc-1|per diem|\$40|External training/i);
     } finally {
       info.mockRestore();
     }

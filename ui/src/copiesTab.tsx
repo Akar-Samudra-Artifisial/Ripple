@@ -24,8 +24,9 @@ interface LoadedList {
   data: CopyList;
 }
 
-/** Copies that count as restatements of the facts (historical mentions and ignored matches excluded). */
-const totalOf = (c: CopyCounts): number => c.in_sync + c.drifted + c.unsure + c.updated;
+/** Statuses of the "All" filter and the headline (historical mentions and ignored matches have their own filter). */
+const ALL_STATUSES: readonly CopyStatus[] = ['in_sync', 'drifted', 'unsure', 'updated'];
+const totalOf = (c: CopyCounts): number => ALL_STATUSES.reduce((n, s) => n + c[s], 0);
 const withUnit = (value: string | null, unit: string | null): string => (value ? (unit && !value.includes(unit) ? `${value} ${unit}` : value) : '—');
 const spaceOf = (url: string | null): string | null => (url ? (/\/spaces\/([^/]+)\//.exec(url)?.[1] ?? null) : null);
 const formatDateTime = (iso: string | null): string | null => {
@@ -218,10 +219,11 @@ function DoneView({ scan, counts, filter, list, siteUrl, hasError, onFilter, onR
   const finished = formatDateTime(scan.finishedAt);
   const filters: { id: Filter; label: string; count: number }[] = [
     { id: 'all', label: 'All', count: total },
-    ...ORDER.filter((s) => s !== 'ignored' && (counts[s] > 0 || s === 'drifted')).map((s) => ({ id: s, label: COPY_LABEL[s], count: counts[s] })),
+    ...ORDER.filter((s) => counts[s] > 0 || s === 'drifted').map((s) => ({ id: s, label: COPY_LABEL[s], count: counts[s] })),
   ];
   const current = list && list.filter === filter ? list.data : undefined;
-  const copies = current ? [...current.copies].sort((a, b) => ORDER.indexOf(a.status) - ORDER.indexOf(b.status)) : undefined;
+  // "All" lists exactly what its count counts.
+  const copies = current ? [...current.copies].filter((c) => filter !== 'all' || ALL_STATUSES.includes(c.status)).sort((a, b) => ORDER.indexOf(a.status) - ORDER.indexOf(b.status)) : undefined;
 
   return (
     <>
@@ -237,7 +239,7 @@ function DoneView({ scan, counts, filter, list, siteUrl, hasError, onFilter, onR
         </p>
       </div>
 
-      {total > 0 || counts.historical > 0 ? (
+      {total > 0 || counts.historical > 0 || counts.ignored > 0 ? (
         <div className="chips" role="group" aria-label="Filter copies by status">
           {filters.map((f) => (
             <button key={f.id} type="button" className={`chip${f.id === 'drifted' && f.count > 0 ? ' chip--danger' : ''}`} aria-pressed={filter === f.id} onClick={() => onFilter(f.id)}>

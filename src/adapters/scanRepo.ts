@@ -93,9 +93,15 @@ export interface ScanRepo {
   copyPageIds(sourcePageId: string): Promise<string[]>;
   /** Copies of confirmed facts per status; only on `pageIds` when given. */
   countCopies(sourcePageId: string, pageIds?: readonly string[]): Promise<CopyCounts>;
-  /** Copies of confirmed facts on `pageIds`; `status` omitted = all but historical. At most `MAX_LISTED_COPIES`. */
+  /** Copies of confirmed facts on `pageIds`; `status` omitted = `ALL_FILTER_STATUSES`. At most `MAX_LISTED_COPIES`. */
   listCopies(sourcePageId: string, status: CopyStatus | undefined, pageIds: readonly string[]): Promise<CopyView[]>;
 }
+
+/**
+ * Statuses of the "All" filter, its count and the "N copies" headline: restatements of the facts. Historical mentions
+ * and ignored matches have their own filter only, so the All count always equals the cards listed under All.
+ */
+export const ALL_FILTER_STATUSES = ['in_sync', 'drifted', 'unsure', 'updated'] as const;
 
 export const EMPTY_COPY_COUNTS: CopyCounts = { in_sync: 0, drifted: 0, unsure: 0, historical: 0, ignored: 0, updated: 0 };
 
@@ -210,6 +216,8 @@ const toCopy = (r: CopyDbRow): CopyView => ({
 const STATUS_ORDER = "CASE c.status WHEN 'drifted' THEN 0 WHEN 'unsure' THEN 1 WHEN 'in_sync' THEN 2 WHEN 'updated' THEN 3 WHEN 'historical' THEN 4 ELSE 5 END";
 /** Copies the owner settled; a rescan never changes or removes them. */
 const STICKY = "('ignored', 'updated')";
+/** Statuses the "All" list leaves out (shown under their own filter): see `ALL_FILTER_STATUSES`. */
+const NOT_IN_ALL = "'historical', 'ignored'";
 /** Copies of facts that are still confirmed (a rejected or removed fact's copies are not shown or counted). */
 const CONFIRMED_JOIN = "JOIN facts f ON f.id = c.fact_id AND f.status = 'confirmed'";
 const placeholders = (n: number) => Array.from({ length: n }, () => '?').join(', ');
@@ -413,7 +421,7 @@ export const sqlScanRepo: ScanRepo = {
 
   async listCopies(sourcePageId, status, pageIds) {
     if (pageIds.length === 0) return [];
-    const filter = status ? 'AND c.status = ?' : "AND c.status <> 'historical'";
+    const filter = status ? 'AND c.status = ?' : `AND c.status NOT IN (${NOT_IN_ALL})`;
     const rows = await query<CopyDbRow>(
       `SELECT c.id, c.fact_id, c.page_id, c.page_title, c.page_url, c.status, c.stated_value, c.stated_unit, c.stated_condition, c.quote, c.reason,
          c.judged_at, f.subject, f.attribute, f.fact_condition, f.value, f.unit

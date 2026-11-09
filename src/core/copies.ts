@@ -63,20 +63,43 @@ export interface FactTerms {
   /** Distinct words of the phrases, used to find chunks. */
   keywords: string[];
   /**
-   * Distinctive words of the subject ("Travel per diem" → ["diem"]), all required in one CQL clause, so a copy that
-   * words the subject differently ("the per diem is $60") is still found when the exact phrase is not on the page.
+   * Word groups searched in any order or wording, each group's words all required (one CQL `AND` clause): the
+   * distinctive words of the subject and of each synonym, two at a time when there are three. Never the value, so a
+   * copy with a different value (drift) is found by what it is about: "Expense claim deadline" → [expense, claim],
+   * [expense, deadline], [claim, deadline]; "Travel per diem" → [diem].
    */
-  subjectWords: string[];
+  wordGroups: string[][];
 }
 
 /** Subject words too common to narrow a search on their own (a site's every page about travel says "travel"). */
 const GENERIC_SEARCH_WORDS = new Set(['travel', 'trip', 'trips', 'policy', 'policies', 'company', 'employee', 'employees', 'staff', 'team', 'general', 'rule', 'rules', 'process', 'guide']);
-const MAX_SUBJECT_WORDS = 3;
+const MAX_GROUP_SOURCE_WORDS = 3;
+const MAX_WORD_GROUPS = 8;
 
-const subjectWordsOf = (subject: string): string[] =>
-  [...new Set(normaliseKeyPart(cleanTerm(subject)).split(' '))]
+const distinctiveWordsOf = (term: string): string[] =>
+  [...new Set(normaliseKeyPart(cleanTerm(term)).split(' '))]
     .filter((w) => w.length >= 3 && /^[\p{L}\p{N}]+$/u.test(w) && !/^\d+$/.test(w) && !STOPWORDS.has(w) && !GENERIC_SEARCH_WORDS.has(w))
-    .slice(0, MAX_SUBJECT_WORDS);
+    .slice(0, MAX_GROUP_SOURCE_WORDS);
+
+/** One group of up to two words, or every pair of three (a page may word one of the three differently). */
+const groupsOf = (words: readonly string[]): string[][] => {
+  if (words.length < 3) return words.length > 0 ? [[...words]] : [];
+  const out: string[][] = [];
+  for (let i = 0; i < words.length; i++) for (let k = i + 1; k < words.length; k++) out.push([words[i] as string, words[k] as string]);
+  return out;
+};
+
+function wordGroupsOf(terms: readonly string[]): string[][] {
+  const seen = new Set<string>();
+  const out: string[][] = [];
+  for (const g of terms.flatMap((t) => groupsOf(distinctiveWordsOf(t)))) {
+    const key = [...g].sort().join(' ');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(g);
+  }
+  return out.slice(0, MAX_WORD_GROUPS);
+}
 
 /** Numbers written in `text`, with thousands separators of either style ("2,000", "2.000" → 2000). */
 export function numbersIn(text: string): number[] {
@@ -106,20 +129,21 @@ export function factTerms(fact: ScanFact, extra: readonly string[] = []): FactTe
     if (t.length >= 3 && !phrases.some((x) => x.toLowerCase() === t.toLowerCase())) phrases.push(t);
   }
   const numbers = [...new Set([...numbersIn(fact.value), ...numbersIn(fact.previousValue ?? '')].map(String))];
-  return { phrases, numbers, keywords: keywordsOf([...phrases, fact.attribute]), subjectWords: subjectWordsOf(fact.subject) };
+  return { phrases, numbers, keywords: keywordsOf([...phrases, fact.attribute]), wordGroups: wordGroupsOf(phrases) };
 }
 
 /**
  * CQL for the candidates of one fact: current pages (archived pages are not returned by default) other than the
- * source, without the `ripple-ignore` label, that contain a phrase of the fact or one of its numbers. Results come
+ * source, without the `ripple-ignore` label, that contain a phrase of the fact, all words of one of its word groups
+ * or one of its numbers. Results come
  * back by relevance, so the first 200 are the best candidates.
  */
 export function buildCql(sourcePageId: string, terms: FactTerms): string {
   if (!/^\d{1,32}$/.test(sourcePageId)) throw new Error('invalid source page id');
   const clauses = [
     ...terms.phrases.map((p) => `text ~ "\\"${p}\\""`),
-    // All distinctive subject words, in any order or wording ("per diem" for "Travel per diem").
-    ...(terms.subjectWords.length > 0 ? [terms.subjectWords.map((w) => `text ~ "${w}"`).join(' AND ')].map((c) => (terms.subjectWords.length > 1 ? `(${c})` : c)) : []),
+    // Distinctive words of the subject/synonyms in any order or wording, without the value (finds drifted copies).
+    ...terms.wordGroups.map((g) => (g.length > 1 ? `(${g.map((w) => `text ~ "${w}"`).join(' AND ')})` : `text ~ "${g[0]}"`)),
     // Bare numbers of 3+ digits only: "60" alone matches too many pages to help relevance. 4+ digits also as
     // written with a thousands separator ("2,000"), which the index keeps as one token.
     ...terms.numbers
@@ -531,7 +555,30 @@ export interface CopyDecision {
  * cannot be compared).
  */
 export function decideStatus(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[] = []): CopyDecision | null {
-  if (j.sameFact === 'no' || j.mention === 'example') return null;
+  return judgeOutcome(fact, j, siblings).decision;
+}
+
+/** Why a judged mention is not a copy (for logs). */
+export type NotCopyReason = 'not_same_fact' | 'example' | 'value_not_comparable';
+
+/**
+ * `decideStatus` plus the reason when the mention is not a copy. The judge is told to answer "no" for a different
+ * condition (e.g. per diem for external training vs domestic travel); such a current mention with a comparable value
+ * is still reported as `unsure` (PRD: different condition → unsure), only an unrelated "no" is dropped.
+ */
+export function judgeOutcome(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[] = []): { decision: CopyDecision | null; reason?: NotCopyReason } {
+  if (j.mention === 'example') return { decision: null, reason: 'example' };
+  if (j.sameFact === 'no') {
+    const otherCondition = j.mention === 'current' && j.statedCondition !== null && !sameCondition(fact, j.statedCondition);
+    if (!otherCondition || compareValues({ value: fact.value, unit: fact.unit }, { value: j.statedValue, unit: j.statedUnit }) === 'unknown') {
+      return { decision: null, reason: 'not_same_fact' };
+    }
+  }
+  const decision = statusOf(fact, j, siblings);
+  return decision ? { decision } : { decision: null, reason: 'value_not_comparable' };
+}
+
+function statusOf(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[]): CopyDecision | null {
   if (j.mention === 'historical') return { status: 'historical', reason: 'Past value (historical mention); not checked.' };
   if (!sameCondition(fact, j.statedCondition)) {
     return { status: 'unsure', reason: fact.condition ? `Different condition: "${j.statedCondition}" vs "${fact.condition}".` : `Only for "${j.statedCondition}"; the source has no condition.` };

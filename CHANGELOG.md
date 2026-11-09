@@ -38,6 +38,10 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Halaman arsip/draft tidak lagi menjadi kandidat salinan. Pengecualian space lewat pengaturan belum ada.
 
 ### Fixed
+- Salinan yang menyimpang (nilai berbeda) kini ditemukan berdasarkan kata subjek/sinonim tanpa nilai: tiap subjek dan sinonim menjadi kelompok kata (berpasangan bila tiga kata, mis. "Expense claim deadline" → expense+claim, expense+deadline, claim+deadline), batas 200 kandidat per fakta tetap.
+- Salinan dengan kondisi lain (mis. per diem pelatihan eksternal $40) kini Tidak pasti walaupun judge menjawab "bukan fakta yang sama", bukan hilang diam-diam.
+- Hitungan "N copies" dan filter "All" kini sama dengan kartu di bawah All: hanya In sync, Out of date, Unsure, Updated; Historical dan Ignored punya filter sendiri.
+- Setiap halaman yang dinilai menulis log `ripple judge page` (pageId, factId, hasil per fakta: status / no_chunk / no_match / not_same_fact / example / value_not_comparable, alasan drop), tanpa isi halaman.
 - Tahap penilaian salinan tidak lagi gagal dengan "Unknown SQL execution error": daftar halaman yang menunggu dinilai memakai `LIMIT` inline, karena Forge SQL (TiDB) menolak `LIMIT ?` (ER_WRONG_ARGUMENTS).
 - Pencarian salinan kini juga mencari kata khas subjek (mis. "diem" untuk "Travel per diem", "flight" + "class") dan angka ≥4 digit dalam bentuk "2,000", sehingga salinan yang tidak memuat frasa subjek persis tetap ditemukan tanpa bergantung pada sinonim LLM.
 - Log error SQL kini memuat nama operasi (mis. `SELECT scan_hits`) dan kode error MySQL dengan pesan yang disamarkan; setiap scan menulis satu log ringkasan (kandidat per fakta, halaman dinilai/dilewati, panggilan LLM, partial, hitungan status).
