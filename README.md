@@ -1,57 +1,35 @@
-# Ripple — Teamwork Graph prototype
+# Ripple
 
-Minimal Forge app (UI Kit, `confluence:contentBylineItem` "Ripple owners") that de-risks the core Ripple
-dependency: reading page owners from the Teamwork Graph (Preview) curated query `confluencePageOwners`.
+Ripple keeps your official facts true everywhere they're repeated. Mark a Confluence page as the source of truth;
+Ripple extracts its facts, finds every page that restates them, and when a fact changes it sends each page owner
+one Jira task with ready-made edits to approve. Built on Forge (Confluence, Jira, Forge SQL, Forge LLM, Teamwork
+Graph, Rovo).
 
-- `src/resolvers/index.js` — resolver `getPageOwners`: calls `api.asUser().requestTeamworkGraph()` with
-  `query ripple_pageOwners { confluencePageOwners(id: <page ARI>, first: 25) … }` and the
-  `X-Query-Context: ari:cloud:platform::site/<cloudId>` header (same pattern as Tripwire, which works on this
-  site). When the graph returns no owners it falls back to Confluence REST v2 `GET /wiki/api/v2/pages/{id}`
-  (`ownerId`/`authorId`, as user). Logs one JSON line per call (`{"app":"ripple","op":…,"pageId","owners","rawCount","dataPresent","errors"}`).
-- `src/frontend/index.jsx` — shows owners, a source label (`via Teamwork Graph` / `via Confluence REST (fallback)`),
-  the raw TWG edge count, whether `data` was present, and any GraphQL error.
-- Scopes: `read:graph:page:confluence`, `read:graph:space:confluence`, `read:graph:team:atlassian`,
-  `read:graph:user:atlassian`, `read:page:confluence`.
+Status: **M0** — foundation only. The byline shows "Ripple is ready", the database setup progress and the space's
+owning team via Teamwork Graph; every other module is declared and answers "not implemented".
 
-## Deploy / install / test
+## Layout
 
-Use Node 22/24 (`export PATH=~/.nvm/versions/node/v24.22.2/bin:$PATH`; that also brings Forge CLI 15.0.0).
+- `src/index.ts` — function handlers referenced by `manifest.yml`
+- `src/surfaces/` — resolvers (`ui.ts`), triggers and queue consumers (`background.ts`), Rovo actions (`actions.ts`)
+- `src/adapters/` — Forge SQL (`sql.ts`), Teamwork Graph + Confluence REST v2 page (`teamworkGraph.ts`)
+- `src/core/` — append-only migrations, migration pacing (`schema.ts`), shared view types
+- `src/llm/` — Forge LLM tool-call wrapper
+- `ui/src/` — Custom UI views, built by `scripts/build-ui.mjs` into `static/<view>/build`
+- `test/` — vitest
+
+## Develop
+
+Node 24 (`export PATH="$HOME/.nvm/versions/node/<v24>/bin:$PATH"`).
 
 ```sh
 npm install
-forge lint
+npm run build   # typecheck + Custom UI bundles
+npm test
+npm run lint    # forge lint
 forge deploy -e development --non-interactive
-forge install --site one-atlas-vyyd.atlassian.net --product confluence -e development --non-interactive
-# after scope changes:
-forge install --upgrade --site one-atlas-vyyd.atlassian.net --product confluence -e development --non-interactive
+forge install --upgrade   # after scope/module changes
 ```
 
-Test: open any Confluence page on one-atlas-vyyd, click **Ripple owners** in the byline, accept the
-"Allow access" consent if asked, then read the panel and `forge logs -e development --since 15m`.
-
-## Test results (2026-11-08)
-
-- Deploy + install with all four `read:graph:*` scopes: **OK**, no org-admin approval was asked
-  (installation `bf9735d2-…`, development, one-atlas-vyyd Confluence).
-- The byline call itself (`asUser()` from a resolver) is **not verified yet**: no automated browser was
-  available, so no user has opened the module; `forge logs` has no `confluencePageOwners` line from the resolver.
-- Attempted workaround: a temporary dev-only webtrigger calling `api.asUser(<accountId>).requestTeamworkGraph()`
-  (with `read:app-user-token`) for the 5 most recently modified pages. Every call failed with
-  `Forge platform failed to process runtime HTTP request - 401 - NO_IMPERSONATION_SCOPES_DEFINED`
-  (the user has not granted consent to the app yet). `asApp()` has no `requestTeamworkGraph` in `@forge/api` 8.x,
-  so TWG cannot be read from webtriggers, scheduled triggers or queue consumers without a prior user consent.
-  The probe was removed again (app version 5).
-- First real click (page 7110657, via byline): TWG returned `rawCount 1`, `data` present, but error
-  `The field at path '/confluencePageOwners/edges[0]/node' was declared as a non null type, but ... returned a null value`,
-  so 0 owners and the REST fallback answered (owner accountId, no name).
-- v5.1.0 (diagnostic): one click now runs three selections and logs each (`variant` A/B/C, `rawCount`,
-  `nullNodes`, `types`, `errors`): A = Tripwire's `... on AtlassianUser { id accountId }`, B = `__typename ... on
-  AtlassianUser { id }`, C = A + `name`. The best variant feeds the owner list; names missing from the graph are
-  rendered by UI Kit `<User accountId>` (no extra scope). Result of the next click: pending.
-- Real click on v5.1.0: `confluencePageOwners` returned null nodes in every variant.
-- v5.2.0: the same click also runs `confluencePageContributors` (Tripwire's exact selection; no edge metadata,
-  so "main contributor" = first edge) and `atlassianTeamsBySpace(spaceAri: ari:cloud:confluence:<cloudId>:space/<spaceId>)`
-  (space id from the byline context, else REST v2 page `spaceId`). Logs: `op` `confluencePageContributors` /
-  `atlassianTeamsBySpace` with `count`, `nullNodes`, `types`, `errors`. Result of the next click: pending.
-- Implication for Ripple: TWG reads need a user-initiated surface (resolver) or user consent before
-  background/impersonated reads; plan the "owners" lookup around that.
+Schema changes: append a migration to `src/core/migrations.ts` (never edit an applied one). DDL only runs in the
+`schema-migrate` consumer, queued on install/upgrade, paced for the Forge SQL DDL rate limit.

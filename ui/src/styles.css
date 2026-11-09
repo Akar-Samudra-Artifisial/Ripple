@@ -1,0 +1,47 @@
+/* Colours come from Atlassian design tokens (with fallbacks) so views follow light and dark themes. */
+:root {
+  --rp-ink: var(--ds-text, #172b4d);
+  --rp-muted: var(--ds-text-subtlest, #626f86);
+  --rp-danger: var(--ds-text-danger, #ae2e24);
+  --rp-success: var(--ds-text-success, #216e4e);
+  --rp-sans: var(--ds-font-family-body, ui-sans-serif, -apple-system, 'Segoe UI', sans-serif);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  background: transparent;
+  color: var(--rp-ink);
+  font: 14px/1.45 var(--rp-sans);
+}
+
+.shell {
+  padding: 8px 12px;
+}
+
+.shell__title {
+  margin: 0 0 8px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.muted {
+  color: var(--rp-muted);
+}
+
+.error {
+  color: var(--rp-danger);
+}
+
+.ok {
+  color: var(--rp-success);
+}
+
+ul {
+  margin: 4px 0;
+  padding-left: 18px;
+}

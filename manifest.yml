@@ -1,29 +1,217 @@
+app:
+  id: ari:cloud:ecosystem::app/c5c7e62a-0653-4083-ab31-3a3bc498ad87
+  runtime:
+    name: nodejs24.x
+    memoryMB: 256
+    architecture: arm64
+  compatibility:
+    confluence:
+      required: true
+    jira:
+      required: false
+
+# Final manifest for the whole MVP (M0–M7): modules not built yet point at stubs that log and reply
+# "not implemented", so scopes and storage/AI modules never change later (each change is a major upgrade).
 modules:
+  # --- Confluence ---
   confluence:contentBylineItem:
-    - key: ripple-page-owners
-      resource: main
+    - key: ripple-byline
+      title: Ripple
+      resource: byline-ui
       resolver:
-        function: resolver
-      render: native
-      title: Ripple owners
+        function: ui-resolver
+  confluence:globalSettings:
+    - key: ripple-settings
+      title: Ripple settings
+      resource: settings-ui
+      resolver:
+        function: ui-resolver
+
+  # --- Jira (update tasks: approval panel on the issue) ---
+  jira:issuePanel:
+    - key: ripple-approval
+      title: Ripple update
+      icon: resource:icons;ripple.svg
+      resource: approval-ui
+      resolver:
+        function: ui-resolver
+
+  # --- Events and background work ---
+  trigger:
+    - key: on-page-change
+      function: on-page-event
+      events:
+        - avi:confluence:updated:page
+    # New install / major upgrade: start the schema migration (paced for the Forge SQL DDL rate limit).
+    - key: on-app-lifecycle
+      function: app-lifecycle
+      events:
+        - avi:forge:installed:app
+        - avi:forge:upgraded:app
+  scheduledTrigger:
+    - key: weekly-sweep-trigger
+      function: weekly-sweep
+      interval: week
+  consumer:
+    - key: extract-consumer
+      queue: extract
+      function: extract-facts
+    - key: search-consumer
+      queue: search
+      function: search-copies
+    - key: judge-consumer
+      queue: judge
+      function: judge-candidates
+    - key: demo-consumer
+      queue: demo-seed
+      function: demo-job
+    - key: migrate-consumer
+      queue: schema-migrate
+      function: migrate-schema
+
+  # --- Rovo ---
+  rovo:agent:
+    - key: fact-keeper
+      name: Fact Keeper
+      description: Answers questions with the official value from the source-of-truth page, and lists where a fact
+        is repeated and which copies are out of date.
+      prompt: resource:agent-prompt;prompt.md
+      conversationStarters:
+        - What's the per diem for domestic travel?
+        - Where else do we mention the refund window?
+        - Which pages still show an old value?
+      actions:
+        - get-fact
+        - find-copies
+        - list-out-of-date
+        - propose-updates
+        - rollout-status
+  action:
+    - key: get-fact
+      name: Get official fact
+      function: fact-keeper-action
+      actionVerb: GET
+      description: Return the official value of a fact on a topic, with a link to its source-of-truth page.
+      inputs:
+        topic:
+          title: Topic
+          type: string
+          required: true
+          description: The fact to look up, for example "domestic per diem".
+    - key: find-copies
+      name: Find copies of a fact
+      function: fact-keeper-action
+      actionVerb: GET
+      description: List the pages that restate a fact, with each copy's status (in sync, out of date, unsure).
+      inputs:
+        topic:
+          title: Topic
+          type: string
+          required: true
+          description: The fact whose copies to list.
+    - key: list-out-of-date
+      name: List out-of-date copies
+      function: fact-keeper-action
+      actionVerb: GET
+      description: List copies that state a different value than their source of truth, in a space or owned by a user.
+      inputs:
+        spaceKey:
+          title: Space key
+          type: string
+          required: false
+          description: Only copies in this Confluence space.
+        owner:
+          title: Owner
+          type: string
+          required: false
+          description: Only copies owned by this person.
+    - key: propose-updates
+      name: Propose updates
+      function: fact-keeper-action
+      actionVerb: CREATE
+      description: Prepare edit proposals for every copy of a changed fact. Ask the user to confirm first.
+      inputs:
+        topic:
+          title: Topic
+          type: string
+          required: true
+          description: The changed fact.
+    - key: rollout-status
+      name: Rollout status
+      function: fact-keeper-action
+      actionVerb: GET
+      description: Progress of the update rollout for a changed fact (waiting, updated, rejected, overdue, conflict).
+      inputs:
+        topic:
+          title: Topic
+          type: string
+          required: true
+          description: The changed fact.
+
+  # --- Storage and AI (adding these later forces a major version upgrade) ---
+  sql:
+    - key: main
+      engine: mysql
+  llm:
+    - key: ripple-llm
+      model:
+        - claude
+
   function:
-    - key: resolver
-      handler: index.handler
+    - key: ui-resolver
+      handler: index.uiResolver
+    - key: on-page-event
+      handler: index.onPageEvent
+    - key: app-lifecycle
+      handler: index.onAppLifecycle
+    - key: weekly-sweep
+      handler: index.weeklySweep
+    - key: extract-facts
+      handler: index.extractFacts
+      timeoutSeconds: 900
+    - key: search-copies
+      handler: index.searchCopies
+      timeoutSeconds: 900
+    - key: judge-candidates
+      handler: index.judgeCandidates
+      timeoutSeconds: 900
+    - key: demo-job
+      handler: index.demoJob
+      timeoutSeconds: 900
+    - key: migrate-schema
+      handler: index.migrateSchema
+      timeoutSeconds: 900
+    - key: fact-keeper-action
+      handler: index.factKeeperAction
+
 resources:
-  - key: main
-    path: src/frontend/index.jsx
+  - key: byline-ui
+    path: static/byline/build
+  - key: settings-ui
+    path: static/settings/build
+  - key: approval-ui
+    path: static/approval/build
+  - key: agent-prompt
+    path: prompts
+  - key: icons
+    path: static/icons
+
 permissions:
   scopes:
-    # Confluence REST v2 fallback: GET /wiki/api/v2/pages/{id}
-    - read:page:confluence
+    - read:confluence-content.summary # page updated events
+    - read:confluence-content.all     # page bodies for extraction and judging
+    - search:confluence               # CQL candidate search
+    - read:page:confluence            # REST v2 page, body, ownerId/authorId, version history
+    - write:page:confluence           # apply approved edits (as the approving user) and demo pages
+    - write:confluence-content        # version message "Updated by Ripple from <source>"
+    - read:space:confluence           # spaces in scope (v2)
+    - read:label:confluence           # ripple-ignore label (v2)
+    - write:confluence-space          # demo data: Nimbus Labs spaces
+    - read:confluence-user            # owner display names in task text and panels
+    - read:jira-work                  # update tasks and approval panel
+    - write:jira-work                 # create one update task per owner per change
     # Teamwork Graph (Preview, read-only; a missing scope returns empty data, not an error)
     - read:graph:page:confluence
     - read:graph:space:confluence
     - read:graph:team:atlassian
     - read:graph:user:atlassian
-app:
-  runtime:
-    name: nodejs24.x
-    memoryMB: 256
-    architecture: arm64
-  id: ari:cloud:ecosystem::app/c5c7e62a-0653-4083-ab31-3a3bc498ad87

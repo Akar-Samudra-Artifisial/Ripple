@@ -1,21 +1,36 @@
 {
   "name": "ripple",
   "version": "0.1.0",
-  "main": "index.js",
-  "license": "MIT",
   "private": true,
-  "scripts": {
-    "lint": "eslint src/**/*"
+  "description": "Ripple keeps your official facts true everywhere they're repeated",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
   },
-  "devDependencies": {
-    "eslint": "^8.56.0",
-    "eslint-plugin-react-hooks": "^4.6.0"
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p ui",
+    "build:ui": "node scripts/build-ui.mjs",
+    "build": "npm run typecheck && npm run build:ui",
+    "lint": "forge lint",
+    "deploy": "npm run build:ui && forge deploy"
   },
   "dependencies": {
     "@forge/api": "^8.4.0",
-    "@forge/bridge": "^7.2.1",
-    "@forge/react": "^12.4.0",
+    "@forge/events": "^3.0.9",
+    "@forge/llm": "^1.0.9",
     "@forge/resolver": "^2.0.2",
-    "react": "^18.2.0"
+    "@forge/sql": "^4.0.9"
+  },
+  "devDependencies": {
+    "@forge/bridge": "^7.2.1",
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "esbuild": "^0.28.2",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
   }
 }

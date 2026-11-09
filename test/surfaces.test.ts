@@ -1,0 +1,121 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const forge = vi.hoisted(() => ({ push: vi.fn(async () => ({ jobId: 'job-1' })) }));
+
+vi.mock('@forge/api', () => ({ default: {}, route: (s: TemplateStringsArray) => s.join('') }));
+vi.mock('@forge/resolver', () => ({
+  default: class {
+    define() {}
+    getDefinitions() {
+      return {};
+    }
+  },
+}));
+vi.mock('@forge/sql', () => ({ sql: {}, migrationRunner: {} }));
+vi.mock('@forge/events', () => ({
+  Queue: class {
+    push = forge.push;
+  },
+  InvocationError: class {
+    constructor(readonly options: unknown) {}
+  },
+  InvocationErrorCode: { FUNCTION_UPSTREAM_RATE_LIMITED: 'FUNCTION_UPSTREAM_RATE_LIMITED' },
+}));
+
+import { LATEST_MIGRATION, MIGRATIONS } from '../src/core/migrations';
+import { SchemaSettingUpError } from '../src/core/schema';
+import { ACTIONS, factKeeperAction } from '../src/surfaces/actions';
+import { onAppLifecycle, onPageEvent } from '../src/surfaces/background';
+import { bylineStatus, schemaView, type BylineDeps } from '../src/surfaces/ui';
+
+beforeEach(() => {
+  vi.spyOn(console, 'info').mockImplementation(() => undefined);
+  vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  forge.push.mockClear();
+});
+
+describe('migrations', () => {
+  it('are uniquely named, versioned and idempotent', () => {
+    const names = MIGRATIONS.map((m) => m.name);
+    expect(new Set(names).size).toBe(names.length);
+    for (const m of MIGRATIONS) {
+      expect(m.name).toMatch(/^v\d{3}[a-z]?_/);
+      expect(m.statement).toMatch(/IF NOT EXISTS/);
+    }
+    expect(names).toEqual(['v001_create_settings', 'v002_create_audit']);
+    expect(LATEST_MIGRATION).toBe('v002_create_audit');
+  });
+});
+
+describe('schemaView', () => {
+  it('reports ready, setting up and errors', async () => {
+    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 2, total: 2, latest: LATEST_MIGRATION });
+    expect(
+      await schemaView(async () => {
+        throw new SchemaSettingUpError(1, 2);
+      }),
+    ).toMatchObject({ status: 'setting_up', applied: 1, total: 2 });
+    expect(
+      await schemaView(async () => {
+        throw new Error('db down');
+      }),
+    ).toMatchObject({ status: 'error', error: 'db down' });
+  });
+});
+
+describe('bylineStatus', () => {
+  const graphWith = (body: unknown) => () => async () => ({ body });
+  const deps = (over: Partial<BylineDeps> = {}): BylineDeps => ({
+    graph: graphWith({ data: { atlassianTeamsBySpace: { edges: [{ node: { id: 't1', displayName: 'Platform Team' } }] } } }),
+    pageMeta: vi.fn(async () => ({ spaceId: '99' })),
+    ensure: async () => undefined,
+    ...over,
+  });
+
+  it('shows "Ripple is ready" with the space team from the context space id', async () => {
+    const d = deps();
+    const r = await bylineStatus({ cloudId: 'c1', extension: { content: { id: 5 }, space: { id: 7 } } }, d);
+    expect(r.message).toBe('Ripple is ready');
+    expect(r.schema.status).toBe('ready');
+    expect(r.spaceTeams).toEqual({ spaceId: '7', teams: [{ id: 't1', name: 'Platform Team' }], dataPresent: true, errors: [] });
+    expect(d.pageMeta).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the REST v2 page for the space id', async () => {
+    const d = deps();
+    const r = await bylineStatus({ cloudId: 'c1', extension: { content: { id: 5 } } }, d);
+    expect(d.pageMeta).toHaveBeenCalledWith('5');
+    expect(r.spaceTeams.spaceId).toBe('99');
+  });
+
+  it('never throws: missing cloud id or a failed page lookup become errors', async () => {
+    expect((await bylineStatus({}, deps())).spaceTeams.errors).toEqual(['no cloud id in context']);
+    const failing = deps({
+      pageMeta: async () => {
+        throw new Error('Confluence REST v2 page 5 failed: HTTP 404');
+      },
+    });
+    const r = await bylineStatus({ cloudId: 'c1', extension: { content: { id: 5 } } }, failing);
+    expect(r.spaceTeams).toMatchObject({ spaceId: null, teams: [], errors: ['Confluence REST v2 page 5 failed: HTTP 404'] });
+  });
+
+  it('flags data: null from the graph', async () => {
+    const r = await bylineStatus({ cloudId: 'c1', extension: { space: { id: 7 } } }, deps({ graph: graphWith({ data: null }) }));
+    expect(r.spaceTeams).toMatchObject({ teams: [], dataPresent: false });
+  });
+});
+
+describe('background and Rovo stubs', () => {
+  it('queues a migration on install/upgrade', async () => {
+    await onAppLifecycle({ eventType: 'avi:forge:installed:app' });
+    expect(forge.push).toHaveBeenCalledWith({ body: { reason: 'avi:forge:installed:app' } });
+  });
+
+  it('page events and actions reply "not implemented" and log', async () => {
+    await expect(onPageEvent({ eventType: 'avi:confluence:updated:page', content: { id: 1 } })).resolves.toBeUndefined();
+    expect(console.info).toHaveBeenCalledWith('ripple stub', expect.objectContaining({ feature: 'page change detection', pageId: '1' }));
+    for (const key of ACTIONS) {
+      expect(await factKeeperAction({ context: { moduleKey: key } })).toMatchObject({ status: 'not_implemented', feature: `Rovo action ${key}` });
+    }
+  });
+});
