@@ -44,6 +44,12 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Halaman arsip/draft tidak lagi menjadi kandidat salinan. Pengecualian space lewat pengaturan belum ada.
 
 ### Fixed
+- Diff M3 tidak lagi bergantung pada wording LLM:
+  - Fakta tersimpan (confirmed dan proposed yang bukan duplikat) dikirim ke prompt ekstraksi, dan model mengisi `existing_fact_id`. Id hanya diterima bila ditawarkan untuk source ini dan dipakai sekali.
+  - Fallback deterministik: kalimat sama setelah angka diabaikan (Jaccard kata ≥ 0,75; confirmed didahulukan, lalu nilai sama, lalu kemiripan wording), kemudian identity key.
+  - Fakta yang cocok tetap memakai key dan wording lama, sehingga perubahan nilai menjadi change dan tidak muncul sebagai fakta proposed baru.
+  - Fakta proposed duplikat dari pembacaan sebelumnya yang salah cocok dihapus pada diff berikutnya.
+  - Log diff memuat `matchedById`, `matchedByQuote`, `matchedByKey`, `duplicatesRemoved`.
 - Deteksi perubahan M3 diperkeras setelah review:
   - Job diff menyimpan perubahan dulu, baru menandai versi halaman sudah dibaca, sehingga retry setelah gagal tidak kehilangan perubahan.
   - `confirmChange`/`dismissChange` wajib membawa `version` dan status hanya berubah untuk versi itu. Bila versi lebih baru sudah menggantikannya, muncul error "Review it again" dan panel memuat ulang.

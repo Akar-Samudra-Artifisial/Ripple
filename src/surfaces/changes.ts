@@ -15,7 +15,7 @@ import { displayNames } from '../adapters/confluenceUsers';
 import { sqlRepo, type FactRepo, type PageVersionInfo } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
 import { asUserGraph, fetchPageMeta, ownersFromPage, readSpaceTeams, scrubErrorText, type GraphRequest, type PageMeta } from '../adapters/teamworkGraph';
-import { addWorkingDays, computeImpact, DEFAULT_DEADLINE_DAYS, isRippleVersion, MAX_DEADLINE_DAYS, planDiff } from '../core/changes';
+import { addWorkingDays, computeImpact, DEFAULT_DEADLINE_DAYS, isRippleVersion, matchFacts, MAX_DEADLINE_DAYS, offeredFacts, planDiff, type KnownFact } from '../core/changes';
 import { parseExtraction } from '../core/facts';
 import { storageToText, TRUNCATED_MARK } from '../core/pageText';
 import { isSqlRateLimited, SchemaSettingUpError } from '../core/schema';
@@ -131,6 +131,15 @@ export interface DiffDeps {
 
 const defaultDiffDeps: DiffDeps = { facts: sqlRepo, changes: sqlChangeRepo, page: getSourcePage, spaceOf: pageSpaceIdAsApp, ensure: ensureSchema };
 
+/** Stored facts of the source with the text matching needs (key/origin from `storedFacts`, wording from `listFacts`). */
+async function knownFacts(facts: FactRepo, pageId: string): Promise<KnownFact[]> {
+  const views = new Map((await facts.listFacts(pageId)).map((f) => [f.id, f]));
+  return (await facts.storedFacts(pageId)).flatMap((s) => {
+    const v = views.get(s.id);
+    return v ? [{ ...s, subject: v.subject, attribute: v.attribute, condition: v.condition, quote: v.quote }] : [];
+  });
+}
+
 export const MAX_DIFF_RETRIES = 4;
 const backoff = (retryCount: number): number => 30 * 2 ** retryCount;
 
@@ -166,15 +175,31 @@ export async function runDiffJob(pageId: string, retryCount: number, deps: DiffD
       await deps.facts.finishExtraction(pageId, info);
       return { status: 'skipped', reason: 'text unchanged' };
     }
-    const { args, model } = await runFactExtraction(text, { pageId, title: page.title }, deps.llm);
+    // The stored facts are listed in the prompt so the model names the fact it re-reads (its wording may differ).
+    const offered = offeredFacts(await knownFacts(deps.facts, pageId));
+    const { args, model } = await runFactExtraction(text, { pageId, title: page.title }, deps.llm, offered);
     const parsed = parseExtraction(args, text);
     if (!(await deps.facts.getSource(pageId))) return { status: 'skipped', reason: 'unmarked during diff' };
-    const diff = planDiff(await deps.facts.storedFacts(pageId), parsed.facts, page.version, page.versionCreatedAt);
+    // Re-read: a review may have landed while the model ran.
+    const known = await knownFacts(deps.facts, pageId);
+    const match = matchFacts(known, parsed.facts, new Set(offered.map((f) => f.id)));
+    const diff = planDiff(known, match.facts, page.version, page.versionCreatedAt, match.duplicates);
     // Values the owner already dismissed are not raised again (another value still is).
     const dismissed = await deps.changes.dismissedValues(pageId);
     const changes = diff.changes.filter((c) => !dismissed.has(dismissalKey(c.factId, valueHash(c.newValue, c.newUnit))));
     const base = { inserted: diff.merge.insert.length, missing: diff.missing.length };
-    const log = { pageId, version: page.version, model, dismissed: diff.changes.length - changes.length, ...base, dropped: parsed.dropped.length };
+    const log = {
+      pageId,
+      version: page.version,
+      model,
+      matchedById: match.byId,
+      matchedByQuote: match.byQuote,
+      matchedByKey: match.byKey,
+      duplicatesRemoved: diff.merge.remove.length,
+      dismissed: diff.changes.length - changes.length,
+      ...base,
+      dropped: parsed.dropped.length,
+    };
     // Order matters for retries: the change is stored before the version is marked as read (`finishExtraction`), so
     // a failure in between re-reads the same version instead of skipping it as "already read".
     await deps.facts.applyMerge(pageId, diff.merge, info);

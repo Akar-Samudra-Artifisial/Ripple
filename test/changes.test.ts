@@ -17,13 +17,14 @@ import type { Message } from '@forge/llm';
 import { dismissalKey, valueHash, type ChangeRepo, type ChangeRouting, type ChangeRow, type CopyForChange } from '../src/adapters/changeRepo';
 import type { SourcePage } from '../src/adapters/confluence';
 import type { FactRepo, PageVersionInfo } from '../src/adapters/repo';
-import { addWorkingDays, computeImpact, planDiff, type ChangeImpact, type FactChange } from '../src/core/changes';
+import { addWorkingDays, computeImpact, matchFacts, planDiff, type ChangeImpact, type FactChange, type KnownFact } from '../src/core/changes';
 import { identityKey, type ExtractedFact, type MergePlan, type StoredFact } from '../src/core/facts';
 import type { ChangeDecision, CopyStatus, ErrorReply, FactView, PendingChangeReply, SourceView } from '../src/core/views';
 import type { ChatToolFn } from '../src/llm/extract';
 import type { ToolSpec } from '../src/llm/index';
 import { confirmChange, dismissChange, getPendingChange, handlePageUpdate, runDiffJob, type ChangeDeps, type DiffDeps, type TriggerDeps } from '../src/surfaces/changes';
 import { COPY_PAGES, SOURCE_PAGE_ID, type FactKey } from './fixtures/copies';
+import { TRAVEL_POLICY_FACTS, TRAVEL_POLICY_STORAGE } from './fixtures/travelPolicy';
 
 const CHANGE_RE = /^[0-9a-f-]{36}$/i;
 
@@ -132,6 +133,7 @@ class Store {
           if (u.refreshOnly) Object.assign(f, { quote: u.fact.quote, pageVersion: page.version });
           else if (f.status === u.from && !f.edited) Object.assign(f, { value: u.fact.value, unit: u.fact.unit, status: u.status, pageVersion: page.version });
         }
+        this.facts = this.facts.filter((f) => !(plan.remove.includes(f.id) && f.status === 'proposed' && !f.edited));
         for (const i of plan.insert) this.facts.push({ ...fact(`f-new-${this.facts.length}`, i.subject, i.attribute, i.condition, i.value, i.unit, i.quote), status: 'proposed' });
       },
       finishExtraction: async (id: string, page: PageVersionInfo) => {
@@ -383,6 +385,102 @@ describe('diff consumer', () => {
     store.sources.clear();
     expect(await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(4, '$75'))).toEqual({ status: 'skipped', reason: 'not a source' });
     expect(llmCalls).toBe(0);
+  });
+});
+
+describe('diff matching does not depend on the model wording (live bug on 9502721)', () => {
+  const TP_IDS = TRAVEL_POLICY_FACTS.map((_, i) => `tp-${i + 1}`);
+  const tpRow = (f: (typeof TRAVEL_POLICY_FACTS)[number], id: string, quote = f.quote): Row => ({
+    ...fact(id, f.subject, f.attribute, f.condition, f.value, f.unit, quote),
+    type: f.type as Row['type'],
+    pageVersion: 1,
+  });
+  /** A model answer with other subject/attribute wording for the first 4 facts and `domestic` as the per diem. */
+  const reworded = (domestic: string, ids?: readonly (string | null)[]) => ({
+    facts: TRAVEL_POLICY_FACTS.map((f, i) => ({
+      ...f,
+      ...(i < 4 ? { subject: `${f.subject} rules`, attribute: `${f.attribute} limit` } : {}),
+      ...(i === 0 ? { value: domestic.slice(1), quote: f.quote.replace('$60', domestic) } : {}),
+      ...(ids ? { existing_fact_id: ids[i] ?? null } : {}),
+    })),
+  });
+  const prompts: string[] = [];
+  const llm = (answer: unknown): ChatToolFn =>
+    (async (messages: Message[], tool: ToolSpec) => {
+      llmCalls++;
+      prompts.push(String(messages[1]?.content ?? ''));
+      expect(tool.parameters).toMatchObject({ properties: { facts: { items: { required: expect.arrayContaining(['existing_fact_id']) } } } });
+      return { args: answer, model: 'm' };
+    }) as ChatToolFn;
+  const tpDeps = (version: number, domestic: string, answer: unknown): DiffDeps => ({
+    ...diffDeps(version, domestic),
+    page: async () => ({ ...page(version, domestic), body: TRAVEL_POLICY_STORAGE.replace('$60', domestic) }),
+    llm: llm(answer),
+  });
+  const doneLog = () => (console.info as unknown as { mock: { calls: unknown[][] } }).mock.calls.filter((c) => c[0] === 'ripple diff done').at(-1)?.[1];
+
+  beforeEach(() => {
+    prompts.length = 0;
+    store.facts = TRAVEL_POLICY_FACTS.map((f, i) => tpRow(f, TP_IDS[i] as string));
+    store.copies = [];
+    const s = store.sources.get(SOURCE_PAGE_ID);
+    if (s) s.pageVersion = 1;
+  });
+
+  it('new wording for 4 facts + $60 → $75: one change, nothing inserted, stored wording and keys kept', async () => {
+    const r = await runDiffJob(SOURCE_PAGE_ID, 0, tpDeps(2, '$75', reworded('$75')));
+    expect(r).toMatchObject({ status: 'done', changed: 1, inserted: 0, missing: 0 });
+    expect([...store.changes.values()][0]?.factChanges).toEqual([expect.objectContaining({ factId: 'tp-1', oldValue: '60', newValue: '75' })]);
+    expect(store.facts).toHaveLength(5);
+    expect(store.facts.map((f) => f.subject)).toEqual(TRAVEL_POLICY_FACTS.map((f) => f.subject));
+    expect(doneLog()).toMatchObject({ matchedById: 0, matchedByQuote: 5, matchedByKey: 0, duplicatesRemoved: 0 });
+    // The stored facts are offered to the model by id.
+    expect(prompts[0]).toContain('<<<KNOWN\ntp-1 | Travel per diem | Amount per day | Domestic travel | The per diem for domestic travel is $60 per day.');
+  });
+
+  it('ignores an existing_fact_id of another source or named twice; the quote fallback still matches', async () => {
+    const r = await runDiffJob(SOURCE_PAGE_ID, 0, tpDeps(2, '$75', reworded('$75', ['tp-1', 'f-other-source', 'tp-1', null, 'tp-5'])));
+    expect(r).toMatchObject({ status: 'done', changed: 1, inserted: 0 });
+    expect(doneLog()).toMatchObject({ matchedById: 2, matchedByQuote: 3, matchedByKey: 0 });
+    expect(store.facts.map((f) => f.id)).toEqual(TP_IDS);
+  });
+
+  it('falls back to the identity key when neither id nor quote matches', async () => {
+    const answer = { facts: TRAVEL_POLICY_FACTS.map((f) => (f.subject === 'Flight class' ? { ...f, quote: 'Book economy class for flights under 6 hours.' } : f)) };
+    store.facts = store.facts.map((f) => (f.id === 'tp-5' ? { ...f, quote: 'Economy only on short flights, please.' } : f));
+    await runDiffJob(SOURCE_PAGE_ID, 0, tpDeps(2, '$60', answer));
+    expect(doneLog()).toMatchObject({ matchedByQuote: 4, matchedByKey: 1, inserted: 0 });
+  });
+
+  it('recovers the live state: proposed duplicates of an earlier mismatched read are removed, then a change is found', async () => {
+    // State after the buggy v2: 5 confirmed facts plus 4 proposed copies with the new wording (domestic at $75).
+    const v2 = reworded('$75').facts.slice(0, 4);
+    store.facts.push(...v2.map((f, i) => ({ ...tpRow(f, `dup-${i + 1}`), status: 'proposed' as const, pageVersion: 2 })));
+    const s = store.sources.get(SOURCE_PAGE_ID);
+    if (s) s.pageVersion = 2;
+    // v3: back to $60 → no change, duplicates cleaned; they are not offered to the model.
+    const v3 = await runDiffJob(SOURCE_PAGE_ID, 0, tpDeps(3, '$60', reworded('$60')));
+    expect(v3).toMatchObject({ status: 'done', changeId: null, changed: 0, inserted: 0 });
+    expect(doneLog()).toMatchObject({ duplicatesRemoved: 4 });
+    expect(prompts[0]).not.toContain('dup-');
+    expect(store.facts.map((f) => f.id)).toEqual(TP_IDS);
+    // v4: $75 again → one change.
+    const v4 = await runDiffJob(SOURCE_PAGE_ID, 0, tpDeps(4, '$75', reworded('$75')));
+    expect(v4).toMatchObject({ status: 'done', changed: 1, inserted: 0 });
+    expect(store.facts).toHaveLength(5);
+  });
+
+  it('keeps several facts of one sentence apart (same quote): value, then wording decide', () => {
+    const quote = 'Domestic travel is $60 per day and international travel is $90 per day.';
+    const known: KnownFact[] = [
+      { id: 'd', identityKey: 'per diem|amount|domestic', originKey: null, status: 'confirmed', edited: false, value: '$60', unit: null, subject: 'Per diem', attribute: 'Amount', condition: 'Domestic', quote },
+      { id: 'i', identityKey: 'per diem|amount|international', originKey: null, status: 'confirmed', edited: false, value: '$90', unit: null, subject: 'Per diem', attribute: 'Amount', condition: 'International', quote },
+    ];
+    const newQuote = quote.replace('$60', '$75');
+    const ex = (value: string, condition: string): ExtractedFact => ({ type: 'number', subject: 'Daily allowance', attribute: 'Rate', value, unit: null, condition, quote: newQuote, identityKey: `daily allowance|rate|${condition.toLowerCase()}` });
+    const m = matchFacts(known, [ex('$75', 'Domestic trips'), ex('$90', 'International trips')], new Set());
+    expect(m.facts.map((f) => f.identityKey)).toEqual(['per diem|amount|domestic', 'per diem|amount|international']);
+    expect(planDiff(known, m.facts, 2).changes.map((c) => c.factId)).toEqual(['d']);
   });
 });
 

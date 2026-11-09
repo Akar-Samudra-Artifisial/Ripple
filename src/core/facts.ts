@@ -22,6 +22,8 @@ export interface ExtractedFact {
   condition: string | null;
   quote: string;
   identityKey: string;
+  /** Diff mode: the stored fact the model says this is (untrusted; checked by `matchFacts`). */
+  existingFactId?: string | null;
 }
 
 export type DropReason = 'invalid_shape' | 'unsupported_type' | 'quote_not_found' | 'value_not_in_quote' | 'key_too_long' | 'duplicate_key' | 'over_limit';
@@ -154,7 +156,8 @@ export function parseExtraction(raw: unknown, pageText: string): ParsedExtractio
       return;
     }
     keys.add(key);
-    facts.push({ type, subject, attribute, value, unit, condition, quote, identityKey: key });
+    const existingFactId = text(r.existing_fact_id, 64);
+    facts.push({ type, subject, attribute, value, unit, condition, quote, identityKey: key, ...(existingFactId ? { existingFactId } : {}) });
   });
   return { facts, dropped };
 }
