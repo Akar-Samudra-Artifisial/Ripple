@@ -33,7 +33,8 @@ and an audit trail of who confirmed, approved or rejected what and when.
   id>` (used to find the task again instead of creating a second one; it does not contain the account id). The
   source page's title is used in the task summary only when it has no read restriction. When every page is done,
   Ripple adds a short comment and moves the task to Done. Ripple stores the task's id, key and link per change and
-  owner; the Jira admin check reads only the global ADMINISTER permission of the user who saves the settings.
+  owner; the Jira admin check reads only the viewer's own global ADMINISTER permission, as that user
+  (`mypermissions`), when the settings page is opened or saved.
   **Limitation:** "no read restriction" means neither the page nor its ancestors restrict viewing. Ripple cannot read
   space permissions with its scopes, so a page in a space that only some groups may view counts as unrestricted and
   its title, link and the facts of a source in such a space can appear in the Jira task. Pick a Jira project whose

@@ -3,19 +3,38 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 /** Replies of the mocked Jira REST API, in call order; each records its request. */
 const jiraCalls: { path: string; method: string; body: unknown }[] = [];
 let jiraReplies: { status: number; body: unknown }[] = [];
+/** Calls made as the user (`asUser().requestJira`); they share the reply queue. A set `userThrows` is thrown once. */
+const userCalls: { path: string; method: string }[] = [];
+let userThrows: unknown;
 
-vi.mock('@forge/api', () => ({
-  default: {
-    asApp: () => ({
-      requestJira: async (path: string, init: { method: string; body?: string }) => {
-        jiraCalls.push({ path, method: init.method, body: init.body ? JSON.parse(init.body) : undefined });
-        const r = jiraReplies.shift() ?? { status: 500, body: {} };
-        return { status: r.status, ok: r.status >= 200 && r.status < 300, text: async () => JSON.stringify(r.body) };
-      },
-    }),
-  },
-  route: (s: TemplateStringsArray, ...v: unknown[]) => s.reduce((acc, part, i) => acc + part + (i < v.length ? String(v[i]) : ''), ''),
-}));
+vi.mock('@forge/api', () => {
+  const reply = () => {
+    const r = jiraReplies.shift() ?? { status: 500, body: {} };
+    return { status: r.status, ok: r.status >= 200 && r.status < 300, text: async () => JSON.stringify(r.body) };
+  };
+  return {
+    default: {
+      asApp: () => ({
+        requestJira: async (path: string, init: { method: string; body?: string }) => {
+          jiraCalls.push({ path, method: init.method, body: init.body ? JSON.parse(init.body) : undefined });
+          return reply();
+        },
+      }),
+      asUser: () => ({
+        requestJira: async (path: string, init: { method: string }) => {
+          userCalls.push({ path, method: init.method });
+          if (userThrows) {
+            const e = userThrows;
+            userThrows = undefined;
+            throw e;
+          }
+          return reply();
+        },
+      }),
+    },
+    route: (s: TemplateStringsArray, ...v: unknown[]) => s.reduce((acc, part, i) => acc + part + (i < v.length ? String(v[i]) : ''), ''),
+  };
+});
 vi.mock('@forge/sql', () => ({ sql: {}, migrationRunner: {} }));
 vi.mock('@forge/events', () => ({ Queue: class {} }));
 
@@ -24,7 +43,7 @@ import { parseJiraSettings } from '../src/adapters/changeIssueRepo';
 import type { ChangeRow } from '../src/adapters/changeRepo';
 import { sha256 } from '../src/adapters/changeRepo';
 import { pageIdUrl } from '../src/adapters/confluence';
-import { jira, JiraError, JiraUnavailableError, type CreatedIssue, type CreateIssueInput, type JiraClient } from '../src/adapters/jira';
+import { jira, JiraError, JiraUnavailableError, jiraErrorClass, type CreatedIssue, type CreateIssueInput, type JiraClient } from '../src/adapters/jira';
 import type { ProposalRow } from '../src/adapters/proposalRepo';
 import {
   closeKind,
@@ -98,6 +117,8 @@ class Store {
   comments: { key: string; body: AdfDoc }[] = [];
   transitions: string[] = [];
   createFails = false;
+  /** Global Jira ADMINISTER of the calling user (`isCurrentUserAdmin`). */
+  viewerIsAdmin = false;
   closeFails = false;
 
   repo(): ChangeIssueRepo {
@@ -166,7 +187,7 @@ class Store {
   jira(): JiraClient {
     return {
       getProject: async (k) => (k === 'OPS' ? { id: '1', key: 'OPS' } : undefined),
-      isAdmin: async (id) => id === 'admin',
+      isCurrentUserAdmin: async () => this.viewerIsAdmin,
       createIssue: async (input) => {
         if (this.createFails) throw new JiraError(500, 'Jira 500: boom');
         this.created.push(input);
@@ -214,6 +235,8 @@ let store: Store;
 beforeEach(() => {
   store = new Store();
   jiraCalls.length = 0;
+  userCalls.length = 0;
+  userThrows = undefined;
   jiraReplies = [];
   vi.spyOn(console, 'info').mockImplementation(() => undefined);
   vi.spyOn(console, 'warn').mockImplementation(() => undefined);
@@ -535,10 +558,11 @@ describe('settings and approval panel', () => {
   const ctx = (accountId: string, moduleKey = 'ripple-settings') => ({ accountId, moduleKey });
 
   it('anyone on the settings page reads; only Jira admins save an existing project', async () => {
-    expect(await getSettings(ctx('user'), sdeps())).toEqual({ jiraProjectKey: 'OPS', canEdit: false });
-    expect(await getSettings(ctx('admin'), sdeps())).toEqual({ jiraProjectKey: 'OPS', canEdit: true });
-    expect(await getSettings(ctx('admin', 'ripple-byline'), sdeps())).toEqual({ error: expect.any(String) });
+    expect(await getSettings(ctx('user'), sdeps())).toEqual({ jiraProjectKey: 'OPS', canEdit: false, adminCheck: 'not_admin' });
     expect(await saveSettings(ctx('user'), { jiraProjectKey: 'OPS' }, sdeps())).toEqual({ ok: false, errorCode: 'not_allowed' });
+    store.viewerIsAdmin = true;
+    expect(await getSettings(ctx('admin'), sdeps())).toEqual({ jiraProjectKey: 'OPS', canEdit: true, adminCheck: 'admin' });
+    expect(await getSettings(ctx('admin', 'ripple-byline'), sdeps())).toEqual({ error: expect.any(String) });
     expect(await saveSettings(ctx('admin'), { jiraProjectKey: 'bad key' }, sdeps())).toEqual({ ok: false, errorCode: 'invalid_key' });
     expect(await saveSettings(ctx('admin'), { jiraProjectKey: 'NOPE' }, sdeps())).toEqual({ ok: false, errorCode: 'project_not_found' });
     expect(await saveSettings(ctx('admin'), { jiraProjectKey: ' ops ' }, sdeps())).toEqual({ ok: true, errorCode: null });
@@ -547,23 +571,43 @@ describe('settings and approval panel', () => {
     expect(store.settings).toBeUndefined();
   });
 
-  it('a Jira that is not reachable fails closed', async () => {
-    const d = { ...sdeps(), jira: { ...store.jira(), isAdmin: async () => Promise.reject(new JiraUnavailableError('no jira')) } };
-    expect(await getSettings(ctx('admin'), d)).toMatchObject({ canEdit: false });
+  it('a Jira that is not reachable fails closed, told apart from "not an admin"', async () => {
+    const d = { ...sdeps(), jira: { ...store.jira(), isCurrentUserAdmin: async () => Promise.reject(new JiraUnavailableError('no jira')) } };
+    expect(await getSettings(ctx('admin'), d)).toEqual({ jiraProjectKey: 'OPS', canEdit: false, adminCheck: 'check_failed' });
+    expect(await saveSettings(ctx('admin'), { jiraProjectKey: 'OPS' }, d)).toEqual({ ok: false, errorCode: 'admin_check_failed' });
   });
 
-  it('the real admin check: a Jira 403 means canEdit false and save refused with jira_unavailable; a 500 jira_error', async () => {
+  it("the real admin check reads the caller's own ADMINISTER as the user; 401/403/500/no consent fail closed as check_failed", async () => {
     const d = { ...sdeps(), jira };
-    jiraReplies = [{ status: 403, body: { errorMessages: ['Forbidden'] } }];
-    expect(await getSettings(ctx('acc-admin'), d)).toEqual({ jiraProjectKey: 'OPS', canEdit: false });
-    jiraReplies = [{ status: 403, body: {} }];
-    expect(await saveSettings(ctx('acc-admin'), { jiraProjectKey: 'OPS' }, d)).toEqual({ ok: false, errorCode: 'jira_unavailable' });
-    jiraReplies = [{ status: 500, body: {} }];
-    expect(await saveSettings(ctx('acc-admin'), { jiraProjectKey: 'OPS' }, d)).toEqual({ ok: false, errorCode: 'jira_error' });
-    // No ADMINISTER in the reply: not allowed.
-    jiraReplies = [{ status: 200, body: { globalPermissions: [] } }];
-    expect(await saveSettings(ctx('acc-admin'), { jiraProjectKey: 'OPS' }, d)).toEqual({ ok: false, errorCode: 'not_allowed' });
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const admin = (have: boolean) => ({ status: 200, body: { permissions: { ADMINISTER: { key: 'ADMINISTER', havePermission: have } } } });
+
+    jiraReplies = [admin(true)];
+    expect(await getSettings(ctx('acc-admin'), d)).toEqual({ jiraProjectKey: 'OPS', canEdit: true, adminCheck: 'admin' });
+    expect(userCalls).toEqual([{ path: '/rest/api/3/mypermissions?permissions=ADMINISTER', method: 'GET' }]);
+    expect(jiraCalls).toEqual([]);
+    jiraReplies = [admin(false)];
+    expect(await getSettings(ctx('acc-user'), d)).toEqual({ jiraProjectKey: 'OPS', canEdit: false, adminCheck: 'not_admin' });
+    jiraReplies = [admin(false)];
+    expect(await saveSettings(ctx('acc-user'), { jiraProjectKey: 'OPS' }, d)).toEqual({ ok: false, errorCode: 'not_allowed' });
+
+    for (const status of [401, 403, 500]) {
+      info.mockClear();
+      jiraReplies = [{ status, body: { errorMessages: ['secret detail'] } }];
+      expect(await getSettings(ctx('acc-admin'), d)).toEqual({ jiraProjectKey: 'OPS', canEdit: false, adminCheck: 'check_failed' });
+      jiraReplies = [{ status, body: {} }];
+      expect(await saveSettings(ctx('acc-admin'), { jiraProjectKey: 'OPS' }, d)).toEqual({ ok: false, errorCode: 'admin_check_failed' });
+      expect(info).toHaveBeenCalledWith('ripple settings: Jira admin check failed', expect.objectContaining({ errorClass: `http_${status}` }));
+      expect(JSON.stringify(info.mock.calls)).not.toContain('secret detail');
+    }
+
+    // The user has not granted consent (Forge NEEDS_AUTHENTICATION_ERR): its own class, still fail-closed.
+    info.mockClear();
+    userThrows = Object.assign(new Error('needs auth'), { name: 'NEEDS_AUTHENTICATION_ERR', status: 401 });
+    expect(await getSettings(ctx('acc-admin'), d)).toMatchObject({ canEdit: false, adminCheck: 'check_failed' });
+    expect(info).toHaveBeenCalledWith('ripple settings: Jira admin check failed', expect.objectContaining({ errorClass: 'needs_auth' }));
     expect(store.settings).toEqual({ projectKey: 'OPS' });
+    info.mockRestore();
   });
 
   it('the issue panel lists the pages of a Ripple issue, null for other issues', async () => {
@@ -623,14 +667,30 @@ describe('Jira adapter', () => {
     await expect(jira.getProject('OPS')).rejects.toBeInstanceOf(JiraUnavailableError);
   });
 
-  it('isAdmin asks permissions/check for the caller and ADMINISTER only; 403 throws JiraUnavailableError', async () => {
-    jiraReplies = [{ status: 200, body: { globalPermissions: ['ADMINISTER'] } }];
-    expect(await jira.isAdmin('acc-7')).toBe(true);
-    expect(jiraCalls).toEqual([{ path: '/rest/api/3/permissions/check', method: 'POST', body: { accountId: 'acc-7', globalPermissions: ['ADMINISTER'] } }]);
+  it('isCurrentUserAdmin reads mypermissions?permissions=ADMINISTER as the user; 401/403 and 500 are distinguishable errors', async () => {
+    jiraReplies = [{ status: 200, body: { permissions: { ADMINISTER: { havePermission: true } } } }];
+    expect(await jira.isCurrentUserAdmin()).toBe(true);
+    expect(userCalls).toEqual([{ path: '/rest/api/3/mypermissions?permissions=ADMINISTER', method: 'GET' }]);
+    expect(jiraCalls).toEqual([]);
+    jiraReplies = [{ status: 200, body: { permissions: { ADMINISTER: { havePermission: false } } } }];
+    expect(await jira.isCurrentUserAdmin()).toBe(false);
+    // A truthy non-boolean or a missing entry is not "yes".
+    jiraReplies = [{ status: 200, body: { permissions: { ADMINISTER: { havePermission: 'true' } } } }];
+    expect(await jira.isCurrentUserAdmin()).toBe(false);
     jiraReplies = [{ status: 200, body: {} }];
-    expect(await jira.isAdmin('acc-7')).toBe(false);
-    jiraReplies = [{ status: 403, body: {} }];
-    await expect(jira.isAdmin('acc-7')).rejects.toBeInstanceOf(JiraUnavailableError);
+    expect(await jira.isCurrentUserAdmin()).toBe(false);
+    for (const status of [401, 403]) {
+      jiraReplies = [{ status, body: {} }];
+      const err = await jira.isCurrentUserAdmin().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(JiraUnavailableError);
+      expect(jiraErrorClass(err)).toBe(`http_${status}`);
+    }
+    jiraReplies = [{ status: 500, body: {} }];
+    const err = await jira.isCurrentUserAdmin().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(JiraError);
+    expect(jiraErrorClass(err)).toBe('http_500');
+    userThrows = Object.assign(new Error('needs auth'), { name: 'NEEDS_AUTHENTICATION_ERR' });
+    expect(jiraErrorClass(await jira.isCurrentUserAdmin().catch((e: unknown) => e))).toBe('needs_auth');
   });
 
   it('findByLabel: JQL search as the app with validated, quoted values', async () => {

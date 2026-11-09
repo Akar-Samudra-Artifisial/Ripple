@@ -10,6 +10,7 @@ const KEY_PATTERN = /^[A-Z][A-Z0-9_]{1,9}$/;
 const SAVE_ERROR: Record<NonNullable<SaveSettingsResult['errorCode']>, string> = {
   invalid_key: 'That is not a valid Jira project key. Use uppercase letters and digits, starting with a letter (for example OPS).',
   not_allowed: 'Only Jira administrators can change this setting.',
+  admin_check_failed: "Couldn't check your Jira permissions. Try again in a moment.",
   project_not_found: 'No Jira project with this key was found, or Ripple cannot see it.',
   jira_unavailable: 'Ripple is not installed in Jira on this site. Install it in Jira, then try again.',
   jira_error: 'Jira did not respond as expected. Try again in a moment.',
@@ -131,6 +132,8 @@ function Settings() {
               {saving ? 'Saving…' : 'Save'}
             </button>
           </div>
+        ) : view.adminCheck === 'check_failed' ? (
+          <Alert message="Couldn't check your Jira permissions, so the setting is read-only for now. Try again in a moment." onRetry={() => void load()} />
         ) : (
           <p className="muted">Only Jira administrators can change this setting.</p>
         )}

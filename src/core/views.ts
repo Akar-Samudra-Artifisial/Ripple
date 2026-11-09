@@ -449,7 +449,11 @@ export interface SettingsView {
   jiraProjectKey: string | null;
   /** The viewer may save (Jira administrators). */
   canEdit: boolean;
+  /** Result of the Jira admin check; `check_failed` = it could not be made (try again), not "not an admin". */
+  adminCheck: AdminCheck;
 }
+
+export type AdminCheck = 'admin' | 'not_admin' | 'check_failed';
 
 export interface SaveSettingsPayload {
   /** Project key (e.g. `OPS`); empty or null turns update tasks off. */
@@ -458,8 +462,11 @@ export interface SaveSettingsPayload {
 
 export interface SaveSettingsResult {
   ok: boolean;
-  /** `invalid_key`, `not_allowed`, `project_not_found`, `jira_unavailable` (Ripple not installed in Jira), `jira_error`. */
-  errorCode: 'invalid_key' | 'not_allowed' | 'project_not_found' | 'jira_unavailable' | 'jira_error' | null;
+  /**
+   * `invalid_key`, `not_allowed` (not a Jira admin), `admin_check_failed` (the admin check could not be made),
+   * `project_not_found`, `jira_unavailable` (Ripple not installed in Jira), `jira_error`.
+   */
+  errorCode: 'invalid_key' | 'not_allowed' | 'admin_check_failed' | 'project_not_found' | 'jira_unavailable' | 'jira_error' | null;
 }
 
 /** Reply of `getApproval` (Jira issue panel, read-only); `task` is null for issues Ripple did not create. */

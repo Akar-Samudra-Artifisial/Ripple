@@ -17,12 +17,33 @@ export class JiraError extends Error {
   }
 }
 
-/** Jira cannot be reached as the app: the call failed before any HTTP status (Jira not installed) or was refused (401/403). */
+/**
+ * Jira cannot be reached or refused the caller: the call failed before any HTTP status (Jira not installed, Forge
+ * proxy error, user consent missing) or was refused (401/403). `reason` is a log-safe enum.
+ */
 export class JiraUnavailableError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly reason: string = 'unreachable',
+  ) {
     super(message);
     this.name = 'JiraUnavailableError';
   }
+}
+
+/** Log-safe class of a Jira failure: `http_<status>`, `needs_auth`, `proxy_<status>`, `unreachable` or `error`. */
+export function jiraErrorClass(err: unknown): string {
+  if (err instanceof JiraError) return `http_${err.status}`;
+  if (err instanceof JiraUnavailableError) return err.reason;
+  return 'error';
+}
+
+/** Enum for a failure thrown by the Forge fetch itself (never its message). */
+function fetchFailureReason(err: unknown): string {
+  const e = err as { name?: unknown; status?: unknown } | null;
+  if (e?.name === 'NEEDS_AUTHENTICATION_ERR') return 'needs_auth';
+  if (typeof e?.status === 'number' && Number.isInteger(e.status)) return `proxy_${e.status}`;
+  return 'unreachable';
 }
 
 type Method = 'GET' | 'POST' | 'PUT';
@@ -38,20 +59,23 @@ function messageOf(status: number, text: string): string {
   return `Jira ${status}: ${text.slice(0, 200) || 'no body'}`;
 }
 
-/** Calls the Jira REST API as the app. Throws JiraError for non-2xx replies, JiraUnavailableError when Jira is unreachable. */
-async function request<T>(method: Method, path: Route, body?: unknown): Promise<T> {
+/**
+ * Calls the Jira REST API as the app (default) or as the calling user (resolvers only). Throws JiraError for non-2xx
+ * replies, JiraUnavailableError when Jira is unreachable or refuses the caller (401/403).
+ */
+async function request<T>(method: Method, path: Route, body?: unknown, as: 'app' | 'user' = 'app'): Promise<T> {
   let res: APIResponse;
   try {
-    res = await api.asApp().requestJira(path, {
+    res = await (as === 'user' ? api.asUser() : api.asApp()).requestJira(path, {
       method,
       headers: { Accept: 'application/json', ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
   } catch (err) {
-    throw new JiraUnavailableError(`Jira request failed: ${err instanceof Error ? err.message : String(err)}`);
+    throw new JiraUnavailableError(`Jira request failed: ${err instanceof Error ? err.message : String(err)}`, fetchFailureReason(err));
   }
   const text = await res.text();
-  if (res.status === 401 || res.status === 403) throw new JiraUnavailableError(messageOf(res.status, text));
+  if (res.status === 401 || res.status === 403) throw new JiraUnavailableError(messageOf(res.status, text), `http_${res.status}`);
   if (!res.ok) throw new JiraError(res.status, messageOf(res.status, text));
   return (text ? JSON.parse(text) : undefined) as T;
 }
@@ -90,8 +114,11 @@ export function rejectedOptionalFields(err: unknown): { assignee: boolean; dueda
 export interface JiraClient {
   /** Undefined when the project does not exist (or the app cannot see it). */
   getProject(key: string): Promise<{ id: string; key: string } | undefined>;
-  /** True when `accountId` holds the global Jira ADMINISTER permission. */
-  isAdmin(accountId: string): Promise<boolean>;
+  /**
+   * True when the calling user holds the global Jira ADMINISTER permission: `GET /rest/api/3/mypermissions` as the
+   * user (their own permissions; `read:jira-work`, no permission needed). Resolvers only.
+   */
+  isCurrentUserAdmin(): Promise<boolean>;
   createIssue(input: CreateIssueInput): Promise<CreatedIssue>;
   /**
    * The issue of the project carrying Ripple's per-(change, owner) label (`ISSUE_TAG`), or undefined. Used before
@@ -114,12 +141,11 @@ export const jira: JiraClient = {
     }
   },
 
-  async isAdmin(accountId) {
-    const body = await request<{ globalPermissions?: string[] }>('POST', route`/rest/api/3/permissions/check`, {
-      accountId,
-      globalPermissions: ['ADMINISTER'],
-    });
-    return (body.globalPermissions ?? []).includes('ADMINISTER');
+  // Not `POST /permissions/check` as the app: per the Jira docs, checking another user's permissions needs the caller
+  // (here the app user, not a Jira administrator) to hold Administer Jira, so the check failed closed for real admins.
+  async isCurrentUserAdmin() {
+    const body = await request<{ permissions?: { ADMINISTER?: { havePermission?: unknown } } }>('GET', route`/rest/api/3/mypermissions?permissions=ADMINISTER`, undefined, 'user');
+    return body?.permissions?.ADMINISTER?.havePermission === true;
   },
 
   async createIssue(input) {

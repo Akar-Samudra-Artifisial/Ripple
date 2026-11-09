@@ -8,7 +8,7 @@
 import { sqlChangeIssueRepo, PROJECT_KEY, type ChangeIssueRepo, type ChangeIssueRow, type CreatedIssueRef } from '../adapters/changeIssueRepo';
 import { sha256, sqlChangeRepo, type ChangeRepo, type ChangeRow } from '../adapters/changeRepo';
 import { pageIsOpen, pageLinkAsApp, type AppPageLink } from '../adapters/confluence';
-import { JiraError, JiraUnavailableError, jira, type CreatedIssue, type JiraClient } from '../adapters/jira';
+import { JiraError, JiraUnavailableError, jira, jiraErrorClass, type CreatedIssue, type JiraClient } from '../adapters/jira';
 import { sqlProposalRepo, type ProposalRepo, type ProposalRow } from '../adapters/proposalRepo';
 import { sqlRepo, type FactRepo } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
@@ -31,7 +31,7 @@ import {
 } from '../core/changeIssues';
 import { valueLabel } from '../core/copies';
 import { SchemaSettingUpError } from '../core/schema';
-import type { ApprovalView, ErrorReply, RolloutIssue, SaveSettingsPayload, SaveSettingsResult, SettingsView } from '../core/views';
+import type { AdminCheck, ApprovalView, ErrorReply, RolloutIssue, SaveSettingsPayload, SaveSettingsResult, SettingsView } from '../core/views';
 
 export const SETTINGS_MODULE = 'ripple-settings';
 export const APPROVAL_MODULE = 'ripple-approval';
@@ -314,26 +314,25 @@ export interface SettingsContext {
 
 export interface SettingsDeps {
   repo: Pick<ChangeIssueRepo, 'getJiraSettings' | 'saveJiraSettings'>;
-  jira: Pick<JiraClient, 'isAdmin' | 'getProject'>;
+  jira: Pick<JiraClient, 'isCurrentUserAdmin' | 'getProject'>;
   ensure: () => Promise<void>;
 }
 
 const defaultSettingsDeps: SettingsDeps = { repo: sqlChangeIssueRepo, jira, ensure: ensureSchema };
 
 /**
- * Who may change the settings: Jira administrators (global ADMINISTER, checked as the app for the calling account),
- * on Ripple's settings page only. The Confluence admin check (`/wiki/rest/api/user/current?expand=operations`)
- * needs a scope Ripple does not have, and the global settings page is not limited to admins. Fails closed: a refused
- * (401/403) or failed check is `jira_unavailable` / `jira_error`, never "yes".
+ * Who may change the settings: Jira administrators (global ADMINISTER of the calling user, read as that user via
+ * `mypermissions`), on Ripple's settings page only. The Confluence admin check (`/wiki/rest/api/user/current?
+ * expand=operations`) needs a scope Ripple does not have, and the global settings page is not limited to admins.
+ * Fails closed: a check that cannot be made (401/403, no consent, Jira down) is `check_failed`, never "admin".
  */
-async function adminCheck(ctx: SettingsContext, deps: SettingsDeps): Promise<'yes' | 'no' | 'jira_unavailable' | 'jira_error'> {
-  if (ctx.moduleKey !== SETTINGS_MODULE || !ctx.accountId) return 'no';
+async function adminCheck(ctx: SettingsContext, deps: SettingsDeps): Promise<AdminCheck> {
+  if (ctx.moduleKey !== SETTINGS_MODULE || !ctx.accountId) return 'not_admin';
   try {
-    return (await deps.jira.isAdmin(ctx.accountId)) ? 'yes' : 'no';
+    return (await deps.jira.isCurrentUserAdmin()) ? 'admin' : 'not_admin';
   } catch (err) {
-    const code = jiraErrorCode(err);
-    console.info('ripple settings: Jira admin check failed', { error: code });
-    return code === 'jira_unavailable' ? 'jira_unavailable' : 'jira_error';
+    console.info('ripple settings: Jira admin check failed', { error: jiraErrorCode(err), errorClass: jiraErrorClass(err) });
+    return 'check_failed';
   }
 }
 
@@ -350,10 +349,11 @@ async function settingsGuard<T>(ctx: SettingsContext, deps: SettingsDeps, what: 
 }
 
 export async function getSettings(ctx: SettingsContext, deps: SettingsDeps = defaultSettingsDeps): Promise<SettingsView | ErrorReply> {
-  return settingsGuard(ctx, deps, 'load the settings', async () => ({
-    jiraProjectKey: (await deps.repo.getJiraSettings())?.projectKey ?? null,
-    canEdit: (await adminCheck(ctx, deps)) === 'yes',
-  }));
+  return settingsGuard(ctx, deps, 'load the settings', async () => {
+    const jiraProjectKey = (await deps.repo.getJiraSettings())?.projectKey ?? null;
+    const admin = await adminCheck(ctx, deps);
+    return { jiraProjectKey, canEdit: admin === 'admin', adminCheck: admin };
+  });
 }
 
 /** Saves the Jira project key (an empty key turns issues off); the project must exist and be visible to the app. */
@@ -361,9 +361,9 @@ export async function saveSettings(ctx: SettingsContext, payload: Partial<SaveSe
   return settingsGuard(ctx, deps, 'save the settings', async () => {
     const raw = payload?.jiraProjectKey;
     if (raw !== null && raw !== undefined && (typeof raw !== 'string' || raw.length > 20)) return { ok: false, errorCode: 'invalid_key' };
-    // Fails closed: a Jira that refuses the check (403) or errors never lets the save through.
+    // Fails closed: a check that cannot be made never lets the save through, but is told apart from "not an admin".
     const admin = await adminCheck(ctx, deps);
-    if (admin !== 'yes') return { ok: false, errorCode: admin === 'no' ? 'not_allowed' : admin };
+    if (admin !== 'admin') return { ok: false, errorCode: admin === 'not_admin' ? 'not_allowed' : 'admin_check_failed' };
     const key = (raw ?? '').trim().toUpperCase();
     if (key === '') {
       await deps.repo.saveJiraSettings(null);
@@ -375,7 +375,7 @@ export async function saveSettings(ctx: SettingsContext, payload: Partial<SaveSe
       if (!(await deps.jira.getProject(key))) return { ok: false, errorCode: 'project_not_found' };
     } catch (err) {
       const code = jiraErrorCode(err);
-      console.warn('ripple settings: project check failed', { error: code });
+      console.warn('ripple settings: project check failed', { error: code, errorClass: jiraErrorClass(err) });
       return { ok: false, errorCode: code === 'jira_unavailable' ? 'jira_unavailable' : 'jira_error' };
     }
     await deps.repo.saveJiraSettings({ projectKey: key });
