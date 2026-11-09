@@ -1,25 +1,38 @@
-import { useCallback, useEffect, useState } from 'react';
-import type { FactActionResult, FactEditPayload, FactList, FactView, SourceStatus } from '../../src/core/views';
+import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
+import type { FactActionResult, FactEditPayload, FactList, FactStatus, FactType, FactView, SourceStatus } from '../../src/core/views';
 import { call } from './bridge';
 
 const POLL_MS = 3000;
 const errorOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
-/** M1 minimal source-of-truth panel: mark/unmark, extraction status (polled), fact review. Design polish later. */
+const STATUS_LABEL: Record<FactStatus, string> = { proposed: 'To review', confirmed: 'Confirmed', rejected: 'Rejected' };
+const TYPE_LABEL: Record<FactType, string> = { number: 'Number', date: 'Date', list: 'List', name: 'Name', rule: 'Rule' };
+const ACTION_DONE: Record<FactAction, string> = { confirmFact: 'Fact confirmed.', rejectFact: 'Fact rejected.', editFact: 'Changes saved.' };
+
+type FactAction = 'confirmFact' | 'rejectFact' | 'editFact';
+type SourceCall = 'markSource' | 'unmarkSource';
+
+const formatDate = (iso: string | null): string | null => {
+  if (!iso) return null;
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? null : d.toLocaleDateString(undefined, { dateStyle: 'medium' });
+};
+
+/** Source-of-truth panel in the byline popup: mark/unmark, extraction progress (polled) and fact review. */
 export function SourcePanel() {
   const [status, setStatus] = useState<SourceStatus>();
   const [facts, setFacts] = useState<FactView[]>([]);
   const [error, setError] = useState<string>();
-  const [busy, setBusy] = useState(false);
+  const [pending, setPending] = useState<SourceCall>();
 
-  const loadFacts = useCallback(async () => setFacts((await call<FactList>('listFacts')).facts), []);
   const load = useCallback(async () => {
     const s = await call<SourceStatus>('getSourceStatus');
     setStatus(s);
-    if (s.source?.state === 'ready') await loadFacts();
+    if (s.source?.state === 'ready') setFacts((await call<FactList>('listFacts')).facts);
     else if (!s.source) setFacts([]);
+    setError(undefined);
     return s;
-  }, [loadFacts]);
+  }, []);
 
   useEffect(() => {
     load().catch((e: unknown) => setError(errorOf(e)));
@@ -32,149 +45,364 @@ export function SourcePanel() {
     return () => clearInterval(timer);
   }, [extracting, load]);
 
-  const run = async (fn: () => Promise<unknown>) => {
-    setBusy(true);
+  const runSource = useCallback(async (name: SourceCall) => {
+    setPending(name);
     setError(undefined);
     try {
-      await fn();
+      const s = await call<SourceStatus>(name);
+      setStatus(s);
+      if (!s.source) setFacts([]);
     } catch (e) {
       setError(errorOf(e));
     } finally {
-      setBusy(false);
+      setPending(undefined);
     }
-  };
+  }, []);
 
-  const replaceFact = (fact: FactView) => setFacts((list) => list.map((f) => (f.id === fact.id ? fact : f)));
-  const act = (name: 'confirmFact' | 'rejectFact', factId: string) =>
-    run(async () => {
-      replaceFact((await call<FactActionResult>(name, { factId })).fact);
-      setStatus(await call<SourceStatus>('getSourceStatus'));
-    });
-  const save = (payload: FactEditPayload) =>
-    run(async () => {
-      replaceFact((await call<FactActionResult>('editFact', { ...payload })).fact);
-      setStatus(await call<SourceStatus>('getSourceStatus'));
-    });
+  const runFact = useCallback(async (name: FactAction, payload: FactEditPayload | { factId: string }) => {
+    const { fact } = await call<FactActionResult>(name, { ...payload });
+    setFacts((list) => list.map((f) => (f.id === fact.id ? fact : f)));
+    call<SourceStatus>('getSourceStatus')
+      .then(setStatus)
+      .catch(() => undefined);
+    return ACTION_DONE[name];
+  }, []);
 
-  if (!status) return error ? <p className="error">{error}</p> : <p className="muted">Loading source status…</p>;
-  if (status.notice) return <p className="muted">{status.notice}</p>;
-  const { source, counts, canEdit } = status;
-
-  return (
-    <section className="source">
-      {error ? <p className="error">{error}</p> : null}
-      {!source ? (
-        <>
-          <p>This page is not a source of truth.</p>
-          {canEdit ? (
-            <button className="button button--primary" disabled={busy} onClick={() => run(async () => setStatus(await call<SourceStatus>('markSource')))}>
-              Mark as source of truth
-            </button>
-          ) : (
-            <p className="muted">Only people who can edit this page can mark it.</p>
-          )}
-        </>
-      ) : (
-        <>
-          <p>
-            <strong>Source of truth</strong> · {counts.confirmed + counts.proposed} facts ({counts.confirmed} confirmed, {counts.proposed} to review)
-            {source.pageVersion !== null ? ` · page version ${source.pageVersion}` : ''}
+  if (!status) {
+    return (
+      <section className="source" aria-label="Source of truth">
+        {error ? (
+          <Alert message={`Could not load the source status: ${error}`} onRetry={() => load().catch((e: unknown) => setError(errorOf(e)))} />
+        ) : (
+          <p className="muted" role="status">
+            Loading source status…
           </p>
-          {source.state === 'extracting' ? <p className="muted">Reading facts from this page… (this can take a minute)</p> : null}
-          {source.state === 'error' ? <p className="error">Extraction failed: {source.error}</p> : null}
-          {canEdit ? (
-            <p className="actions">
-              <button className="button" disabled={busy || extracting} onClick={() => run(async () => setStatus(await call<SourceStatus>('markSource')))}>
-                Extract again
-              </button>
-              <button className="button" disabled={busy} onClick={() => run(async () => setStatus(await call<SourceStatus>('unmarkSource')))}>
-                Unmark
-              </button>
-            </p>
-          ) : null}
-          {source.state === 'ready' && facts.length === 0 ? <p className="muted">No facts found on this page.</p> : null}
-          <ul className="facts">
-            {facts.map((f) => (
-              <FactItem key={f.id} fact={f} canEdit={canEdit} busy={busy} onConfirm={() => act('confirmFact', f.id)} onReject={() => act('rejectFact', f.id)} onSave={save} />
-            ))}
-          </ul>
-        </>
-      )}
+        )}
+      </section>
+    );
+  }
+  if (status.notice) {
+    return (
+      <section className="source" aria-label="Source of truth">
+        <p className="muted" role="status">
+          {status.notice}
+        </p>
+      </section>
+    );
+  }
+
+  const { source, counts, canEdit } = status;
+  const busy = pending !== undefined;
+
+  if (!source) {
+    return (
+      <section className="source source--empty" aria-labelledby="source-heading">
+        <h2 id="source-heading" className="source__heading">
+          Not a source of truth
+        </h2>
+        <p className="muted">Mark this page as the official source. Ripple reads its facts, shows each one with the exact sentence it came from, and lets you confirm them.</p>
+        {error ? <Alert message={error} /> : null}
+        {canEdit ? (
+          <button type="button" className="button button--primary" disabled={busy} aria-busy={pending === 'markSource'} onClick={() => void runSource('markSource')}>
+            {pending === 'markSource' ? 'Marking…' : 'Mark as source of truth'}
+          </button>
+        ) : (
+          <p className="muted">Only people who can edit this page can mark it.</p>
+        )}
+      </section>
+    );
+  }
+
+  const total = counts.confirmed + counts.proposed;
+  return (
+    <section className="source" aria-labelledby="source-heading">
+      <header className="source__header">
+        <h2 id="source-heading" className="source__heading">
+          Source of truth
+        </h2>
+        {source.state === 'ready' ? (
+          <p className="source__summary">
+            <span>
+              {total} {total === 1 ? 'fact' : 'facts'}
+            </span>
+            <span className="badge badge--confirmed">{counts.confirmed} confirmed</span>
+            {counts.proposed > 0 ? <span className="badge badge--proposed">{counts.proposed} to review</span> : null}
+            {counts.rejected > 0 ? <span className="badge badge--rejected">{counts.rejected} rejected</span> : null}
+          </p>
+        ) : null}
+        {source.pageVersion !== null ? <p className="muted source__meta">Read from page version {source.pageVersion}</p> : null}
+      </header>
+
+      {error ? <Alert message={error} /> : null}
+
+      {source.state === 'extracting' ? <Extracting /> : null}
+      {source.state === 'error' ? (
+        <Alert
+          message={`Ripple could not read the facts on this page. ${source.error ?? ''}`.trim()}
+          onRetry={canEdit ? () => void runSource('markSource') : undefined}
+          retryLabel={pending === 'markSource' ? 'Retrying…' : 'Try again'}
+          retryDisabled={busy}
+        />
+      ) : null}
+
+      {source.state === 'ready' && facts.length === 0 ? (
+        <p className="empty">No facts were found on this page. Facts are numbers, dates, lists, names and yes/no rules stated in the text.</p>
+      ) : null}
+
+      {facts.length > 0 ? (
+        <ul className="facts" aria-label="Facts on this page">
+          {facts.map((f) => (
+            <FactCard key={f.id} fact={f} canEdit={canEdit} onAction={runFact} />
+          ))}
+        </ul>
+      ) : null}
+
+      {canEdit ? <SourceActions extracting={extracting} pending={pending} onRun={runSource} /> : null}
     </section>
   );
 }
 
-interface FactItemProps {
-  fact: FactView;
-  canEdit: boolean;
-  busy: boolean;
-  onConfirm: () => void;
-  onReject: () => void;
-  onSave: (payload: FactEditPayload) => Promise<void>;
+function Alert({ message, onRetry, retryLabel = 'Try again', retryDisabled }: { message: string; onRetry?: () => void; retryLabel?: string; retryDisabled?: boolean }) {
+  return (
+    <div className="alert" role="alert">
+      <p className="alert__text">{message}</p>
+      {onRetry ? (
+        <button type="button" className="button" disabled={retryDisabled} onClick={onRetry}>
+          {retryLabel}
+        </button>
+      ) : null}
+    </div>
+  );
 }
 
-function FactItem({ fact, canEdit, busy, onConfirm, onReject, onSave }: FactItemProps) {
+function Extracting() {
+  const [seconds, setSeconds] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setSeconds((s) => s + 1), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  return (
+    <div className="progress">
+      <p role="status" className="progress__label">
+        Reading facts from this page…
+      </p>
+      <div className="progress__track" role="progressbar" aria-label="Extracting facts" aria-valuetext="In progress">
+        <div className="progress__bar" />
+      </div>
+      <p className="muted progress__hint">
+        {seconds}s elapsed · this usually takes under a minute. You can close this and come back.
+      </p>
+    </div>
+  );
+}
+
+function SourceActions({ extracting, pending, onRun }: { extracting: boolean; pending: SourceCall | undefined; onRun: (name: SourceCall) => Promise<void> }) {
+  const [confirmUnmark, setConfirmUnmark] = useState(false);
+  const busy = pending !== undefined;
+  if (confirmUnmark) {
+    return (
+      <div className="source__footer" role="group" aria-label="Confirm unmark">
+        <p className="source__confirm">Stop treating this page as the source of truth? Ripple will stop tracking its facts.</p>
+        <div className="actions">
+          <button
+            type="button"
+            className="button button--danger"
+            disabled={busy}
+            onClick={() => void onRun('unmarkSource').then(() => setConfirmUnmark(false))}
+          >
+            {pending === 'unmarkSource' ? 'Unmarking…' : 'Unmark'}
+          </button>
+          <button type="button" className="button button--subtle" disabled={busy} onClick={() => setConfirmUnmark(false)}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="source__footer actions">
+      <button type="button" className="button button--subtle" disabled={busy || extracting} onClick={() => void onRun('markSource')}>
+        {pending === 'markSource' ? 'Starting…' : 'Extract again'}
+      </button>
+      <button type="button" className="button button--subtle" disabled={busy} onClick={() => setConfirmUnmark(true)}>
+        Unmark as source
+      </button>
+    </div>
+  );
+}
+
+interface FactCardProps {
+  fact: FactView;
+  canEdit: boolean;
+  onAction: (name: FactAction, payload: FactEditPayload | { factId: string }) => Promise<string>;
+}
+
+type DraftKey = 'subject' | 'attribute' | 'value' | 'unit' | 'condition';
+
+function FactCard({ fact, canEdit, onAction }: FactCardProps) {
   const [draft, setDraft] = useState<FactEditPayload>();
-  const field = (key: 'subject' | 'attribute' | 'value' | 'unit' | 'condition', label: string) => (
+  const [pending, setPending] = useState<FactAction>();
+  const [feedback, setFeedback] = useState<string>('');
+  const [error, setError] = useState<string>();
+  const editButton = useRef<HTMLButtonElement>(null);
+  const firstInput = useRef<HTMLInputElement>(null);
+  const id = useId();
+  const headingId = `${id}-title`;
+
+  const editing = draft !== undefined;
+  useEffect(() => {
+    if (editing) firstInput.current?.focus();
+  }, [editing]);
+
+  const run = async (name: FactAction, payload: FactEditPayload | { factId: string }) => {
+    setPending(name);
+    setError(undefined);
+    setFeedback('');
+    try {
+      setFeedback(await onAction(name, payload));
+      // Confirm/Reject hide the button that was pressed; keep keyboard focus inside the card.
+      if (name !== 'editFact') requestAnimationFrame(() => editButton.current?.focus());
+      return true;
+    } catch (e) {
+      setError(errorOf(e));
+      return false;
+    } finally {
+      setPending(undefined);
+    }
+  };
+
+  const closeEditor = () => {
+    setDraft(undefined);
+    requestAnimationFrame(() => editButton.current?.focus());
+  };
+
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    if (!draft) return;
+    const clean: FactEditPayload = {
+      ...draft,
+      subject: draft.subject.trim(),
+      attribute: draft.attribute.trim(),
+      value: draft.value.trim(),
+      unit: draft.unit?.trim() || null,
+      condition: draft.condition?.trim() || null,
+    };
+    void run('editFact', clean).then((ok) => ok && closeEditor());
+  };
+
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (e.key === 'Escape') {
+      e.stopPropagation();
+      closeEditor();
+    }
+  };
+
+  const field = (key: DraftKey, label: string, required: boolean) => (
     <label className="field">
-      {label}
-      <input value={draft?.[key] ?? ''} onChange={(e) => setDraft((d) => (d ? { ...d, [key]: e.target.value } : d))} />
+      <span className="field__label">
+        {label}
+        {required ? null : <span className="muted"> (optional)</span>}
+      </span>
+      <input
+        ref={key === 'subject' ? firstInput : undefined}
+        className="field__input"
+        value={draft?.[key] ?? ''}
+        required={required}
+        onChange={(e) => setDraft((d) => (d ? { ...d, [key]: e.target.value } : d))}
+      />
     </label>
   );
+
+  const busy = pending !== undefined;
+  const since = formatDate(fact.effectiveSince);
+
   return (
-    <li className={`fact fact--${fact.status}`}>
-      <div>
-        <strong>
-          {fact.subject} · {fact.attribute}
-        </strong>
-        {fact.condition ? <span className="muted"> ({fact.condition})</span> : null}: {fact.value}
-        {fact.unit ? ` ${fact.unit}` : ''} <span className="badge">{fact.status}</span>
-        {fact.edited ? <span className="badge">edited</span> : null}
+    <li className={`fact fact--${fact.status}`} aria-labelledby={headingId}>
+      <div className="fact__top">
+        <span className="fact__type">{TYPE_LABEL[fact.type]}</span>
+        <span className={`badge badge--${fact.status}`}>{STATUS_LABEL[fact.status]}</span>
+        {fact.edited ? <span className="badge">Edited</span> : null}
       </div>
-      {fact.previousValue ? <div className="muted">Was: {fact.previousValue}</div> : null}
-      <blockquote className="quote">“{fact.quote}”</blockquote>
+      <h3 id={headingId} className="fact__title">
+        {fact.subject}
+        <span className="fact__attr"> · {fact.attribute}</span>
+      </h3>
+      <dl className="fact__grid">
+        <dt>Value</dt>
+        <dd className="fact__value">
+          {fact.value}
+          {fact.unit ? ` ${fact.unit}` : ''}
+        </dd>
+        {fact.condition ? (
+          <>
+            <dt>When</dt>
+            <dd>{fact.condition}</dd>
+          </>
+        ) : null}
+        {fact.previousValue ? (
+          <>
+            <dt>Was</dt>
+            <dd className="fact__previous">{fact.previousValue}</dd>
+          </>
+        ) : null}
+      </dl>
+      <figure className="quote">
+        <blockquote className="quote__text">{fact.quote}</blockquote>
+        <figcaption className="quote__caption">
+          From this page · version {fact.pageVersion}
+          {since ? ` · since ${since}` : ''}
+        </figcaption>
+      </figure>
+
       {draft ? (
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            void onSave(draft).then(() => setDraft(undefined));
-          }}
-        >
-          {field('subject', 'Subject')}
-          {field('attribute', 'Attribute')}
-          {field('value', 'Value')}
-          {field('unit', 'Unit')}
-          {field('condition', 'Condition')}
-          <p className="actions">
+        <form className="fact__form" onSubmit={submit} onKeyDown={onKeyDown} aria-label={`Edit ${fact.subject} ${fact.attribute}`}>
+          {field('subject', 'Subject', true)}
+          {field('attribute', 'Attribute', true)}
+          <div className="fact__form-row">
+            {field('value', 'Value', true)}
+            {field('unit', 'Unit', false)}
+          </div>
+          {field('condition', 'Condition', false)}
+          <div className="actions">
             <button className="button button--primary" type="submit" disabled={busy}>
-              Save
+              {pending === 'editFact' ? 'Saving…' : 'Save'}
             </button>
-            <button className="button" type="button" onClick={() => setDraft(undefined)}>
+            <button className="button button--subtle" type="button" disabled={busy} onClick={closeEditor}>
               Cancel
             </button>
-          </p>
+          </div>
         </form>
       ) : canEdit ? (
-        <p className="actions">
+        <div className="actions" role="group" aria-label={`Review ${fact.subject} ${fact.attribute}`}>
           {fact.status !== 'confirmed' ? (
-            <button className="button" disabled={busy} onClick={onConfirm}>
-              Confirm
+            <button type="button" className="button button--primary" disabled={busy} onClick={() => void run('confirmFact', { factId: fact.id })}>
+              {pending === 'confirmFact' ? 'Confirming…' : 'Confirm'}
             </button>
           ) : null}
           <button
+            ref={editButton}
+            type="button"
             className="button"
             disabled={busy}
-            onClick={() => setDraft({ factId: fact.id, subject: fact.subject, attribute: fact.attribute, value: fact.value, unit: fact.unit, condition: fact.condition })}
+            onClick={() => {
+              setFeedback('');
+              setDraft({ factId: fact.id, subject: fact.subject, attribute: fact.attribute, value: fact.value, unit: fact.unit, condition: fact.condition });
+            }}
           >
             Edit
           </button>
           {fact.status !== 'rejected' ? (
-            <button className="button" disabled={busy} onClick={onReject}>
-              Reject
+            <button type="button" className="button button--subtle" disabled={busy} onClick={() => void run('rejectFact', { factId: fact.id })}>
+              {pending === 'rejectFact' ? 'Rejecting…' : 'Reject'}
             </button>
           ) : null}
-        </p>
+        </div>
       ) : null}
+
+      <p className="fact__feedback" role="status">
+        {feedback}
+      </p>
+      {error ? <Alert message={error} /> : null}
     </li>
   );
 }

@@ -20,6 +20,8 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Byline menampilkan "Owner: <nama> · Team: <tim> (via Teamwork Graph)": owner dari Confluence REST v2 `ownerId`, nama lewat `users-bulk` (scope baru `read:user:confluence`).
 
 ### Changed
+- Panel sumber resmi di byline dipoles untuk demo M1: ajakan "Mark as source of truth" dengan penjelasan, progres ekstraksi (bar + waktu berjalan, menghormati reduced motion), error dengan tombol "Try again", ringkasan jumlah fakta per status, kartu fakta (jenis, status, subjek/atribut, nilai, kondisi, nilai lama, kutipan verbatim dengan versi halaman) dengan Confirm/Edit/Reject per fakta, label "Confirming…/Saving…", umpan balik yang diumumkan pembaca layar, fokus terjaga, dan konfirmasi sebelum Unmark.
+- Byline tidak lagi menampilkan detail database saat sudah siap dan tidak mengulang daftar tim space (tim tetap tampil di baris Owner).
 - Byline hanya menampilkan "Ripple is ready" bila database siap; saat setup atau cek gagal tampil status yang jelas.
 - Permintaan ke `claude-sonnet-5` tidak lagi mengirim `temperature` (parameter ini ditolak model tersebut).
 
