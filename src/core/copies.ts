@@ -62,7 +62,21 @@ export interface FactTerms {
   numbers: string[];
   /** Distinct words of the phrases, used to find chunks. */
   keywords: string[];
+  /**
+   * Distinctive words of the subject ("Travel per diem" → ["diem"]), all required in one CQL clause, so a copy that
+   * words the subject differently ("the per diem is $60") is still found when the exact phrase is not on the page.
+   */
+  subjectWords: string[];
 }
+
+/** Subject words too common to narrow a search on their own (a site's every page about travel says "travel"). */
+const GENERIC_SEARCH_WORDS = new Set(['travel', 'trip', 'trips', 'policy', 'policies', 'company', 'employee', 'employees', 'staff', 'team', 'general', 'rule', 'rules', 'process', 'guide']);
+const MAX_SUBJECT_WORDS = 3;
+
+const subjectWordsOf = (subject: string): string[] =>
+  [...new Set(normaliseKeyPart(cleanTerm(subject)).split(' '))]
+    .filter((w) => w.length >= 3 && /^[\p{L}\p{N}]+$/u.test(w) && !/^\d+$/.test(w) && !STOPWORDS.has(w) && !GENERIC_SEARCH_WORDS.has(w))
+    .slice(0, MAX_SUBJECT_WORDS);
 
 /** Numbers written in `text`, with thousands separators of either style ("2,000", "2.000" → 2000). */
 export function numbersIn(text: string): number[] {
@@ -92,7 +106,7 @@ export function factTerms(fact: ScanFact, extra: readonly string[] = []): FactTe
     if (t.length >= 3 && !phrases.some((x) => x.toLowerCase() === t.toLowerCase())) phrases.push(t);
   }
   const numbers = [...new Set([...numbersIn(fact.value), ...numbersIn(fact.previousValue ?? '')].map(String))];
-  return { phrases, numbers, keywords: keywordsOf([...phrases, fact.attribute]) };
+  return { phrases, numbers, keywords: keywordsOf([...phrases, fact.attribute]), subjectWords: subjectWordsOf(fact.subject) };
 }
 
 /**
@@ -104,8 +118,14 @@ export function buildCql(sourcePageId: string, terms: FactTerms): string {
   if (!/^\d{1,32}$/.test(sourcePageId)) throw new Error('invalid source page id');
   const clauses = [
     ...terms.phrases.map((p) => `text ~ "\\"${p}\\""`),
-    // Bare numbers of 3+ digits only: "60" alone matches too many pages to help relevance.
-    ...terms.numbers.filter((n) => n.length >= 3).map((n) => `text ~ "${n}"`),
+    // All distinctive subject words, in any order or wording ("per diem" for "Travel per diem").
+    ...(terms.subjectWords.length > 0 ? [terms.subjectWords.map((w) => `text ~ "${w}"`).join(' AND ')].map((c) => (terms.subjectWords.length > 1 ? `(${c})` : c)) : []),
+    // Bare numbers of 3+ digits only: "60" alone matches too many pages to help relevance. 4+ digits also as
+    // written with a thousands separator ("2,000"), which the index keeps as one token.
+    ...terms.numbers
+      .filter((n) => n.length >= 3)
+      .flatMap((n) => (/^\d{4,}$/.test(n) ? [n, Number(n).toLocaleString('en-US')] : [n]))
+      .map((n) => `text ~ "${n}"`),
   ];
   if (clauses.length === 0) throw new Error('fact has no search terms');
   return `type = page AND id != ${sourcePageId} AND label != "ripple-ignore" AND (${clauses.join(' OR ')})`;

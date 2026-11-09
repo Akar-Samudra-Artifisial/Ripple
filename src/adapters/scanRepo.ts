@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Judgement } from '../core/copies';
 import type { CopyCounts, CopyStatus, CopyView, ScanState, ScanView } from '../core/views';
+import { sqlInt } from '../core/schema';
 import { execute, query } from './sql';
 
 /** No progress for this long while running = stalled (a consumer died); `startScan` resumes it. */
@@ -69,6 +70,8 @@ export interface ScanRepo {
   advanceSearch(scanId: string, factCursor: number): Promise<void>;
   startJudging(scanId: string): Promise<void>;
   pendingPages(scanId: string, limit: number): Promise<PendingPage[]>;
+  /** Distinct candidate pages per fact id (for the scan summary log; hits are removed when the scan finishes). */
+  candidatesPerFact(scanId: string): Promise<Record<string, number>>;
   chunkResults(scanId: string, pageId: string): Promise<Map<string, ChunkResult>>;
   saveChunkResult(scanId: string, pageId: string, chunkHash: string, result: ChunkResult): Promise<void>;
   /**
@@ -278,9 +281,9 @@ export const sqlScanRepo: ScanRepo = {
 
   async pendingPages(scanId, limit) {
     const pages = await query<{ page_id: string }>(
-      "SELECT DISTINCT page_id FROM scan_hits WHERE scan_id = ? AND status = 'pending' ORDER BY page_id LIMIT ?",
+      // Inline LIMIT: Forge SQL (TiDB) rejects a bound `LIMIT ?` (ER_WRONG_ARGUMENTS).
+      `SELECT DISTINCT page_id FROM scan_hits WHERE scan_id = ? AND status = 'pending' ORDER BY page_id LIMIT ${sqlInt(limit, 1, 100)}`,
       scanId,
-      limit,
     );
     if (pages.length === 0) return [];
     const ids = pages.map((p) => p.page_id);
@@ -293,6 +296,11 @@ export const sqlScanRepo: ScanRepo = {
       const own = rows.filter((r) => r.page_id === pageId);
       return { pageId, title: own[0]?.title ?? '', url: own[0]?.page_url ?? null, factIds: [...new Set(own.map((r) => r.fact_id))] };
     });
+  },
+
+  async candidatesPerFact(scanId) {
+    const rows = await query<{ fact_id: string; n: number | string }>('SELECT fact_id, COUNT(DISTINCT page_id) AS n FROM scan_hits WHERE scan_id = ? GROUP BY fact_id', scanId);
+    return Object.fromEntries(rows.map((r) => [r.fact_id, Number(r.n)]));
   },
 
   async chunkResults(scanId, pageId) {

@@ -1,7 +1,7 @@
 import { Queue } from '@forge/events';
 import { migrationRunner, sql } from '@forge/sql';
 import { MIGRATIONS } from '../core/migrations';
-import { isSqlRateLimited, migrateWithPacing, schemaGuard, schemaStatus, type MigrationStore, type SchemaStatus } from '../core/schema';
+import { isSqlRateLimited, migrateWithPacing, sqlOp, schemaGuard, schemaStatus, type MigrationStore, type SchemaStatus } from '../core/schema';
 
 export const MIGRATE_QUEUE = 'schema-migrate';
 const migrateQueue = new Queue({ key: MIGRATE_QUEUE });
@@ -55,15 +55,35 @@ export const currentSchemaStatus = (): Promise<SchemaStatus> => schemaStatus(sto
  */
 export const ensureSchema = schemaGuard(currentSchemaStatus, () => requestMigration('pending'));
 
-/** Parameterised SELECT; never interpolate values into `statement`. */
+/** Tags a failed statement's error with its operation label (see `sqlErrorInfo`), keeping the error itself. */
+function tagged(err: unknown, statement: string): unknown {
+  if (err && typeof err === 'object' && !('sqlOp' in err)) {
+    try {
+      Object.defineProperty(err, 'sqlOp', { value: sqlOp(statement), enumerable: false });
+    } catch {
+      // A frozen error object only loses the label.
+    }
+  }
+  return err;
+}
+
+/** Parameterised SELECT; never interpolate values into `statement` (inline LIMIT only via `sqlInt`). */
 export async function query<Row>(statement: string, ...params: unknown[]): Promise<Row[]> {
-  const result = await sql.prepare<Row>(statement).bindParams(...params).execute();
-  return result.rows as Row[];
+  try {
+    const result = await sql.prepare<Row>(statement).bindParams(...params).execute();
+    return result.rows as Row[];
+  } catch (err) {
+    throw tagged(err, statement);
+  }
 }
 
 /** Parameterised INSERT/UPDATE/DELETE; returns the number of affected rows. */
 export async function execute(statement: string, ...params: unknown[]): Promise<number> {
-  const result = await sql.prepare<{ affectedRows: number }>(statement).bindParams(...params).execute();
-  const rows = result.rows as unknown as { affectedRows?: number };
-  return rows.affectedRows ?? 0;
+  try {
+    const result = await sql.prepare<{ affectedRows: number }>(statement).bindParams(...params).execute();
+    const rows = result.rows as unknown as { affectedRows?: number };
+    return rows.affectedRows ?? 0;
+  } catch (err) {
+    throw tagged(err, statement);
+  }
 }

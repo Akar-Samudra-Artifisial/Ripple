@@ -155,6 +155,11 @@ class FakeScans implements ScanRepo {
   async startJudging(id: string) {
     this.patch(id, { state: 'judging' });
   }
+  async candidatesPerFact(scanId: string) {
+    const out: Record<string, Set<string>> = {};
+    for (const h of this.hits) if (h.scanId === scanId) (out[h.factId] ??= new Set()).add(h.pageId);
+    return Object.fromEntries(Object.entries(out).map(([k, v]) => [k, v.size]));
+  }
   async pendingPages(scanId: string, limit: number): Promise<PendingPage[]> {
     const pending = this.hits.filter((h) => h.scanId === scanId && h.status === 'pending');
     const ids = [...new Set(pending.map((h) => h.pageId))].sort().slice(0, limit);
@@ -345,7 +350,7 @@ describe('CQL builder', () => {
   it('searches phrases and long numbers, excludes the source and ripple-ignore pages', () => {
     const cql = buildCql(SOURCE_PAGE_ID, factTerms(fact('approval'), ['manager sign off']));
     expect(cql).toBe(
-      'type = page AND id != 9502721 AND label != "ripple-ignore" AND (text ~ "\\"Trip approval\\"" OR text ~ "\\"manager sign off\\"" OR text ~ "2000")',
+      'type = page AND id != 9502721 AND label != "ripple-ignore" AND (text ~ "\\"Trip approval\\"" OR text ~ "\\"manager sign off\\"" OR text ~ "approval" OR text ~ "2000" OR text ~ "2,000")',
     );
     // "60" alone is too common to search.
     expect(buildCql(SOURCE_PAGE_ID, factTerms(fact('domestic')))).not.toContain('text ~ "60"');
@@ -355,8 +360,36 @@ describe('CQL builder', () => {
     expect(cleanTerm('meal "allowance") OR space = X')).toBe('meal allowance OR space X');
     const cql = buildCql(SOURCE_PAGE_ID, factTerms(fact('domestic'), ['daily "allowance" ) OR type = blog']));
     expect(cql).toContain('text ~ "\\"daily allowance OR type blog\\""');
-    expect(cql.match(/(?<!\\)"/g)?.length).toBe(6); // label value + the two text ~ "…" clauses
+    expect(cql.match(/(?<!\\)"/g)?.length).toBe(8); // label value + the two phrase clauses + the subject-word clause
     expect(() => buildCql('12 OR 1=1', factTerms(fact('domestic')))).toThrow('invalid source page id');
+  });
+
+  it('also searches the distinctive subject words, so a copy without the exact subject phrase is found', () => {
+    expect(factTerms(fact('domestic')).subjectWords).toEqual(['diem']);
+    expect(factTerms(fact('approval')).subjectWords).toEqual(['approval']);
+    expect(factTerms(fact('flight')).subjectWords).toEqual(['flight', 'class']);
+    expect(buildCql(SOURCE_PAGE_ID, factTerms(fact('flight')))).toContain(' OR (text ~ "flight" AND text ~ "class")');
+    // Without any LLM synonym, every fixture copy is a candidate of each fact it states (CQL `text ~` ≈ word match).
+    const plain = (html: string) => ` ${html.replace(/<[^>]+>/g, ' ').toLowerCase().replace(/[^\p{L}\p{N},]+/gu, ' ').replace(/,(?!\d)/g, ' ')} `;
+    // Confluence search stems English words ("flight" finds "flights"); only plural -s is modelled here.
+    const has = (text: string, term: string) => [term, `${term}s`].some((t) => text.includes(` ${t.toLowerCase()} `));
+    const matches = (cql: string, html: string) => {
+      const text = plain(html);
+      const clauses = /AND \((.*)\)$/.exec(cql)?.[1]?.split(' OR ') ?? [];
+      return clauses.some((c) =>
+        c
+          .replace(/^\(|\)$/g, '')
+          .split(' AND ')
+          .every((t) => has(text, /^text ~ "(?:\\")?(.*?)(?:\\")?"$/.exec(t)?.[1] ?? '\u0000')),
+      );
+    };
+    for (const page of COPY_PAGES)
+      for (const [k, status] of Object.entries(page.expect))
+        if (status) expect(matches(buildCql(SOURCE_PAGE_ID, factTerms(fact(k as FactKey))), page.storage), `${page.title} / ${k}`).toBe(true);
+  });
+
+  it('searches 4+ digit numbers also with a thousands separator', () => {
+    expect(buildCql(SOURCE_PAGE_ID, factTerms(fact('approval')))).toContain('text ~ "2000" OR text ~ "2,000"');
   });
 
   it('adds the previous value as a search number', () => {
@@ -487,6 +520,28 @@ describe('copy scan (search + judge consumers)', () => {
     // Synonyms from the terms call are cleaned and searched for fact 1 (sorted by id).
     expect(searchCalls[0]?.cql).toContain('text ~ "\\"meal allowance\\""');
     expect(facts.audits).toContain('scan.finished');
+  });
+
+  it('logs one summary line per scan with counts only', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    try {
+      const scanId = await fullScan();
+      const line = info.mock.calls.find((c) => c[0] === 'ripple scan summary');
+      expect(line?.[1]).toMatchObject({
+        scanId,
+        candidatesPerFact: expect.any(Array),
+        candidates: COPY_PAGES.length,
+        pagesJudged: COPY_PAGES.length,
+        pagesSkipped: 0,
+        llmCalls: expect.any(Number),
+        partial: false,
+        counts: expect.objectContaining({ in_sync: 5, drifted: 2 }),
+      });
+      expect((line?.[1] as { candidatesPerFact: number[] }).candidatesPerFact).toHaveLength(FACTS.length);
+      expect(JSON.stringify(line?.[1])).not.toMatch(/accountId|per diem|\$60/i);
+    } finally {
+      info.mockRestore();
+    }
   });
 
   it('keeps at most 200 candidates per fact', async () => {

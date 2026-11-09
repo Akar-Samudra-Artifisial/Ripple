@@ -38,6 +38,9 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Halaman arsip/draft tidak lagi menjadi kandidat salinan. Pengecualian space lewat pengaturan belum ada.
 
 ### Fixed
+- Tahap penilaian salinan tidak lagi gagal dengan "Unknown SQL execution error": daftar halaman yang menunggu dinilai memakai `LIMIT` inline, karena Forge SQL (TiDB) menolak `LIMIT ?` (ER_WRONG_ARGUMENTS).
+- Pencarian salinan kini juga mencari kata khas subjek (mis. "diem" untuk "Travel per diem", "flight" + "class") dan angka ≥4 digit dalam bentuk "2,000", sehingga salinan yang tidak memuat frasa subjek persis tetap ditemukan tanpa bergantung pada sinonim LLM.
+- Log error SQL kini memuat nama operasi (mis. `SELECT scan_hits`) dan kode error MySQL dengan pesan yang disamarkan; setiap scan menulis satu log ringkasan (kandidat per fakta, halaman dinilai/dilewati, panggilan LLM, partial, hitungan status).
 - Setup database tidak lagi berhenti di 14/16: migrasi v015 (unique index satu scan aktif per sumber) memakai `CREATE UNIQUE INDEX IF NOT EXISTS ... ON ...`, karena Forge SQL (TiDB) menolak `ADD UNIQUE INDEX IF NOT EXISTS` (ER_PARSE_ERROR 1064).
 - Salinan yang menyebut kondisi sendiri (mis. "training $40") untuk fakta tanpa kondisi kini Tidak pasti, bukan Menyimpang.
 - Nilai dengan angka tambahan ("$60 per day (max 3 days)"), tanggal beda format, dan satuan beda (2 weeks = 14 days; USD vs EUR → tidak dinilai) tidak lagi ditandai menyimpang secara keliru.

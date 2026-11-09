@@ -38,6 +38,51 @@ export class SchemaSettingUpError extends Error {
 
 const RATE_LIMIT_MESSAGE = 'Limits for the current installation have been exceeded';
 
+/**
+ * Integer for an inline `LIMIT`/`OFFSET`: Forge SQL (TiDB) rejects bound LIMIT parameters (`LIMIT ?` →
+ * ER_WRONG_ARGUMENTS). Truncates and clamps to [min, max]; throws on non-finite input so only a number reaches SQL.
+ */
+export function sqlInt(n: number, min: number, max: number): number {
+  if (!Number.isFinite(n)) throw new Error('sqlInt: not a finite number');
+  return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
+/** Label of one of our own statements for logs ("SELECT scan_hits", "INSERT copies"); never contains values. */
+export function sqlOp(statement: string): string {
+  const s = statement.replace(/\s+/g, ' ').trim();
+  const verb = (s.split(' ')[0] ?? '?').toUpperCase();
+  const table = /\b(?:FROM|INTO|UPDATE|TABLE)\s+`?(\w+)/i.exec(s)?.[1] ?? '?';
+  return `${verb} ${table}`;
+}
+
+export interface SqlErrorInfo {
+  op?: string;
+  code?: string;
+  errno?: number;
+  sqlState?: string;
+  /** MySQL message with quoted values masked ('…' → '?') and cut to 160 characters. */
+  sqlMessage?: string;
+}
+
+/**
+ * Safe details of a Forge SQL error for logs: the operation label (set by the SQL adapter), the MySQL error code and a
+ * masked message from `context.debug`. Undefined for errors that are not SQL errors.
+ */
+export function sqlErrorInfo(err: unknown): SqlErrorInfo | undefined {
+  if (!err || typeof err !== 'object') return undefined;
+  const e = err as { sqlOp?: unknown; code?: unknown; context?: { debug?: { code?: unknown; errno?: unknown; sqlState?: unknown; sqlMessage?: unknown } } };
+  const debug = e.context?.debug;
+  if (e.sqlOp === undefined && !debug) return undefined;
+  const info: SqlErrorInfo = {};
+  if (typeof e.sqlOp === 'string') info.op = e.sqlOp;
+  const code = typeof debug?.code === 'string' ? debug.code : typeof e.code === 'string' ? e.code : undefined;
+  if (code) info.code = code;
+  if (typeof debug?.errno === 'number') info.errno = debug.errno;
+  if (typeof debug?.sqlState === 'string') info.sqlState = debug.sqlState;
+  if (typeof debug?.sqlMessage === 'string') info.sqlMessage = debug.sqlMessage.replace(/'[^']*'/g, "'?'").slice(0, 160);
+  return info;
+}
+
 /** True for Forge SQL's per-installation rate limit (HTTP 429 `RATE_LIMIT_EXCEEDED`), also when wrapped in `cause`. */
 export function isSqlRateLimited(err: unknown): boolean {
   for (let e: unknown = err, depth = 0; e && typeof e === 'object' && depth < 5; e = (e as { cause?: unknown }).cause, depth++) {

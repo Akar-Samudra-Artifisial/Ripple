@@ -31,7 +31,7 @@ import {
   type ScanFact,
 } from '../core/copies';
 import { storageToText } from '../core/pageText';
-import { isSqlRateLimited, SchemaSettingUpError } from '../core/schema';
+import { isSqlRateLimited, SchemaSettingUpError, sqlErrorInfo, type SqlErrorInfo } from '../core/schema';
 import { COPY_STATUSES, type CopyList, type CopyListPayload, type CopyStatus, type ErrorReply, type ScanStatus, type ScanView } from '../core/views';
 import { isLlmApiError, isLlmRateLimited, isLlmRetryable, LlmOutputError } from '../llm';
 import type { ChatToolFn } from '../llm/extract';
@@ -63,6 +63,11 @@ async function pushScan(queue: ScanQueue, scanId: string): Promise<string> {
 }
 
 const errorText = (err: unknown): string => scrubErrorText(err instanceof Error ? err.message : String(err));
+/** Operation + MySQL error code of a failed statement for logs, with the message scrubbed too. */
+const sqlDetails = (err: unknown): SqlErrorInfo | undefined => {
+  const info = sqlErrorInfo(err);
+  return info?.sqlMessage ? { ...info, sqlMessage: scrubErrorText(info.sqlMessage) } : info;
+};
 const NOT_ALLOWED = 'You need edit permission on this page to do that.';
 
 /** Confirmed facts of the source, in a stable order (by id). */
@@ -117,7 +122,7 @@ async function guarded<T>(ctx: SourceContext, deps: CopyDeps, what: string, body
     return await body(pageId);
   } catch (err) {
     if (err instanceof SchemaSettingUpError) return { error: err.message };
-    console.warn(`ripple ${what} failed`, { pageId, error: errorText(err) });
+    console.warn(`ripple ${what} failed`, { pageId, error: errorText(err), sql: sqlDetails(err) });
     return { error: `Ripple could not ${what}: ${errorText(err)}` };
   }
 }
@@ -253,7 +258,7 @@ async function failOrRetry(what: string, scanId: string, retryCount: number, err
     : err instanceof ConfluenceRetryableError
       ? `Confluence did not answer (HTTP ${err.status}); start the search again later.`
       : errorText(err);
-  console.warn(`ripple ${what} failed`, { scanId, error });
+  console.warn(`ripple ${what} failed`, { scanId, error, sql: sqlDetails(err) });
   await deps.scans.failScan(scanId, error);
   return { status: 'failed', error };
 }
@@ -543,9 +548,22 @@ export async function runJudgeJob(scanId: string, retryCount: number, deps: Scan
         }
       }
     }
+    const perFact = await deps.scans.candidatesPerFact(scanId);
+    const final = await deps.scans.getScan(scanId);
     await deps.scans.finishScan(scanId, scan.sourcePageId, partial);
     const counts = await deps.scans.countCopies(scan.sourcePageId);
-    console.info('ripple scan done', { scanId, pages, copies, dropped, skipped, partial, llmCalls: budget.used, ...counts });
+    // One summary line per scan: ids and counts only.
+    console.info('ripple scan summary', {
+      scanId,
+      candidatesPerFact: (scan.factIds ?? Object.keys(perFact)).map((id) => perFact[id] ?? 0),
+      candidates: final?.candidates ?? scan.candidates,
+      pagesJudged: final?.pagesJudged ?? pages,
+      pagesSkipped: final?.pagesSkipped ?? skipped,
+      llmCalls: budget.used,
+      partial,
+      dropped,
+      counts,
+    });
     await deps.facts.audit('scan.finished', null, 'page', scan.sourcePageId, { scanId, partial, skipped, ...counts });
     return { status: 'done', detail: { pages, copies, dropped, skipped, partial: partial ? 1 : 0 } };
   } catch (err) {
