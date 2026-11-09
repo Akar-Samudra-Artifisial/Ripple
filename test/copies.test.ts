@@ -248,7 +248,7 @@ class FakeScans implements ScanRepo {
   }
   async listCopies(sourcePageId: string, status: CopyStatus | undefined, pageIds: readonly string[]): Promise<CopyView[]> {
     return this.live(sourcePageId)
-      .filter((c) => pageIds.includes(c.pageId) && (status ? c.status === status : c.status !== 'historical' && c.status !== 'ignored'))
+      .filter((c) => pageIds.includes(c.pageId) && (status ? c.status === status : c.status !== 'ignored'))
       .map((c) => ({ id: `${c.factId}|${c.pageId}`, factId: c.factId, factLabel: '', officialValue: '', officialUnit: null, pageId: c.pageId, pageTitle: c.pageTitle, pageUrl: c.pageUrl, status: c.status, statedValue: c.statedValue, statedUnit: c.statedUnit, statedCondition: c.statedCondition, quote: c.quote, reason: c.reason, judgedAt: null }));
   }
   statusOf(k: FactKey, pageId: string): CopyStatus | null {
@@ -1007,7 +1007,8 @@ describe('startScan / getScanStatus / listCopies', () => {
     if ('error' in reply) throw new Error(reply.error);
     expect(reply.hiddenCount).toBe(1);
     expect(reply.copies.map((c) => c.pageId)).not.toContain('9600003');
-    expect(reply.copies.some((c) => c.status === 'historical')).toBe(false);
+    // "All" lists the historical mention too (its chip counts it), never ignored matches.
+    expect(reply.copies.filter((c) => c.status === 'historical').map((c) => c.pageId)).toEqual(['9600005']);
     const historical = await listCopies(ctx, { status: 'historical' }, copyDeps());
     expect('copies' in historical && historical.copies.map((c) => c.pageId)).toEqual(['9600005']);
     expect(await listCopies(ctx, { status: 'bogus' as CopyStatus }, copyDeps())).toEqual({ error: 'Unknown copy status filter.' });

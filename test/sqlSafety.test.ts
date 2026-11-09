@@ -77,6 +77,12 @@ describe('Forge SQL LIMIT (TiDB rejects a bound LIMIT with ER_WRONG_ARGUMENTS)',
     expect(first?.params).toEqual(['scan-1']);
   });
 
+  it('listCopies "All" leaves out only ignored matches (historical mentions are listed, as their chip counts them)', async () => {
+    await sqlScanRepo.listCopies('9500001', undefined, ['9600001']);
+    expect(calls[0]?.statement).toContain("AND c.status NOT IN ('ignored')");
+    expect(calls[0]?.params).toEqual(['9500001', '9600001']);
+  });
+
   it('no statement in src binds LIMIT/OFFSET', () => {
     const files = (dir: string): string[] =>
       readdirSync(dir).flatMap((f) => {

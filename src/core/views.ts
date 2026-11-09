@@ -218,7 +218,7 @@ export interface CopyView {
   judgedAt: string | null;
 }
 
-/** `listCopies` payload; `status` omitted = everything except `historical`. */
+/** `listCopies` payload; `status` omitted = everything except `ignored` (historical mentions included, listed last). */
 export interface CopyListPayload {
   status?: CopyStatus;
 }

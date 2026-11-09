@@ -113,7 +113,7 @@ export interface ScanRepo {
  * Statuses of the "All" filter, its count and the "N copies" headline: restatements of the facts. Historical mentions
  * and ignored matches have their own filter only, so the All count always equals the cards listed under All.
  */
-export const ALL_FILTER_STATUSES = ['in_sync', 'drifted', 'unsure', 'updated'] as const;
+export const ALL_FILTER_STATUSES = ['in_sync', 'drifted', 'unsure', 'updated', 'historical'] as const;
 
 export const EMPTY_COPY_COUNTS: CopyCounts = { in_sync: 0, drifted: 0, unsure: 0, historical: 0, ignored: 0, updated: 0 };
 
@@ -231,7 +231,7 @@ const STATUS_ORDER = "CASE c.status WHEN 'drifted' THEN 0 WHEN 'unsure' THEN 1 W
 /** Copies the owner settled; a rescan never changes or removes them. */
 const STICKY = "('ignored', 'updated')";
 /** Statuses the "All" list leaves out (shown under their own filter): see `ALL_FILTER_STATUSES`. */
-const NOT_IN_ALL = "'historical', 'ignored'";
+const NOT_IN_ALL = "'ignored'";
 /** Copies of facts that are still confirmed (a rejected or removed fact's copies are not shown or counted). */
 const CONFIRMED_JOIN = "JOIN facts f ON f.id = c.fact_id AND f.status = 'confirmed'";
 const placeholders = (n: number) => Array.from({ length: n }, () => '?').join(', ');

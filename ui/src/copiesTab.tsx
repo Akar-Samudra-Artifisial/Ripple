@@ -24,9 +24,13 @@ interface LoadedList {
   data: CopyList;
 }
 
-/** Statuses of the "All" filter and the headline (historical mentions and ignored matches have their own filter). */
-const ALL_STATUSES: readonly CopyStatus[] = ['in_sync', 'drifted', 'unsure', 'updated'];
-const totalOf = (c: CopyCounts): number => ALL_STATUSES.reduce((n, s) => n + c[s], 0);
+/** Statuses counted as copies in the headline ("23 copies"); a historical mention is not a copy. */
+const COPY_STATUSES_COUNTED: readonly CopyStatus[] = ['in_sync', 'drifted', 'unsure', 'updated'];
+/** Statuses of the "All" list and its chip: the copies plus historical mentions (ignored matches have their own filter). */
+const ALL_STATUSES: readonly CopyStatus[] = [...COPY_STATUSES_COUNTED, 'historical'];
+const totalOf = (c: CopyCounts): number => COPY_STATUSES_COUNTED.reduce((n, s) => n + c[s], 0);
+/** Card label; a historical mention is shown but never compared. */
+const cardLabel = (s: CopyStatus): string => (s === 'historical' ? 'Historical mention — not checked' : COPY_LABEL[s]);
 const withUnit = (value: string | null, unit: string | null): string => (value ? (unit && !value.includes(unit) ? `${value} ${unit}` : value) : '—');
 const spaceOf = (url: string | null): string | null => (url ? (/\/spaces\/([^/]+)\//.exec(url)?.[1] ?? null) : null);
 const formatDateTime = (iso: string | null): string | null => {
@@ -218,11 +222,11 @@ function DoneView({ scan, counts, filter, list, siteUrl, hasError, onFilter, onR
   const total = totalOf(counts);
   const finished = formatDateTime(scan.finishedAt);
   const filters: { id: Filter; label: string; count: number }[] = [
-    { id: 'all', label: 'All', count: total },
+    // "All" lists exactly what its count counts: the copies and the historical mentions.
+    { id: 'all', label: 'All', count: total + counts.historical },
     ...ORDER.filter((s) => counts[s] > 0 || s === 'drifted').map((s) => ({ id: s, label: COPY_LABEL[s], count: counts[s] })),
   ];
   const current = list && list.filter === filter ? list.data : undefined;
-  // "All" lists exactly what its count counts.
   const copies = current ? [...current.copies].filter((c) => filter !== 'all' || ALL_STATUSES.includes(c.status)).sort((a, b) => ORDER.indexOf(a.status) - ORDER.indexOf(b.status)) : undefined;
 
   return (
@@ -284,11 +288,12 @@ function CopyCard({ copy, siteUrl }: { copy: CopyView; siteUrl: string | undefin
     void router.open({ target: 'contentView', contentId: copy.pageId });
   };
   const differs = copy.status === 'drifted';
+  const historical = copy.status === 'historical';
   return (
     <li className={`fact copy copy--${copy.status}`}>
       <div className="fact__top">
         <span className="fact__type">{copy.factLabel}</span>
-        <span className={`badge badge--copy-${copy.status}`}>{COPY_LABEL[copy.status]}</span>
+        <span className={`badge badge--copy-${copy.status}`}>{cardLabel(copy.status)}</span>
       </div>
       <h3 className="fact__title">
         <a className="copy__link" href={href ?? '#'} target="_blank" rel="noopener noreferrer" onClick={open}>
@@ -299,7 +304,7 @@ function CopyCard({ copy, siteUrl }: { copy: CopyView; siteUrl: string | undefin
       </h3>
       <dl className="copy__compare">
         <div className={`copy__side${differs ? ' copy__side--drifted' : ''}`}>
-          <dt>This page says</dt>
+          <dt>{historical ? 'Past value on this page' : 'This page says'}</dt>
           <dd className="fact__value">{withUnit(copy.statedValue, copy.statedUnit)}</dd>
           {copy.statedCondition ? <dd className="muted copy__when">When {copy.statedCondition}</dd> : null}
         </div>
