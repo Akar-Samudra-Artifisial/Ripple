@@ -19,6 +19,8 @@ export interface PageVersionInfo {
   spaceId: string;
   version: number;
   versionAt: string | null;
+  /** The page text was cut at the LLM input limit. */
+  truncated: boolean;
 }
 
 /** Storage used by the resolvers and the `extract` consumer (an in-memory fake implements it in tests). */
@@ -35,6 +37,10 @@ export interface FactRepo {
   storedFacts(pageId: string): Promise<StoredFact[]>;
   countFacts(pageId: string): Promise<FactCounts>;
   getFact(factId: string): Promise<(FactView & { sourcePageId: string; identityKey: string }) | undefined>;
+  /**
+   * Applies the plan with status guards (see `FactUpdate.from`): a fact reviewed after the plan was made keeps the
+   * review, and a rejected fact is never changed.
+   */
   applyMerge(pageId: string, plan: MergePlan, page: PageVersionInfo): Promise<void>;
   setFactStatus(factId: string, status: FactStatus, actor: string): Promise<void>;
   /** False when another fact of the page already has the edited identity key. */
@@ -50,12 +56,14 @@ interface SourceRow {
   marked_at: unknown;
   extracted_at: unknown;
   extract_error: string | null;
+  text_truncated: number | boolean | null;
 }
 
 interface FactRow {
   id: string;
   source_page_id: string;
   identity_key: string;
+  origin_key: string | null;
   fact_type: string;
   subject: string;
   attribute: string;
@@ -71,7 +79,7 @@ interface FactRow {
 }
 
 const FACT_COLUMNS =
-  'id, source_page_id, identity_key, fact_type, subject, attribute, value, unit, fact_condition, quote, status, edited, previous_value, page_version, effective_since';
+  'id, source_page_id, identity_key, origin_key, fact_type, subject, attribute, value, unit, fact_condition, quote, status, edited, previous_value, page_version, effective_since';
 
 const iso = (v: unknown): string | null => {
   if (v === null || v === undefined || v === '') return null;
@@ -87,6 +95,7 @@ const toSource = (r: SourceRow): SourceView => ({
   markedAt: iso(r.marked_at) ?? '',
   extractedAt: iso(r.extracted_at),
   error: r.extract_error,
+  truncated: Boolean(Number(r.text_truncated ?? 0)),
 });
 
 const toFact = (r: FactRow): FactView => ({
@@ -110,7 +119,7 @@ const STATUS_ORDER = "CASE status WHEN 'confirmed' THEN 0 WHEN 'proposed' THEN 1
 export const sqlRepo: FactRepo = {
   async getSource(pageId) {
     const rows = await query<SourceRow>(
-      'SELECT page_id, title, status, page_version, marked_at, extracted_at, extract_error FROM sources WHERE page_id = ?',
+      'SELECT page_id, title, status, page_version, marked_at, extracted_at, extract_error, text_truncated FROM sources WHERE page_id = ?',
       pageId,
     );
     return rows[0] ? toSource(rows[0]) : undefined;
@@ -133,12 +142,13 @@ export const sqlRepo: FactRepo = {
 
   async finishExtraction(pageId, page) {
     await execute(
-      `UPDATE sources SET status = 'ready', title = ?, space_id = ?, page_version = ?, page_version_at = ?, extracted_at = CURRENT_TIMESTAMP,
-       extract_error = NULL WHERE page_id = ?`,
+      `UPDATE sources SET status = 'ready', title = ?, space_id = ?, page_version = ?, page_version_at = ?, text_truncated = ?,
+       extracted_at = CURRENT_TIMESTAMP, extract_error = NULL WHERE page_id = ?`,
       page.title.slice(0, 255),
       page.spaceId,
       page.version,
       page.versionAt,
+      page.truncated ? 1 : 0,
       pageId,
     );
   },
@@ -160,7 +170,7 @@ export const sqlRepo: FactRepo = {
 
   async storedFacts(pageId) {
     const rows = await query<FactRow>(`SELECT ${FACT_COLUMNS} FROM facts WHERE source_page_id = ?`, pageId);
-    return rows.map((r) => ({ id: r.id, identityKey: r.identity_key, status: r.status as FactStatus, edited: Boolean(Number(r.edited)), value: r.value, unit: r.unit }));
+    return rows.map((r) => ({ id: r.id, identityKey: r.identity_key, originKey: r.origin_key, status: r.status as FactStatus, edited: Boolean(Number(r.edited)), value: r.value, unit: r.unit }));
   },
 
   async countFacts(pageId) {
@@ -180,11 +190,18 @@ export const sqlRepo: FactRepo = {
     for (const id of plan.remove) await execute("DELETE FROM facts WHERE id = ? AND status = 'proposed' AND edited = 0", id);
     for (const u of plan.update) {
       if (u.refreshOnly) {
-        await execute('UPDATE facts SET quote = ?, page_version = ?, effective_since = ? WHERE id = ?', u.fact.quote, page.version, page.versionAt, u.id);
+        await execute(
+          "UPDATE facts SET quote = ?, page_version = ?, effective_since = ? WHERE id = ? AND status <> 'rejected'",
+          u.fact.quote,
+          page.version,
+          page.versionAt,
+          u.id,
+        );
       } else {
         await execute(
           `UPDATE facts SET fact_type = ?, subject = ?, attribute = ?, value = ?, unit = ?, fact_condition = ?, quote = ?, status = ?,
-           previous_value = COALESCE(?, previous_value), page_version = ?, effective_since = ?, reviewed_by = NULL, reviewed_at = NULL WHERE id = ?`,
+           previous_value = COALESCE(?, previous_value), page_version = ?, effective_since = ?, reviewed_by = NULL, reviewed_at = NULL
+           WHERE id = ? AND status = ? AND status <> 'rejected' AND edited = 0`,
           u.fact.type,
           u.fact.subject,
           u.fact.attribute,
@@ -197,6 +214,7 @@ export const sqlRepo: FactRepo = {
           page.version,
           page.versionAt,
           u.id,
+          u.from,
         );
       }
     }
@@ -241,10 +259,11 @@ export const sqlRepo: FactRepo = {
 /** Insert keyed on (page, identity key); a duplicate from a concurrent run is ignored. */
 async function insertFact(pageId: string, f: ExtractedFact, page: PageVersionInfo): Promise<void> {
   await execute(
-    `INSERT IGNORE INTO facts (id, source_page_id, identity_key, fact_type, subject, attribute, value, unit, fact_condition, quote, status, page_version, effective_since)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?)`,
+    `INSERT IGNORE INTO facts (id, source_page_id, identity_key, origin_key, fact_type, subject, attribute, value, unit, fact_condition, quote, status, page_version, effective_since)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?)`,
     randomUUID(),
     pageId,
+    f.identityKey,
     f.identityKey,
     f.type,
     f.subject,

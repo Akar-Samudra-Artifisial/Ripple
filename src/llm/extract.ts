@@ -41,7 +41,8 @@ Rules:
    - date: a date or deadline, e.g. "claims must be filed within 30 days after the trip".
    - list: a closed list, e.g. "accepted payment methods: credit card, bank transfer". value = the items, comma-separated.
    - name: a product, plan or team name or other term.
-   - rule: a yes/no rule, e.g. "trips over $2,000 need manager approval". value = the required outcome.
+   - rule: a yes/no rule, e.g. "trips over $2,000 need manager approval". value = the threshold or required outcome in the page's words.
+   "value" must be written in the quote (same number or words), never "yes"/"true".
    Narrative, opinions, examples, goals and long procedures are NOT facts. Skip them.
 3. "quote" must be copied verbatim from the page: the same words in the same order, one full sentence, list item or table row. If you cannot quote it, leave the fact out.
 4. Split facts that differ by condition: "domestic $60, international $90" is two facts with conditions "Domestic travel" and "International travel".
@@ -53,10 +54,22 @@ export interface ExtractContext {
   title: string;
 }
 
+/** Title on one line (a newline could start a fake prompt section), at most 255 characters. `\s` covers U+2028/9. */
+export const sanitiseTitle = (title: string): string => title.replace(/\s+/g, ' ').trim().slice(0, 255);
+
+/**
+ * Breaks any `<<<PAGE` / `PAGE>>>` in page-controlled text so the page cannot close the data block early. Changes
+ * only those markers; quotes containing them would not verify against the page text and are dropped (fine).
+ */
+export const neutraliseDelimiters = (text: string): string => text.replace(/<<<\s*PAGE/gi, '<< <PAGE').replace(/PAGE\s*>>>/gi, 'PAGE> >>');
+
 export function buildExtractMessages(pageText: string, ctx: ExtractContext): Message[] {
   return [
     { role: 'system', content: EXTRACT_SYSTEM_PROMPT },
-    { role: 'user', content: `Page title: ${ctx.title}\nPage ID: ${ctx.pageId}\n<<<PAGE\n${pageText}\nPAGE>>>` },
+    {
+      role: 'user',
+      content: `Page title: ${neutraliseDelimiters(sanitiseTitle(ctx.title))}\nPage ID: ${ctx.pageId}\n<<<PAGE\n${neutraliseDelimiters(pageText)}\nPAGE>>>`,
+    },
   ];
 }
 

@@ -24,7 +24,7 @@ export interface ExtractedFact {
   identityKey: string;
 }
 
-export type DropReason = 'invalid_shape' | 'unsupported_type' | 'quote_not_found' | 'value_not_in_quote' | 'duplicate_key' | 'over_limit';
+export type DropReason = 'invalid_shape' | 'unsupported_type' | 'quote_not_found' | 'value_not_in_quote' | 'key_too_long' | 'duplicate_key' | 'over_limit';
 
 export interface ParsedExtraction {
   facts: ExtractedFact[];
@@ -67,11 +67,28 @@ function numbersIn(text: string): number[] {
   return [...text.matchAll(/\d[\d,]*(?:\.\d+)?/g)].map((m) => Number(m[0].replace(/,/g, ''))).filter(Number.isFinite);
 }
 
-/** For number facts: every number in the value must be written in the quote (guards against a mis-read value). */
-function valueInQuote(value: string, quote: string): boolean {
+/** Words of at least 3 letters/digits, after key normalisation. */
+const wordsIn = (text: string): string[] => normaliseKeyPart(text).split(' ').filter((w) => w.length >= 3);
+
+/**
+ * The value must be grounded in its own quote (guards against a mis-read or invented value):
+ * - `number`: at least one number in the value, and every number in it is written in the quote ("2000" ↔ "$2,000");
+ * - other types: numbers in the value must be in the quote; a value without numbers needs all of its words
+ *   (3+ characters, at least one) in the quote ("economy class" ↔ "Book economy class …"). "yes" is never grounded.
+ */
+export function valueInQuote(type: FactType, value: string, quote: string): boolean {
   const inQuote = new Set(numbersIn(quote));
-  return numbersIn(value).every((n) => inQuote.has(n));
+  const numbers = numbersIn(value);
+  if (!numbers.every((n) => inQuote.has(n))) return false;
+  if (numbers.length > 0) return true;
+  if (type === 'number') return false;
+  const quoteText = normaliseKeyPart(quote);
+  const words = wordsIn(value);
+  return words.length > 0 && words.every((w) => quoteText.includes(w));
 }
+
+/** Column size of `facts.identity_key` / `facts.origin_key`; longer keys are rejected, never truncated. */
+export const MAX_KEY_CHARS = 400;
 
 const sameText = (a: string | null, b: string | null): boolean => normaliseKeyPart(a) === normaliseKeyPart(b);
 
@@ -119,11 +136,15 @@ export function parseExtraction(raw: unknown, pageText: string): ParsedExtractio
       dropped.push({ index, reason: 'quote_not_found' });
       return;
     }
-    if (type === 'number' && !valueInQuote(value, quote)) {
+    if (!valueInQuote(type, value, quote)) {
       dropped.push({ index, reason: 'value_not_in_quote' });
       return;
     }
     const key = identityKey(subject, attribute, condition);
+    if (key.length > MAX_KEY_CHARS) {
+      dropped.push({ index, reason: 'key_too_long' });
+      return;
+    }
     if (keys.has(key)) {
       dropped.push({ index, reason: 'duplicate_key' });
       return;
@@ -142,6 +163,8 @@ export function parseExtraction(raw: unknown, pageText: string): ParsedExtractio
 export interface StoredFact {
   id: string;
   identityKey: string;
+  /** Key as first extracted; survives reviewer edits so re-extraction still matches the fact. Null on old rows. */
+  originKey: string | null;
   status: FactStatus;
   edited: boolean;
   value: string;
@@ -153,6 +176,11 @@ export interface FactUpdate {
   fact: ExtractedFact;
   /** Only refresh quote and page version; keep subject/attribute/value/unit/condition and status. */
   refreshOnly: boolean;
+  /**
+   * Status the row had when the plan was made. The store applies a full update only while the row still has it and
+   * is unedited, so a review that lands during extraction wins; a refresh never touches a rejected row.
+   */
+  from: FactStatus;
   status: FactStatus;
   previousValue: string | null;
 }
@@ -174,20 +202,29 @@ export interface MergePlan {
  * - stored but not extracted: `proposed` is removed; reviewed facts are kept (M2 asks the owner).
  */
 export function planMerge(existing: readonly StoredFact[], extracted: readonly ExtractedFact[]): MergePlan {
-  const byKey = new Map(existing.map((f) => [f.identityKey, f]));
-  const seen = new Set<string>();
+  // Match on the original (extracted) key first, so an edit of subject/attribute/condition does not duplicate the
+  // fact on the next extraction; then on the current key.
+  const byKey = new Map<string, StoredFact>();
+  for (const f of existing) byKey.set(f.originKey ?? f.identityKey, f);
+  for (const f of existing) if (!byKey.has(f.identityKey)) byKey.set(f.identityKey, f);
+  const matched = new Set<string>();
   const plan: MergePlan = { insert: [], update: [], remove: [] };
   for (const fact of extracted) {
-    seen.add(fact.identityKey);
     const old = byKey.get(fact.identityKey);
-    if (!old) plan.insert.push(fact);
-    else if (old.status === 'rejected') continue;
-    else if (old.status === 'proposed' && !old.edited) plan.update.push({ id: old.id, fact, refreshOnly: false, status: 'proposed', previousValue: null });
+    if (!old) {
+      plan.insert.push(fact);
+      continue;
+    }
+    if (matched.has(old.id)) continue;
+    matched.add(old.id);
+    const from = old.status;
+    if (old.status === 'rejected') continue;
+    if (old.status === 'proposed' && !old.edited) plan.update.push({ id: old.id, fact, refreshOnly: false, from, status: 'proposed', previousValue: null });
     else if (old.edited || (sameText(old.value, fact.value) && sameText(old.unit, fact.unit))) {
-      plan.update.push({ id: old.id, fact, refreshOnly: true, status: old.status, previousValue: null });
-    } else plan.update.push({ id: old.id, fact, refreshOnly: false, status: 'proposed', previousValue: old.value });
+      plan.update.push({ id: old.id, fact, refreshOnly: true, from, status: old.status, previousValue: null });
+    } else plan.update.push({ id: old.id, fact, refreshOnly: false, from, status: 'proposed', previousValue: old.value });
   }
-  for (const f of existing) if (!seen.has(f.identityKey) && f.status === 'proposed' && !f.edited) plan.remove.push(f.id);
+  for (const f of existing) if (!matched.has(f.id) && f.status === 'proposed' && !f.edited) plan.remove.push(f.id);
   return plan;
 }
 
@@ -213,5 +250,7 @@ export function cleanEdit(payload: Partial<FactEditPayload> | undefined): CleanE
   if (!value) return { error: `Value is required (at most ${FIELD_LIMITS.value} characters).` };
   if (unit === undefined) return { error: `Unit must be text of at most ${FIELD_LIMITS.unit} characters.` };
   if (condition === undefined) return { error: `Condition must be text of at most ${FIELD_LIMITS.condition} characters.` };
-  return { subject, attribute, value, unit, condition, identityKey: identityKey(subject, attribute, condition) };
+  const key = identityKey(subject, attribute, condition);
+  if (key.length > MAX_KEY_CHARS) return { error: 'Subject, attribute and condition are too long together; shorten them.' };
+  return { subject, attribute, value, unit, condition, identityKey: key };
 }

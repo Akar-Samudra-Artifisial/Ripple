@@ -19,6 +19,17 @@ export class PageNotFoundError extends Error {
   }
 }
 
+/** 429 or 5xx from Confluence: worth retrying later through the queue. */
+export class ConfluenceRetryableError extends Error {
+  constructor(
+    readonly pageId: string,
+    readonly status: number,
+  ) {
+    super(`Confluence REST v2 page ${pageId} failed: HTTP ${status} (will retry)`);
+    this.name = 'ConfluenceRetryableError';
+  }
+}
+
 interface RawPage {
   id?: string | number;
   title?: string;
@@ -31,6 +42,7 @@ interface RawPage {
 export async function getSourcePage(pageId: string): Promise<SourcePage> {
   const res = await api.asApp().requestConfluence(route`/wiki/api/v2/pages/${pageId}?body-format=storage`, { headers: { Accept: 'application/json' } });
   if (res.status === 404) throw new PageNotFoundError(pageId);
+  if (res.status === 429 || res.status >= 500) throw new ConfluenceRetryableError(pageId, res.status);
   if (!res.ok) throw new Error(`Confluence REST v2 page ${pageId} failed: HTTP ${res.status}`);
   const page = (await res.json()) as RawPage;
   return {

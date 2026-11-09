@@ -74,6 +74,11 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
       KEY idx_facts_source_status (source_page_id, status)
     )`,
   },
+  // Identity key as first extracted; a reviewer edit changes identity_key but not this, so re-extraction still
+  // matches the edited fact instead of proposing it again. NULL on rows from before v005 (falls back to identity_key).
+  { name: 'v005_facts_origin_key', statement: 'ALTER TABLE facts ADD COLUMN IF NOT EXISTS origin_key VARCHAR(400) NULL' },
+  // Page text was longer than the LLM input limit, so facts past the cut were not read.
+  { name: 'v006_sources_text_truncated', statement: 'ALTER TABLE sources ADD COLUMN IF NOT EXISTS text_truncated TINYINT(1) NOT NULL DEFAULT 0' },
 ];
 
 /** Name of the newest migration; the byline reports it so admins can confirm the schema is current. */

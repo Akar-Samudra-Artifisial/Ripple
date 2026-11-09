@@ -3,12 +3,12 @@
  * permission on the page server-side and only touch SQL and the queue; the LLM runs in the `extract` consumer.
  */
 import { Queue } from '@forge/events';
-import { canEditPage, getSourcePage, PageNotFoundError, type SourcePage } from '../adapters/confluence';
+import { canEditPage, ConfluenceRetryableError, getSourcePage, PageNotFoundError, type SourcePage } from '../adapters/confluence';
 import { sqlRepo, type FactRepo, type PageVersionInfo } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
 import { scrubErrorText } from '../adapters/teamworkGraph';
 import { cleanEdit, parseExtraction, planMerge } from '../core/facts';
-import { storageToText } from '../core/pageText';
+import { storageToText, TRUNCATED_MARK } from '../core/pageText';
 import { isSqlRateLimited, SchemaSettingUpError } from '../core/schema';
 import type { ErrorReply, FactActionResult, FactEditPayload, FactIdPayload, FactList, FactStatus, SourceStatus } from '../core/views';
 import { isLlmRateLimited, LlmOutputError } from '../llm';
@@ -93,7 +93,16 @@ export async function markSource(ctx: SourceContext, deps: SourceDeps = defaultD
     const spaceId = ctx.extension?.space?.id;
     const title = ctx.extension?.content?.title;
     await deps.repo.markSource({ pageId, spaceId: spaceId === undefined ? null : String(spaceId), title: title ? title.slice(0, 255) : null, accountId: ctx.accountId });
-    const jobId = await deps.enqueue(pageId);
+    let jobId: string;
+    try {
+      jobId = await deps.enqueue(pageId);
+    } catch (err) {
+      // Without a job nothing would ever leave `extracting`; show the failure so the user can retry.
+      const error = `Could not start the extraction: ${errorText(err)}`;
+      console.warn('ripple mark: enqueue failed', { pageId, error });
+      await deps.repo.failExtraction(pageId, error);
+      return { error: `${error}. Try again in a minute.` };
+    }
     await deps.repo.setExtractJob(pageId, jobId);
     await deps.repo.audit('source.marked', ctx.accountId, 'page', pageId, { jobId });
     console.info('ripple source marked', { pageId, jobId });
@@ -174,8 +183,10 @@ export interface ExtractDeps {
 
 const defaultExtractDeps: ExtractDeps = { repo: sqlRepo, page: getSourcePage, ensure: ensureSchema };
 
-/** Retries for a rate-limited LLM before the source is marked as failed. */
-export const MAX_LLM_RETRIES = 4;
+/** Queue retries for transient failures (LLM/SQL rate limit, Confluence 429/5xx) before the source is marked failed. */
+export const MAX_RETRIES = 4;
+
+const backoff = (retryCount: number): number => 30 * 2 ** retryCount;
 
 export type ExtractOutcome =
   | { status: 'done'; facts: number; inserted: number; updated: number; removed: number; dropped: number }
@@ -200,9 +211,22 @@ export async function runExtractJob(pageId: string, retryCount: number, deps: Ex
     const text = storageToText(page.body);
     const { args, model } = await runFactExtraction(text, { pageId, title: page.title }, deps.llm);
     const parsed = parseExtraction(args, text);
+    // The page may have been unmarked while the LLM ran: do not write facts for a page that is no longer a source.
+    if (!(await deps.repo.getSource(pageId))) return { status: 'skipped', reason: 'unmarked during extraction' };
     const plan = planMerge(await deps.repo.storedFacts(pageId), parsed.facts);
-    const info: PageVersionInfo = { title: page.title, spaceId: page.spaceId, version: page.version, versionAt: page.versionCreatedAt };
+    const info: PageVersionInfo = {
+      title: page.title,
+      spaceId: page.spaceId,
+      version: page.version,
+      versionAt: page.versionCreatedAt,
+      truncated: text.endsWith(TRUNCATED_MARK),
+    };
     await deps.repo.applyMerge(pageId, plan, info);
+    if (!(await deps.repo.getSource(pageId))) {
+      // Unmarked between the check and the writes: remove what this run just wrote (unmark is idempotent).
+      await deps.repo.unmarkSource(pageId);
+      return { status: 'skipped', reason: 'unmarked during extraction' };
+    }
     await deps.repo.finishExtraction(pageId, info);
     const outcome = { status: 'done', facts: parsed.facts.length, inserted: plan.insert.length, updated: plan.update.length, removed: plan.remove.length, dropped: parsed.dropped.length } as const;
     const reasons = parsed.dropped.reduce<Record<string, number>>((acc, d) => ({ ...acc, [d.reason]: (acc[d.reason] ?? 0) + 1 }), {});
@@ -210,8 +234,11 @@ export async function runExtractJob(pageId: string, retryCount: number, deps: Ex
     await deps.repo.audit('source.extracted', null, 'page', pageId, { version: page.version, facts: outcome.facts, dropped: outcome.dropped });
     return outcome;
   } catch (err) {
-    if (isLlmRateLimited(err) && retryCount < MAX_LLM_RETRIES) return { status: 'retry', seconds: 30 * 2 ** retryCount, reason: 'llm-rate-limited' };
-    if (isSqlRateLimited(err) && retryCount < MAX_LLM_RETRIES) return { status: 'retry', seconds: 60, reason: 'sql-rate-limited' };
+    if (retryCount < MAX_RETRIES) {
+      if (isLlmRateLimited(err)) return { status: 'retry', seconds: backoff(retryCount), reason: 'llm-rate-limited' };
+      if (err instanceof ConfluenceRetryableError) return { status: 'retry', seconds: backoff(retryCount), reason: `confluence-http-${err.status}` };
+      if (isSqlRateLimited(err)) return { status: 'retry', seconds: 60, reason: 'sql-rate-limited' };
+    }
     const error =
       err instanceof PageNotFoundError
         ? 'The page could not be read (deleted or not visible to Ripple).'
@@ -219,7 +246,9 @@ export async function runExtractJob(pageId: string, retryCount: number, deps: Ex
           ? `The extraction model gave an unusable answer: ${errorText(err)}`
           : isLlmRateLimited(err)
             ? 'The extraction model is busy; mark the page again later.'
-            : errorText(err);
+            : err instanceof ConfluenceRetryableError
+              ? `Confluence did not answer (HTTP ${err.status}); mark the page again later.`
+              : errorText(err);
     console.warn('ripple extract failed', { pageId, error });
     await deps.repo.failExtraction(pageId, error);
     return { status: 'failed', error };

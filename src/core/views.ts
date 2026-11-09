@@ -94,6 +94,8 @@ export interface SourceView {
   extractedAt: string | null;
   /** Scrubbed reason when `state` is `error`. */
   error: string | null;
+  /** True when the page was longer than Ripple reads (12,000 characters of text): facts past the cut are missing. */
+  truncated?: boolean;
 }
 
 /** Reply of `getSourceStatus`, `markSource` and `unmarkSource`. */

@@ -5,6 +5,7 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 ## [Unreleased]
 
 ### Added
+- Status sumber memuat `truncated` bila teks halaman melebihi batas baca LLM (kolom `sources.text_truncated`, migrasi v006).
 - M1 (FR-1..3): tombol "Mark as source of truth" di byline (hanya untuk pengguna dengan izin edit halaman, dicek di server), lepas status sumber, status ekstraksi yang di-poll, dan daftar fakta dengan kutipan serta aksi Confirm/Edit/Reject.
 - Ekstraksi fakta di antrean `extract` lewat Forge LLM: maksimal 30 fakta per halaman, hanya jenis yang didukung, kutipan wajib ditemukan persis di teks halaman (fakta dengan kutipan palsu dibuang), dedup kunci identitas subjek + atribut + kondisi; ekstraksi ulang mempertahankan fakta yang sudah dikonfirmasi/diedit dan tidak menghidupkan lagi fakta yang ditolak.
 - Tabel Forge SQL `sources` dan `facts` (migrasi v003, v004) serta baris audit untuk mark/unmark, ekstraksi, dan tiap review fakta.
@@ -25,8 +26,18 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Byline hanya menampilkan "Ripple is ready" bila database siap; saat setup atau cek gagal tampil status yang jelas.
 - Permintaan ke `claude-sonnet-5` tidak lagi mengirim `temperature` (parameter ini ditolak model tersebut).
 
+### Fixed
+- Ekstraksi ulang tidak lagi menimpa review yang masuk di tengah ekstraksi dan tidak pernah menghidupkan lagi fakta yang ditolak (UPDATE dengan guard status).
+- Halaman yang di-unmark saat LLM berjalan tidak meninggalkan fakta yatim; fakta yang terlanjur ditulis dibersihkan.
+- Gagal mengantrekan ekstraksi kini menandai sumber sebagai error (bisa "Try again") alih-alih tertahan di `extracting`.
+- Confluence 429/5xx saat membaca halaman di-retry lewat antrean dengan backoff, lalu ditandai gagal.
+- Nilai fakta wajib berasal dari kutipannya: fakta number wajib berisi angka yang tertulis di kutipan; jenis lain wajib memuat semua kata nilai (≥3 huruf) di kutipan.
+- Kunci identitas lebih dari 400 karakter ditolak (ekstraksi dan edit), bukan gagal di database.
+- Mengedit subjek/atribut/kondisi tidak lagi memunculkan duplikat saat ekstraksi ulang (kolom `origin_key`, migrasi v005).
+
 ### Security
 - Log menyamarkan account id berprefiks 5–7 digit (sebelumnya hanya 6 digit).
+- Prompt ekstraksi: judul halaman dijadikan satu baris dan penanda `<<<PAGE`/`PAGE>>>` di judul/isi dinetralkan.
 
 ### Removed
 - Scope `write:confluence-content` dan `read:confluence-user` (tidak dibutuhkan; suntingan lewat REST v2, nama owner dari Teamwork Graph).

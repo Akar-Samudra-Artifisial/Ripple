@@ -14,6 +14,7 @@ vi.mock('@forge/events', () => ({
 }));
 
 import { randomUUID } from 'node:crypto';
+import { ConfluenceRetryableError } from '../src/adapters/confluence';
 import type { FactRepo, MarkInput } from '../src/adapters/repo';
 import type { StoredFact } from '../src/core/facts';
 import { SchemaSettingUpError } from '../src/core/schema';
@@ -35,7 +36,7 @@ import {
 } from '../src/surfaces/sources';
 import { TRAVEL_POLICY_FACTS, TRAVEL_POLICY_STORAGE } from './fixtures/travelPolicy';
 
-type Row = FactView & { sourcePageId: string; identityKey: string };
+type Row = FactView & { sourcePageId: string; identityKey: string; originKey: string | null };
 
 /** In-memory `FactRepo` with the same semantics as the SQL one. */
 class FakeRepo implements FactRepo {
@@ -51,9 +52,9 @@ class FakeRepo implements FactRepo {
     this.sources.set(input.pageId, { pageId: input.pageId, title: old?.title ?? input.title, state: 'extracting', pageVersion: old?.pageVersion ?? null, markedAt: old?.markedAt ?? 'now', extractedAt: old?.extractedAt ?? null, error: null });
   }
   async setExtractJob() {}
-  async finishExtraction(pageId: string, page: { title: string; version: number }) {
+  async finishExtraction(pageId: string, page: { title: string; version: number; truncated: boolean }) {
     const s = this.sources.get(pageId);
-    if (s) this.sources.set(pageId, { ...s, state: 'ready', title: page.title, pageVersion: page.version, extractedAt: 'now', error: null });
+    if (s) this.sources.set(pageId, { ...s, state: 'ready', title: page.title, pageVersion: page.version, extractedAt: 'now', error: null, truncated: page.truncated });
   }
   async failExtraction(pageId: string, error: string) {
     const s = this.sources.get(pageId);
@@ -70,7 +71,7 @@ class FakeRepo implements FactRepo {
     return this.of(pageId);
   }
   async storedFacts(pageId: string): Promise<StoredFact[]> {
-    return this.of(pageId).map((f) => ({ id: f.id, identityKey: f.identityKey, status: f.status, edited: f.edited, value: f.value, unit: f.unit }));
+    return this.of(pageId).map((f) => ({ id: f.id, identityKey: f.identityKey, originKey: f.originKey, status: f.status, edited: f.edited, value: f.value, unit: f.unit }));
   }
   async countFacts(pageId: string) {
     const c = { proposed: 0, confirmed: 0, rejected: 0 };
@@ -85,13 +86,15 @@ class FakeRepo implements FactRepo {
     for (const id of plan.remove) this.facts.delete(id);
     for (const u of plan.update) {
       const f = this.facts.get(u.id);
-      if (!f) continue;
+      // Same guards as the SQL UPDATEs: refresh never touches a rejected row; a full update needs the planned status.
+      if (!f || f.status === 'rejected') continue;
+      if (!u.refreshOnly && (f.status !== u.from || f.edited)) continue;
       const fields = u.refreshOnly ? {} : { type: u.fact.type, subject: u.fact.subject, attribute: u.fact.attribute, value: u.fact.value, unit: u.fact.unit, condition: u.fact.condition, status: u.status, previousValue: u.previousValue ?? f.previousValue };
       this.facts.set(u.id, { ...f, ...fields, quote: u.fact.quote, pageVersion: page.version, effectiveSince: page.versionAt });
     }
     for (const x of plan.insert) {
       const id = randomUUID();
-      this.facts.set(id, { id, sourcePageId: pageId, identityKey: x.identityKey, type: x.type, subject: x.subject, attribute: x.attribute, value: x.value, unit: x.unit, condition: x.condition, quote: x.quote, status: 'proposed', edited: false, previousValue: null, pageVersion: page.version, effectiveSince: page.versionAt });
+      this.facts.set(id, { id, sourcePageId: pageId, identityKey: x.identityKey, originKey: x.identityKey, type: x.type, subject: x.subject, attribute: x.attribute, value: x.value, unit: x.unit, condition: x.condition, quote: x.quote, status: 'proposed', edited: false, previousValue: null, pageVersion: page.version, effectiveSince: page.versionAt });
     }
   }
   async setFactStatus(id: string, status: FactView['status']) {
@@ -140,6 +143,12 @@ describe('markSource / unmarkSource (FR-1)', () => {
     expect(enqueue).toHaveBeenCalledWith(PAGE);
     expect(canEdit).toHaveBeenCalledWith(PAGE);
     expect(repo.audits).toEqual([expect.objectContaining({ action: 'source.marked', actor: 'acc-1', subjectId: PAGE })]);
+  });
+
+  it('fails the source instead of leaving it extracting when the queue push fails (warning 3)', async () => {
+    enqueue.mockRejectedValue(new Error('queue unavailable'));
+    expect(await markSource(ctx, deps)).toEqual({ error: expect.stringContaining('Could not start the extraction: queue unavailable') });
+    expect(repo.sources.get(PAGE)).toMatchObject({ state: 'error', error: expect.stringContaining('queue unavailable') });
   });
 
   it('refuses mark and unmark without edit permission, and without a user', async () => {
@@ -219,6 +228,72 @@ describe('extract consumer (FR-2)', () => {
     expect(await runExtractJob(PAGE, 1, extractDeps(busy))).toEqual({ status: 'retry', seconds: 60, reason: 'llm-rate-limited' });
     expect(await runExtractJob(PAGE, 4, extractDeps(busy))).toMatchObject({ status: 'failed' });
     expect(repo.sources.get(PAGE)).toMatchObject({ state: 'error', error: expect.stringContaining('busy') });
+  });
+
+  it('keeps a review that lands between planning and writing, and never revives a rejected fact (warning 1)', async () => {
+    await markSource(ctx, deps);
+    await runExtractJob(PAGE, 0, extractDeps(llmReturning(TRAVEL_POLICY_FACTS)));
+    const [a, b] = [...repo.facts.values()] as [Row, Row];
+    const snapshot = repo.storedFacts.bind(repo);
+    repo.storedFacts = async (pageId: string) => {
+      const facts = await snapshot(pageId); // plan sees both as proposed …
+      await repo.setFactStatus(a.id, 'confirmed'); // … then the reviewer acts before the writes
+      await repo.setFactStatus(b.id, 'rejected');
+      return facts;
+    };
+    await runExtractJob(PAGE, 0, extractDeps(llmReturning(TRAVEL_POLICY_FACTS), TRAVEL_POLICY_STORAGE, 4));
+    expect(repo.facts.get(a.id)).toMatchObject({ status: 'confirmed' });
+    expect(repo.facts.get(b.id)).toMatchObject({ status: 'rejected', pageVersion: 3 });
+  });
+
+  it('writes no facts for a page unmarked while the LLM ran, and cleans up a late unmark (warning 2)', async () => {
+    await markSource(ctx, deps);
+    const unmarkingLlm = (async () => {
+      await repo.unmarkSource(PAGE);
+      return { args: { facts: TRAVEL_POLICY_FACTS }, model: 'claude-sonnet-5' };
+    }) as unknown as ChatToolFn;
+    expect(await runExtractJob(PAGE, 0, extractDeps(unmarkingLlm))).toEqual({ status: 'skipped', reason: 'unmarked during extraction' });
+    expect(repo.facts.size).toBe(0);
+
+    await markSource(ctx, deps);
+    const apply = repo.applyMerge.bind(repo);
+    repo.applyMerge = async (...args: Parameters<FactRepo['applyMerge']>) => {
+      await apply(...args);
+      repo.sources.delete(PAGE); // unmark committed right after the facts were written
+    };
+    expect(await runExtractJob(PAGE, 0, extractDeps(llmReturning(TRAVEL_POLICY_FACTS)))).toMatchObject({ status: 'skipped' });
+    expect(repo.facts.size).toBe(0);
+  });
+
+  it('retries Confluence 429/5xx through the queue, then fails the source (warning 4)', async () => {
+    await markSource(ctx, deps);
+    const down = (status: number): ExtractDeps => ({
+      ...extractDeps(llmReturning(TRAVEL_POLICY_FACTS)),
+      page: async () => {
+        throw new ConfluenceRetryableError(PAGE, status);
+      },
+    });
+    expect(await runExtractJob(PAGE, 1, down(503))).toEqual({ status: 'retry', seconds: 60, reason: 'confluence-http-503' });
+    expect(await runExtractJob(PAGE, 0, down(429))).toEqual({ status: 'retry', seconds: 30, reason: 'confluence-http-429' });
+    expect(await runExtractJob(PAGE, 4, down(502))).toMatchObject({ status: 'failed', error: expect.stringContaining('HTTP 502') });
+    expect(repo.sources.get(PAGE)).toMatchObject({ state: 'error' });
+  });
+
+  it('does not duplicate an edited fact on re-extraction (warning 7)', async () => {
+    await markSource(ctx, deps);
+    await runExtractJob(PAGE, 0, extractDeps(llmReturning(TRAVEL_POLICY_FACTS)));
+    const c = [...repo.facts.values()][2]!;
+    const r = await editFact(ctx, { factId: c.id, subject: 'Travel approval', attribute: 'Manager sign-off above', value: '2000', unit: 'USD', condition: null }, deps);
+    expect(r).toMatchObject({ fact: { edited: true } });
+    await runExtractJob(PAGE, 0, extractDeps(llmReturning(TRAVEL_POLICY_FACTS), TRAVEL_POLICY_STORAGE, 4));
+    expect(repo.facts.size).toBe(5);
+    expect(repo.facts.get(c.id)).toMatchObject({ subject: 'Travel approval', status: 'confirmed', pageVersion: 4 });
+  });
+
+  it('flags a page cut at the LLM input limit in the status', async () => {
+    await markSource(ctx, deps);
+    await runExtractJob(PAGE, 0, extractDeps(llmReturning([]), `<p>${'word '.repeat(4000)}</p>`));
+    expect(await getSourceStatus(ctx, deps)).toMatchObject({ source: { state: 'ready', truncated: true } });
   });
 
   it('marks the source as failed on an unusable model answer, and waits for the schema', async () => {
