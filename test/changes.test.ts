@@ -17,7 +17,7 @@ import type { Message } from '@forge/llm';
 import { dismissalKey, valueHash, type ChangeRepo, type ChangeRouting, type ChangeRow, type CopyForChange } from '../src/adapters/changeRepo';
 import type { SourcePage } from '../src/adapters/confluence';
 import type { FactRepo, PageVersionInfo } from '../src/adapters/repo';
-import { addWorkingDays, computeImpact, matchFacts, planDiff, type ChangeImpact, type FactChange, type KnownFact } from '../src/core/changes';
+import { addWorkingDays, computeImpact, factChanged, matchFacts, planDiff, type ChangeImpact, type FactChange, type KnownFact } from '../src/core/changes';
 import { identityKey, type ExtractedFact, type MergePlan, type StoredFact } from '../src/core/facts';
 import type { ChangeDecision, CopyStatus, ErrorReply, FactView, PendingChangeReply, SourceView } from '../src/core/views';
 import type { ChatToolFn } from '../src/llm/extract';
@@ -205,6 +205,15 @@ class Store {
           if (toSync.includes(c.id) && c.status === 'drifted') c.status = 'in_sync';
         }
         return n;
+      },
+      confirmedChanges: async (sourcePageId) => [...this.changes.values()].filter((c) => c.sourcePageId === sourcePageId && c.status === 'confirmed').reverse(),
+      revertFactChange: async (sourcePageId, c: FactChange, copyIds) => {
+        const f = this.facts.find((x) => x.id === c.factId && x.status === 'confirmed' && x.value === c.newValue && x.previousValue === c.oldValue);
+        if (!f || sourcePageId !== SOURCE_PAGE_ID) return { reverted: false, copies: 0 };
+        Object.assign(f, { value: c.oldValue, unit: c.oldUnit, previousValue: null });
+        let copies = 0;
+        for (const k of this.copies) if (copyIds.includes(k.id) && k.factId === c.factId && k.status === 'drifted') (k.status = 'in_sync'), copies++;
+        return { reverted: true, copies };
       },
     };
   }
@@ -470,6 +479,74 @@ describe('diff matching does not depend on the model wording (live bug on 950272
     expect(store.facts).toHaveLength(5);
   });
 
+  /** Live v3/v4 answer: unchanged sentences, but approval and flight class with other value wording. */
+  const rewordedValues = (domestic: string) => ({
+    facts: TRAVEL_POLICY_FACTS.map((f, i) => ({
+      ...f,
+      existing_fact_id: TP_IDS[i] ?? null,
+      ...(i === 0 ? { value: domestic.slice(1), quote: f.quote.replace('$60', domestic) } : {}),
+      ...(f.subject === 'Trip approval' ? { value: 'Trips over $2,000', unit: null } : {}),
+      ...(f.subject === 'Flight class' ? { value: 'economy class for flights under 6 hours' } : {}),
+    })),
+  });
+
+  it('unchanged sentences with reworded values: no change; $60 → $75 is exactly one change (live v3/v4)', async () => {
+    const v2 = await runDiffJob(SOURCE_PAGE_ID, 0, tpDeps(2, '$60', rewordedValues('$60')));
+    expect(v2).toMatchObject({ status: 'done', changeId: null, changed: 0, inserted: 0 });
+    const v3 = await runDiffJob(SOURCE_PAGE_ID, 0, tpDeps(3, '$75', rewordedValues('$75')));
+    expect(v3).toMatchObject({ status: 'done', changed: 1, inserted: 0 });
+    expect([...store.changes.values()][0]?.factChanges).toEqual([expect.objectContaining({ factId: 'tp-1', oldValue: '60', newValue: '75' })]);
+    // The stored values keep their wording.
+    expect(store.facts.find((f) => f.id === 'tp-3')).toMatchObject({ value: '2000', unit: 'USD' });
+    expect(store.facts.find((f) => f.id === 'tp-5')).toMatchObject({ value: 'economy class' });
+  });
+
+  it('undoes a confirmed wording-only change (old value back, its drifted copies in sync), keeps the real one and the audit', async () => {
+    // Live state after confirming v4: approval and flight class hold the reworded values, domestic $75.
+    const set = (id: string, value: string, unit: string | null, previousValue: string) => {
+      const f = store.facts.find((x) => x.id === id);
+      if (f) Object.assign(f, { value, unit, previousValue, pageVersion: 4 });
+    };
+    set('tp-1', '75', 'USD', '60');
+    set('tp-3', 'Trips over $2,000', null, '2000');
+    set('tp-5', 'economy class for flights under 6 hours', null, 'economy class');
+    const fc = (factId: string, oldValue: string, oldUnit: string | null, newValue: string, newUnit: string | null, newQuote: string): FactChange => ({ factId, oldValue, oldUnit, newValue, newUnit, newQuote, version: 4, versionAt: null });
+    const q = (i: number) => TRAVEL_POLICY_FACTS[i]?.quote ?? '';
+    const impactCopy = (copyId: string, factId: string) => ({ copyId, factId, pageId: '9600001', spaceId: '6979587', status: 'in_sync' as const });
+    store.changes.set('ch-1', {
+      id: 'ch-1',
+      sourcePageId: SOURCE_PAGE_ID,
+      status: 'confirmed',
+      pageVersion: 4,
+      factChanges: [fc('tp-1', '60', 'USD', '75', 'USD', q(0).replace('$60', '$75')), fc('tp-3', '2000', 'USD', 'Trips over $2,000', null, q(2)), fc('tp-5', 'economy class', null, 'economy class for flights under 6 hours', null, q(4))],
+      missingFactIds: [],
+      impact: { copies: [impactCopy('k-1', 'tp-1'), impactCopy('k-3', 'tp-3')], alreadyNew: 0, syncCopyIds: [], unsure: 0, historical: 0, needsCheck: 0 },
+      routing: null,
+      deadlineDays: 5,
+      createdAt: 'now',
+    });
+    const copy = (id: string, factId: string) => ({ id, factId, pageId: '9600001', pageTitle: 't', pageUrl: null, status: 'drifted' as CopyStatus, statedValue: null, statedUnit: null, reason: 'r' });
+    store.copies = [copy('k-1', 'tp-1'), copy('k-3', 'tp-3')];
+    const s = store.sources.get(SOURCE_PAGE_ID);
+    if (s) s.pageVersion = 4;
+
+    const v5 = await runDiffJob(SOURCE_PAGE_ID, 0, tpDeps(5, '$75', rewordedValues('$75')));
+    expect(v5).toMatchObject({ status: 'done', changeId: null, changed: 0, inserted: 0 });
+    expect(store.facts.find((f) => f.id === 'tp-1')).toMatchObject({ value: '75', previousValue: '60' });
+    expect(store.facts.find((f) => f.id === 'tp-3')).toMatchObject({ value: '2000', unit: 'USD', previousValue: null });
+    expect(store.facts.find((f) => f.id === 'tp-5')).toMatchObject({ value: 'economy class', previousValue: null });
+    expect(store.copies.map((c) => [c.id, c.status])).toEqual([
+      ['k-1', 'drifted'],
+      ['k-3', 'in_sync'],
+    ]);
+    expect(store.changes.get('ch-1')?.status).toBe('confirmed');
+    const reverted = store.audits.filter((a) => a.action === 'change.fact_reverted');
+    expect(reverted.map((a) => a.detail?.factId)).toEqual(['tp-3', 'tp-5']);
+    // Guarded: a later version does not undo anything twice.
+    await runDiffJob(SOURCE_PAGE_ID, 0, tpDeps(6, '$75', rewordedValues('$75')));
+    expect(store.audits.filter((a) => a.action === 'change.fact_reverted')).toHaveLength(2);
+  });
+
   it('keeps several facts of one sentence apart (same quote): value, then wording decide', () => {
     const quote = 'Domestic travel is $60 per day and international travel is $90 per day.';
     const known: KnownFact[] = [
@@ -531,6 +608,27 @@ describe('planDiff / computeImpact / addWorkingDays', () => {
     expect(changed('2026-01-15', '15 Jan 2026')).toBe(false);
   });
 
+  it('factChanged: only the value tokens of the sentence count, not the model wording of the value', () => {
+    const approval = 'Trips over $2,000 require manager approval before booking.';
+    const old = { value: '2000', unit: 'USD', quote: approval };
+    expect(factChanged(old, { value: '$2,000', unit: null, quote: approval })).toBe(false);
+    expect(factChanged(old, { value: '2000 USD', unit: null, quote: 'Trips over $2,000 need a manager approval before booking.' })).toBe(false);
+    expect(factChanged(old, { value: 'over $2,000', unit: null, quote: 'Trips over $2,000 need a manager approval before booking.' })).toBe(false);
+    expect(factChanged(old, { value: '$2,500', unit: null, quote: approval.replace('2,000', '2,500') })).toBe(true);
+    expect(factChanged(old, { value: '2000 EUR', unit: null, quote: 'Trips over 2,000 EUR require manager approval before booking.' })).toBe(true);
+    const domestic = { value: '60', unit: 'USD', quote: 'The per diem for domestic travel is $60 per day.' };
+    expect(factChanged(domestic, { value: '75', unit: 'USD', quote: 'The per diem for domestic travel is $75 per day.' })).toBe(true);
+    expect(factChanged(domestic, { value: '60–90', unit: 'USD', quote: 'The per diem for domestic travel is $60–90 per day.' })).toBe(true);
+    const flight = { value: 'economy class', unit: null, quote: 'Book economy class for flights under 6 hours.' };
+    expect(factChanged(flight, { value: 'economy class for flights under 6 hours', unit: null, quote: flight.quote })).toBe(false);
+    expect(factChanged(flight, { value: 'economy class only', unit: null, quote: 'Always book economy class for flights under 6 hours.' })).toBe(false);
+    expect(factChanged(flight, { value: 'business class', unit: null, quote: 'Book business class for flights under 6 hours.' })).toBe(true);
+    // Dates keep the strict comparison (same day number, other month).
+    expect(factChanged({ value: '15 January 2026', unit: null, quote: 'Valid from 15 January 2026.' }, { value: '15 February 2026', unit: null, quote: 'Valid from 15 February 2026.' })).toBe(true);
+    // No stored sentence: strict `sameValue`.
+    expect(factChanged({ value: '2000', unit: 'USD' }, { value: '$2,000 per booking', unit: null, quote: approval })).toBe(true);
+  });
+
   it('counts working days (Mon–Fri)', () => {
     expect(addWorkingDays(new Date('2026-11-06T15:00:00Z'), 5)).toBe('2026-11-13'); // Friday → next Friday
     expect(addWorkingDays(new Date('2026-11-09T09:00:00Z'), 5)).toBe('2026-11-16'); // Monday → next Monday
@@ -576,6 +674,21 @@ describe('change resolvers', () => {
       defaultDeadline: '2026-11-16',
       canDecide: true,
     });
+  });
+
+  it('teams come from the space of each copy page, not from the source space', async () => {
+    // Source in space 7 (PLAT); the copy page is in ACCORD (6979587). pageMeta would say PLAT: the copy space wins.
+    await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(4, '$75', { spaceOf: async () => '6979587' }));
+    const asked: unknown[] = [];
+    const graph = () => async (_q: string, variables: Record<string, unknown>) => {
+      asked.push(variables.spaceAri);
+      const name = String(variables.spaceAri).endsWith('/6979587') ? 'Accord Team' : 'Platform Team';
+      return { body: { data: { atlassianTeamsBySpace: { edges: [{ node: { id: name, displayName: name } }] } } } };
+    };
+    const r = (await getPendingChange(ctx, changeDeps({ graph, pageMeta: async (id) => ({ spaceId: '7', ownerId: `owner-${id}` }) }))) as PendingChangeReply;
+    expect(r.change?.pages.map((p) => p.spaceId)).toEqual(['6979587']);
+    expect(r.change?.spaces).toEqual([{ spaceId: '6979587', teams: [{ id: 'Accord Team', name: 'Accord Team' }], teamSource: 'teamwork_graph' }]);
+    expect(asked).toEqual(['ari:cloud:confluence:cloud-1:space/6979587']);
   });
 
   it('getPendingChange hides pages the viewer cannot open (count only) and reports no teams as "none"', async () => {

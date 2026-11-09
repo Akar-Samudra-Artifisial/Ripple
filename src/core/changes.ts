@@ -68,12 +68,55 @@ export function sameValue(a: Valued, b: Valued): boolean {
   return x.numbers.length > 0 && x.numbers.length === y.numbers.length && sortedKey(x.numbers) === sortedKey(y.numbers) && unitOk && words(x.words) === words(y.words);
 }
 
+/** The same numbers (as a multiset, at least one): "over $2,000" / "2000"; a range or an extra number differs. */
+export function sameNumbers(a: readonly number[], b: readonly number[]): boolean {
+  if (a.length === 0 || a.length !== b.length) return false;
+  const x = [...a].sort((p, q) => p - q);
+  const y = [...b].sort((p, q) => p - q);
+  return x.every((n, i) => n === y[i]);
+}
+
+/** Every word of a value without digits ("economy class") still in the sentence; false when the value has no words. */
+export function valueWordsIn(value: string, quote: string): boolean {
+  const need = words(value);
+  if (need.size === 0) return false;
+  const have = words(quote);
+  return [...need].every((w) => have.has(w));
+}
+
+type Quoted = Valued & { quote?: string | null };
+
+/**
+ * Whether a matched confirmed fact really changed. The model's free-text value is not trusted on its own: a wording
+ * change without another number or unit ("2000" USD → "over $2,000", "economy class" → "economy class for flights
+ * under 6 hours") is no change. No change when the value is the same (`sameValue`), the sentence is the same
+ * (whitespace/punctuation ignored), the sentence states the same numbers and unit, a value without digits still
+ * appears word for word in the new sentence, or the value states the same numbers (unit not written is tolerated).
+ * Dates and facts without a stored sentence keep the strict `sameValue`.
+ */
+export function factChanged(old: Quoted, now: Valued & { quote: string }): boolean {
+  if (sameValue(old, now)) return false;
+  const oldQuote = old.quote ?? '';
+  if (oldQuote.trim() === '') return true;
+  if (sameText(oldQuote, now.quote)) return false;
+  if (parseDate(old.value) !== undefined || parseDate(now.value) !== undefined) return true;
+  if (!/\d/.test(old.value)) return !valueWordsIn(old.value, now.quote);
+  const q0 = normaliseValue(oldQuote);
+  const q1 = normaliseValue(now.quote);
+  if (sameNumbers(q0.numbers, q1.numbers) && q0.unit === q1.unit) return false;
+  const x = normaliseValue(old.value, old.unit);
+  const y = normaliseValue(now.value, now.unit);
+  const unitOk = x.unit === y.unit || x.unit === null || y.unit === null;
+  return !(sameNumbers(x.numbers, y.numbers) && unitOk);
+}
+
 /**
  * Like `planMerge`, except for confirmed facts: a different value or unit (also on a reviewer-edited fact) becomes a
  * `FactChange` and the row is left untouched until the owner confirms; nothing is ever removed.
  */
 export function planDiff(
-  existing: readonly StoredFact[],
+  /** With the stored sentence when known (`factChanged` compares sentences, not only the model's value). */
+  existing: readonly (StoredFact & { quote?: string | null })[],
   extracted: readonly ExtractedFact[],
   version: number,
   versionAt: string | null = null,
@@ -89,11 +132,11 @@ export function planDiff(
     matched.add(u.id);
     const old = byId.get(u.id);
     if (old && u.from === 'confirmed') {
-      if (!sameValue(old, u.fact)) {
+      if (factChanged(old, u.fact)) {
         changes.push({ factId: old.id, oldValue: old.value, oldUnit: old.unit, newValue: u.fact.value, newUnit: u.fact.unit, newQuote: u.fact.quote, version, versionAt });
         continue;
       }
-      // Same value written differently ("$60" / "60 USD"): refresh only, never back to proposed.
+      // Same value written differently ("$60" / "60 USD", reworded value): refresh only, the stored value stays.
       update.push({ ...u, refreshOnly: true, status: 'confirmed', previousValue: null });
       continue;
     }
@@ -103,6 +146,45 @@ export function planDiff(
   changes.sort((a, b) => (a.factId < b.factId ? -1 : a.factId > b.factId ? 1 : 0));
   const removable = new Set(existing.filter((f) => f.status === 'proposed' && !f.edited && !matched.has(f.id)).map((f) => f.id));
   return { merge: { insert: plan.insert, update, remove: remove.filter((id) => removable.has(id)) }, changes, missing: missing.sort() };
+}
+
+/**
+ * A confirmed change that only reworded the value (the rule `factChanged` now applies; the old sentence is not
+ * stored with the change, so the new sentence and both values decide): a value without digits still in the new
+ * sentence, or the same numbers with a compatible unit. Dates never count as wording only.
+ */
+export function wordingOnlyChange(c: Pick<FactChange, 'oldValue' | 'oldUnit' | 'newValue' | 'newUnit' | 'newQuote'>): boolean {
+  if (parseDate(c.oldValue) !== undefined || parseDate(c.newValue) !== undefined) return false;
+  if (!/\d/.test(c.oldValue)) return valueWordsIn(c.oldValue, c.newQuote);
+  const x = normaliseValue(c.oldValue, c.oldUnit);
+  const y = normaliseValue(c.newValue, c.newUnit);
+  return sameNumbers(x.numbers, y.numbers) && (x.unit === y.unit || x.unit === null || y.unit === null);
+}
+
+export interface WordingRevert {
+  changeId: string;
+  change: FactChange;
+  /** Copies the confirmation set to drifted for this fact (only those still drifted for that reason are restored). */
+  copyIds: string[];
+}
+
+/**
+ * Facts whose latest confirmed change (`confirmed` newest first) was wording only: their old value is restored. Only
+ * the latest confirmed change of a fact counts; the change rows and their audit stay.
+ */
+export function wordingOnlyReverts(confirmed: readonly { id: string; factChanges: readonly FactChange[]; impact: ChangeImpact | null }[]): WordingRevert[] {
+  const seen = new Set<string>();
+  const out: WordingRevert[] = [];
+  for (const row of confirmed) {
+    for (const c of row.factChanges) {
+      if (seen.has(c.factId)) continue;
+      seen.add(c.factId);
+      if (!wordingOnlyChange(c)) continue;
+      const copyIds = (row.impact?.copies ?? []).filter((k) => k.factId === c.factId && k.status === 'in_sync').map((k) => k.copyId);
+      out.push({ changeId: row.id, change: c, copyIds });
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------------------------------------------

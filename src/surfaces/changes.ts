@@ -15,7 +15,7 @@ import { displayNames } from '../adapters/confluenceUsers';
 import { sqlRepo, type FactRepo, type PageVersionInfo } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
 import { asUserGraph, fetchPageMeta, ownersFromPage, readSpaceTeams, scrubErrorText, type GraphRequest, type PageMeta } from '../adapters/teamworkGraph';
-import { addWorkingDays, computeImpact, DEFAULT_DEADLINE_DAYS, isRippleVersion, matchFacts, MAX_DEADLINE_DAYS, offeredFacts, planDiff, type KnownFact } from '../core/changes';
+import { addWorkingDays, computeImpact, DEFAULT_DEADLINE_DAYS, isRippleVersion, matchFacts, MAX_DEADLINE_DAYS, offeredFacts, planDiff, wordingOnlyReverts, type KnownFact } from '../core/changes';
 import { parseExtraction } from '../core/facts';
 import { storageToText, TRUNCATED_MARK } from '../core/pageText';
 import { isSqlRateLimited, SchemaSettingUpError } from '../core/schema';
@@ -140,6 +140,25 @@ async function knownFacts(facts: FactRepo, pageId: string): Promise<KnownFact[]>
   });
 }
 
+/**
+ * Undoes confirmations that only reworded a value (detected before `factChanged` existed): the fact gets its old
+ * value back and the copies that confirmation drifted are in sync again. Change rows and their audit stay; the undo
+ * is audited (ids and counts only). Guarded in SQL, so it runs at most once per confirmation.
+ */
+async function revertWordingOnly(pageId: string, deps: DiffDeps): Promise<void> {
+  const reverts = wordingOnlyReverts(await deps.changes.confirmedChanges(pageId));
+  let facts = 0;
+  let copies = 0;
+  for (const r of reverts) {
+    const done = await deps.changes.revertFactChange(pageId, r.change, r.copyIds);
+    if (!done.reverted) continue;
+    facts++;
+    copies += done.copies;
+    await deps.facts.audit('change.fact_reverted', null, 'change', r.changeId, { pageId, factId: r.change.factId, version: r.change.version, copies: done.copies, reason: 'wording only' });
+  }
+  if (facts > 0) console.info('ripple diff: wording-only confirmations undone', { pageId, facts, copies });
+}
+
 export const MAX_DIFF_RETRIES = 4;
 const backoff = (retryCount: number): number => 30 * 2 ** retryCount;
 
@@ -167,6 +186,7 @@ export async function runDiffJob(pageId: string, retryCount: number, deps: DiffD
     const page = await deps.page(pageId);
     if (isRippleVersion(page.versionMessage)) return { status: 'skipped', reason: 'ripple edit' };
     if (source.pageVersion !== null && page.version <= source.pageVersion) return { status: 'skipped', reason: 'version already read' };
+    await revertWordingOnly(pageId, deps);
     const text = storageToText(page.body);
     const info: PageVersionInfo = { title: page.title, spaceId: page.spaceId, version: page.version, versionAt: page.versionCreatedAt, truncated: text.endsWith(TRUNCATED_MARK) };
     const hash = sha256(text);

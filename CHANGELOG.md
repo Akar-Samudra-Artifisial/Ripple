@@ -44,6 +44,13 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Halaman arsip/draft tidak lagi menjadi kandidat salinan. Pengecualian space lewat pengaturan belum ada.
 
 ### Fixed
+- Diff M3 tidak lagi melaporkan perubahan palsu karena wording nilai dari LLM ("2000" USD → "Trips over $2,000", "economy class" → "economy class for flights under 6 hours"):
+  - Fakta confirmed hanya berubah bila token nilai di kalimat kutipan berubah. Tidak dianggap berubah bila kalimatnya sama (whitespace/tanda baca diabaikan), angka dan satuan di kalimat sama, atau angka nilainya sama.
+  - Fakta tanpa angka dibandingkan lewat kalimat. Rentang, angka tambahan, satuan lain, dan tanggal tetap dihitung sebagai perubahan.
+  - Konfirmasi lama yang hanya mengubah wording dipulihkan otomatis pada diff berikutnya:
+    - nilai lama kembali;
+    - salinan yang di-drift oleh konfirmasi itu kembali in sync;
+    - baris change dan audit tetap disimpan, ditambah audit `change.fact_reverted`.
 - Diff M3 tidak lagi bergantung pada wording LLM:
   - Fakta tersimpan (confirmed dan proposed yang bukan duplikat) dikirim ke prompt ekstraksi, dan model mengisi `existing_fact_id`. Id hanya diterima bila ditawarkan untuk source ini dan dipakai sekali.
   - Fallback deterministik: kalimat sama setelah angka diabaikan (Jaccard kata ≥ 0,75; confirmed didahulukan, lalu nilai sama, lalu kemiripan wording), kemudian identity key.

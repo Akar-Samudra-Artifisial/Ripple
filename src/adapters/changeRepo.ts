@@ -68,6 +68,13 @@ export interface ChangeRepo {
   dismissedValues(sourcePageId: string): Promise<Set<string>>;
   /** Remembers the new values of a dismissed change (repeat-safe). */
   saveDismissals(sourcePageId: string, changes: readonly FactChange[]): Promise<void>;
+  /** The most recent confirmed changes of the source, newest decision first. */
+  confirmedChanges(sourcePageId: string): Promise<ChangeRow[]>;
+  /**
+   * Undoes `applyFactChange` (old value and unit back, quote kept): only while the fact still holds the change's new
+   * value with its old value as `previous_value`. Then the given copies drifted by that confirmation are in sync again.
+   */
+  revertFactChange(sourcePageId: string, change: FactChange, copyIds: readonly string[]): Promise<{ reverted: boolean; copies: number }>;
 }
 
 export const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex');
@@ -116,6 +123,10 @@ const placeholders = (n: number): string => Array.from({ length: n }, () => '?')
 
 const DRIFT_REASON = 'The official value changed; this copy states the old value.';
 const SAME_REASON = 'Already states the new official value.';
+/** Same text as the copy scan's in-sync reason (`src/core/copies.ts`). */
+const RESTORED_REASON = 'Same value as the source.';
+/** Confirmed changes read when looking for wording-only confirmations to undo. */
+const CONFIRMED_CHANGES_READ = 20;
 
 export const sqlChangeRepo: ChangeRepo = {
   async claimPageEvent(pageId, version) {
@@ -257,5 +268,36 @@ export const sqlChangeRepo: ChangeRepo = {
     for (const c of changes) {
       await execute('INSERT IGNORE INTO change_dismissals (fact_id, value_hash, source_page_id) VALUES (?, ?, ?)', c.factId, valueHash(c.newValue, c.newUnit), sourcePageId);
     }
+  },
+
+  async confirmedChanges(sourcePageId) {
+    const rows = await query<ChangeDbRow>(
+      `SELECT ${CHANGE_COLUMNS} FROM changes WHERE source_page_id = ? AND status = 'confirmed' ORDER BY decided_at DESC, id DESC LIMIT ${CONFIRMED_CHANGES_READ}`,
+      sourcePageId,
+    );
+    return rows.map(toChange);
+  },
+
+  async revertFactChange(sourcePageId, c, copyIds) {
+    const n = await execute(
+      `UPDATE facts SET value = ?, unit = ?, previous_value = NULL
+       WHERE id = ? AND source_page_id = ? AND status = 'confirmed' AND value = ? AND previous_value = ?`,
+      c.oldValue,
+      c.oldUnit,
+      c.factId,
+      sourcePageId,
+      c.newValue,
+      c.oldValue,
+    );
+    if (n === 0 || copyIds.length === 0) return { reverted: n > 0, copies: 0 };
+    // Only copies still drifted for the reason the confirmation gave (a rescan may have re-judged them meanwhile).
+    const copies = await execute(
+      `UPDATE copies SET status = 'in_sync', reason = ? WHERE status = 'drifted' AND reason = ? AND fact_id = ? AND id IN (${placeholders(copyIds.length)})`,
+      RESTORED_REASON,
+      DRIFT_REASON,
+      c.factId,
+      ...copyIds,
+    );
+    return { reverted: true, copies };
   },
 };
