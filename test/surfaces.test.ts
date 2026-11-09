@@ -50,14 +50,21 @@ describe('migrations', () => {
       'v007_create_scan_jobs',
       'v008_create_scan_hits',
       'v009_create_copies',
+      'v010_scan_jobs_fact_ids',
+      'v011_scan_jobs_llm_calls',
+      'v012_scan_jobs_partial',
+      'v013_scan_jobs_pages_skipped',
+      'v014_scan_jobs_active_source',
+      'v015_scan_jobs_active_unique',
+      'v016_create_scan_chunks',
     ]);
-    expect(LATEST_MIGRATION).toBe('v009_create_copies');
+    expect(LATEST_MIGRATION).toBe('v016_create_scan_chunks');
   });
 });
 
 describe('schemaView', () => {
   it('reports ready, setting up and errors', async () => {
-    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 9, total: 9, latest: LATEST_MIGRATION });
+    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 16, total: 16, latest: LATEST_MIGRATION });
     expect(
       await schemaView(async () => {
         throw new SchemaSettingUpError(1, 4);

@@ -2,16 +2,18 @@
  * M2: copies of a source's facts on other pages (FR-4..6).
  *
  * Resolvers (`startScan`, `getScanStatus`, `listCopies`) only touch SQL and the queue. The `search` consumer runs
- * CQL per confirmed fact as the app (a consumer has no user) and stores up to 200 candidate pages per fact; the
- * `judge` consumer reads candidate pages as the app in small batches, sends only the chunks that mention a fact to
- * the LLM and stores one status per fact and page. Both resume from the last finished batch (cursor / pending hits
- * in Forge SQL) when re-queued, retried or resumed by `startScan`. Because the app sees more than a given user,
- * `listCopies` shows only pages the viewer can open (CQL as the user) and counts the rest.
+ * CQL per confirmed fact (ids fixed when the scan starts) as the app (a consumer has no user) and stores up to 200
+ * candidate pages per fact; the `judge` consumer reads candidate pages as the app in small batches, sends only the
+ * chunks that mention a fact to the LLM (a few at a time, capped per scan) and stores one status per fact and page.
+ * Both resume from the last finished batch (cursor / pending hits / saved chunk results in Forge SQL) when re-queued,
+ * retried or resumed by `startScan`. Because the app sees more than a given user, the resolvers list and count by
+ * status only copies on pages the viewer can open (CQL as the user); the rest is one total (NFR-3).
  */
+import { createHash } from 'node:crypto';
 import { Queue } from '@forge/events';
 import { canEditPage, ConfluenceRetryableError, getSourcePage, PageNotFoundError, searchPagesAsApp, visiblePageIds, type SearchHit, type SourcePage } from '../adapters/confluence';
 import { sqlRepo, type FactRepo } from '../adapters/repo';
-import { EMPTY_COPY_COUNTS, sqlScanRepo, type CopyInput, type PendingPage, type ScanRepo, type ScanRow } from '../adapters/scanRepo';
+import { EMPTY_COPY_COUNTS, sqlScanRepo, type ChunkResult, type CopyInput, type PendingPage, type ScanRepo, type ScanRow } from '../adapters/scanRepo';
 import { ensureSchema } from '../adapters/sql';
 import { scrubErrorText } from '../adapters/teamworkGraph';
 import {
@@ -25,12 +27,13 @@ import {
   parseTermSuggestions,
   siblingsOf,
   strongest,
+  type Chunk,
   type ScanFact,
 } from '../core/copies';
 import { storageToText } from '../core/pageText';
 import { isSqlRateLimited, SchemaSettingUpError } from '../core/schema';
 import { COPY_STATUSES, type CopyList, type CopyListPayload, type CopyStatus, type ErrorReply, type ScanStatus, type ScanView } from '../core/views';
-import { isLlmRateLimited, LlmOutputError } from '../llm';
+import { isLlmApiError, isLlmRateLimited, isLlmRetryable, LlmOutputError } from '../llm';
 import type { ChatToolFn } from '../llm/extract';
 import { judgeChunk, suggestSearchTerms } from '../llm/judge';
 import type { SourceContext } from './sources';
@@ -41,9 +44,13 @@ export type ScanQueue = typeof SEARCH_QUEUE | typeof JUDGE_QUEUE;
 
 /** Candidate pages read per `pendingPages` call in the judge consumer. */
 export const PAGES_PER_BATCH = 5;
+/** Judge calls in flight at once for one page (keeps a burst of chunks below the LLM rate limit). */
+export const JUDGE_CONCURRENCY = 2;
+/** LLM calls per scan (synonyms + judge), across all runs. When reached the scan ends as `partial`. */
+export const MAX_LLM_CALLS_PER_SCAN = 300;
 /** Work per consumer run before it re-queues itself (the consumer timeout is 900 s). */
 export const RUN_BUDGET_MS = 10 * 60 * 1000;
-/** Queue retries for transient failures (LLM/SQL rate limit, Confluence 429/5xx) before the scan is marked failed. */
+/** Queue retries for transient failures (LLM 429/5xx, SQL rate limit, Confluence 429/5xx) before the scan fails. */
 export const MAX_RETRIES = 4;
 const backoff = (retryCount: number): number => 30 * 2 ** retryCount;
 
@@ -58,7 +65,7 @@ async function pushScan(queue: ScanQueue, scanId: string): Promise<string> {
 const errorText = (err: unknown): string => scrubErrorText(err instanceof Error ? err.message : String(err));
 const NOT_ALLOWED = 'You need edit permission on this page to do that.';
 
-/** Confirmed facts of the source, in a stable order (the search cursor indexes into it). */
+/** Confirmed facts of the source, in a stable order (by id). */
 async function scanFactsOf(facts: FactRepo, sourcePageId: string): Promise<ScanFact[]> {
   return (await facts.listFacts(sourcePageId))
     .filter((f) => f.status === 'confirmed')
@@ -74,6 +81,8 @@ const scanView = (s: ScanRow): ScanView => ({
   factsSearched: s.factsSearched,
   candidates: s.candidates,
   pagesJudged: s.pagesJudged,
+  pagesSkipped: s.pagesSkipped ?? 0,
+  partial: s.partial ?? false,
   startedAt: s.startedAt,
   finishedAt: s.finishedAt,
   error: s.error,
@@ -113,19 +122,31 @@ async function guarded<T>(ctx: SourceContext, deps: CopyDeps, what: string, body
   }
 }
 
-async function scanStatusOf(pageId: string, canEdit: boolean, deps: CopyDeps): Promise<ScanStatus> {
-  const scan = await deps.scans.latestScan(pageId);
-  return { pageId, canEdit, scan: scan ? scanView(scan) : null, counts: scan ? await deps.scans.countCopies(pageId) : { ...EMPTY_COPY_COUNTS } };
+/** Pages holding copies of the source, split by whether the viewer may open them (NFR-3). */
+async function copyPagesFor(sourcePageId: string, deps: CopyDeps): Promise<{ visible: string[]; hidden: string[] }> {
+  const all = await deps.scans.copyPageIds(sourcePageId);
+  if (all.length === 0) return { visible: [], hidden: [] };
+  const seen = await deps.visible(all);
+  return { visible: all.filter((id) => seen.has(id)), hidden: all.filter((id) => !seen.has(id)) };
 }
 
-/** Polled by the Copies tab while a scan runs. Counts include copies on pages the viewer cannot open. */
+/** Status counts cover only copies on pages the viewer may open; restricted ones are never broken down by status. */
+async function scanStatusOf(pageId: string, canEdit: boolean, deps: CopyDeps): Promise<ScanStatus> {
+  const scan = await deps.scans.latestScan(pageId);
+  if (!scan) return { pageId, canEdit, scan: null, counts: { ...EMPTY_COPY_COUNTS } };
+  const { visible } = await copyPagesFor(pageId, deps);
+  return { pageId, canEdit, scan: scanView(scan), counts: await deps.scans.countCopies(pageId, visible) };
+}
+
+/** Polled by the Copies tab while a scan runs. */
 export async function getScanStatus(ctx: SourceContext, deps: CopyDeps = defaultDeps): Promise<ScanStatus | ErrorReply> {
   return guarded(ctx, deps, 'load the scan status', async (pageId) => scanStatusOf(pageId, await deps.canEdit(pageId), deps));
 }
 
 /**
  * FR-4: start a copy scan of the viewed source page (edit permission, source ready, at least one confirmed fact).
- * A running scan is returned as is; a stalled one (no progress for 15 minutes) is resumed from its last batch.
+ * A running scan is returned as is (also when another request created it a moment ago: one running scan per source
+ * is enforced by a unique key); a stalled one (no progress for 15 minutes) is resumed from its last batch.
  */
 export async function startScan(ctx: SourceContext, deps: CopyDeps = defaultDeps): Promise<ScanStatus | ErrorReply> {
   return guarded(ctx, deps, 'start the copy search', async (pageId) => {
@@ -146,7 +167,12 @@ export async function startScan(ctx: SourceContext, deps: CopyDeps = defaultDeps
       return scanStatusOf(pageId, true, deps);
     }
 
-    const scanId = await deps.scans.createScan(pageId, facts.length, ctx.accountId);
+    const scanId = await deps.scans.createScan(
+      pageId,
+      facts.map((f) => f.id),
+      ctx.accountId,
+    );
+    if (!scanId) return scanStatusOf(pageId, true, deps); // a concurrent click created it
     let jobId: string;
     try {
       jobId = await deps.push(SEARCH_QUEUE, scanId);
@@ -162,16 +188,24 @@ export async function startScan(ctx: SourceContext, deps: CopyDeps = defaultDeps
   });
 }
 
-/** FR-6: copies of the viewed source's facts, on pages the viewer may open (NFR-3); the rest only as a count. */
+/**
+ * FR-6: copies of the viewed source's facts on pages the viewer may open (NFR-3). The visibility filter runs before
+ * the row limit, so the list and the counts agree; copies on other pages are one total (`hiddenCount`, allowed by
+ * NFR-3: "sisanya ditampilkan sebagai jumlah") for the same status filter.
+ */
 export async function listCopies(ctx: SourceContext, payload: Partial<CopyListPayload> | undefined, deps: CopyDeps = defaultDeps): Promise<CopyList | ErrorReply> {
   const raw = payload?.status;
   if (raw !== undefined && !COPY_STATUSES.includes(raw as CopyStatus)) return { error: 'Unknown copy status filter.' };
   const status = raw as CopyStatus | undefined;
   return guarded(ctx, deps, 'load the copies', async (pageId) => {
-    const all = await deps.scans.listCopies(pageId, status);
-    const visible = all.length > 0 ? await deps.visible(all.map((c) => c.pageId)) : new Set<string>();
-    const copies = all.filter((c) => visible.has(c.pageId));
-    return { pageId, copies, hiddenCount: all.length - copies.length };
+    const { visible, hidden } = await copyPagesFor(pageId, deps);
+    const copies = await deps.scans.listCopies(pageId, status, visible);
+    let hiddenCount = 0;
+    if (hidden.length > 0) {
+      const counts = await deps.scans.countCopies(pageId, hidden);
+      hiddenCount = status ? counts[status] : COPY_STATUSES.filter((s) => s !== 'historical').reduce((n, s) => n + counts[s], 0);
+    }
+    return { pageId, copies, hiddenCount };
   });
 }
 
@@ -210,10 +244,11 @@ export type ScanOutcome =
 async function failOrRetry(what: string, scanId: string, retryCount: number, err: unknown, deps: ScanJobDeps): Promise<ScanOutcome> {
   if (retryCount < MAX_RETRIES) {
     if (isLlmRateLimited(err)) return { status: 'retry', seconds: backoff(retryCount), reason: 'llm-rate-limited' };
+    if (isLlmRetryable(err)) return { status: 'retry', seconds: backoff(retryCount), reason: 'llm-unavailable' };
     if (err instanceof ConfluenceRetryableError) return { status: 'retry', seconds: backoff(retryCount), reason: `confluence-http-${err.status}` };
     if (isSqlRateLimited(err)) return { status: 'retry', seconds: 60, reason: 'sql-rate-limited' };
   }
-  const error = isLlmRateLimited(err)
+  const error = isLlmRetryable(err)
     ? 'The model is busy; start the search again later.'
     : err instanceof ConfluenceRetryableError
       ? `Confluence did not answer (HTTP ${err.status}); start the search again later.`
@@ -241,21 +276,29 @@ const isScan = (x: ScanRow | { status: string }): x is ScanRow => 'sourcePageId'
 const asOutcome = (x: { status: 'skipped' | 'retry'; reason: string; seconds?: number }): ScanOutcome =>
   x.status === 'retry' ? { status: 'retry', seconds: x.seconds ?? 60, reason: x.reason } : { status: 'skipped', reason: x.reason };
 
+/** The source was unmarked while the scan ran: nothing of it may stay behind. */
+async function discardUnmarked(scan: ScanRow, deps: ScanJobDeps): Promise<ScanOutcome> {
+  await deps.scans.discardScan(scan.id, scan.sourcePageId);
+  console.info('ripple scan discarded: source unmarked', { scanId: scan.id });
+  return { status: 'skipped', reason: 'source unmarked' };
+}
+
 /** Search phrases per fact from the LLM (once per scan). A failed suggestion only means fewer terms. */
 async function termsFor(facts: readonly ScanFact[], deps: ScanJobDeps): Promise<Record<string, string[]>> {
   try {
     const { args } = await suggestSearchTerms(facts, deps.llm);
     return parseTermSuggestions(args, facts.map((f) => f.id));
   } catch (err) {
-    if (isLlmRateLimited(err)) throw err;
+    if (isLlmRetryable(err)) throw err;
     console.warn('ripple search: no synonym terms', { error: errorText(err) });
     return {};
   }
 }
 
 /**
- * `search` consumer: CQL per confirmed fact from the scan's cursor, at most 200 candidate pages per fact (the source
- * page itself excluded). Re-queues itself when the run budget is used up; then queues the judge.
+ * `search` consumer: CQL per fact of the scan (ids fixed when it started; facts no longer confirmed are skipped) from
+ * the cursor, at most 200 candidate pages per fact (the source page itself excluded). Re-queues itself when the run
+ * budget is used up; then queues the judge.
  */
 export async function runSearchJob(scanId: string, retryCount: number, deps: ScanJobDeps = defaultJobDeps, budgetMs = RUN_BUDGET_MS): Promise<ScanOutcome> {
   const opened = await openScan(scanId, 'searching', deps);
@@ -263,57 +306,109 @@ export async function runSearchJob(scanId: string, retryCount: number, deps: Sca
   const scan = opened;
   const deadline = deps.now() + budgetMs;
   try {
-    if (!(await deps.facts.getSource(scan.sourcePageId))) {
-      await deps.scans.failScan(scanId, 'The page is no longer a source of truth.');
-      return { status: 'failed', error: 'source unmarked' };
-    }
-    const facts = await scanFactsOf(deps.facts, scan.sourcePageId);
+    if (!(await deps.facts.getSource(scan.sourcePageId))) return await discardUnmarked(scan, deps);
+    const current = await scanFactsOf(deps.facts, scan.sourcePageId);
+    const byId = new Map(current.map((f) => [f.id, f]));
+    const ids = scan.factIds ?? current.map((f) => f.id);
+    const facts = ids.map((id) => byId.get(id)).filter((f): f is ScanFact => f !== undefined);
     if (facts.length === 0) {
       await deps.scans.failScan(scanId, 'No confirmed facts to search for.');
       return { status: 'failed', error: 'no confirmed facts' };
     }
     let terms = scan.terms;
     if (!terms) {
-      terms = await termsFor(facts, deps);
+      try {
+        terms = await termsFor(facts, deps);
+      } finally {
+        await deps.scans.addLlmCalls(scanId, 1);
+      }
       await deps.scans.setTerms(scanId, terms);
     }
     let searched = 0;
-    for (let i = scan.factCursor; i < facts.length; i++) {
+    for (let i = scan.factCursor; i < ids.length; i++) {
       if (deps.now() > deadline) {
         await deps.push(SEARCH_QUEUE, scanId);
         return { status: 'continued', detail: { searched, cursor: i } };
       }
-      const fact = facts[i] as ScanFact;
-      const cql = buildCql(scan.sourcePageId, factTerms(fact, terms[fact.id] ?? []));
-      const hits = (await deps.search(cql, MAX_CANDIDATES_PER_FACT)).filter((h) => h.pageId !== scan.sourcePageId).slice(0, MAX_CANDIDATES_PER_FACT);
-      await deps.scans.addHits(scanId, hits.map((h) => ({ factId: fact.id, ...h })));
+      const fact = byId.get(ids[i] as string);
+      if (fact) {
+        const cql = buildCql(scan.sourcePageId, factTerms(fact, terms[fact.id] ?? []));
+        const hits = (await deps.search(cql, MAX_CANDIDATES_PER_FACT)).filter((h) => h.pageId !== scan.sourcePageId).slice(0, MAX_CANDIDATES_PER_FACT);
+        await deps.scans.addHits(scanId, hits.map((h) => ({ factId: fact.id, ...h })));
+        searched++;
+        console.info('ripple search fact', { scanId, fact: i + 1, of: ids.length, hits: hits.length });
+      }
       await deps.scans.advanceSearch(scanId, i + 1);
-      searched++;
-      console.info('ripple search fact', { scanId, fact: i + 1, of: facts.length, hits: hits.length });
     }
     await deps.scans.startJudging(scanId);
     await deps.push(JUDGE_QUEUE, scanId);
-    return { status: 'done', detail: { searched, facts: facts.length } };
+    return { status: 'done', detail: { searched, facts: ids.length } };
   } catch (err) {
     return failOrRetry('search', scanId, retryCount, err, deps);
   }
 }
 
-/** Judges one candidate page: chunks that mention its facts → LLM → verified quotes → one status per fact. */
-async function judgePage(scan: ScanRow, page: PendingPage, facts: readonly ScanFact[], deps: ScanJobDeps): Promise<{ copies: number; dropped: number }> {
+/** Stable key of a chunk (its text and facts), so a saved result is reused only for the same input. */
+const chunkKey = (chunk: Chunk): string => createHash('sha256').update(`${chunk.factIds.join(',')}\n${chunk.text}`).digest('hex');
+
+/** Runs `fn` over `items`, at most `limit` at a time. Stops taking new items after a failure, waits for the rest. */
+async function forEachLimit<T>(items: readonly T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  let failed = false;
+  const worker = async () => {
+    while (!failed && next < items.length) {
+      const item = items[next++] as T;
+      try {
+        await fn(item);
+      } catch (err) {
+        failed = true;
+        throw err;
+      }
+    }
+  };
+  const settled = await Promise.allSettled(Array.from({ length: Math.min(limit, items.length) }, worker));
+  const rejected = settled.find((s): s is PromiseRejectedResult => s.status === 'rejected');
+  if (rejected) throw rejected.reason;
+}
+
+const isUnusableAnswer = (err: unknown): boolean => err instanceof LlmOutputError || (err instanceof Error && err.message.startsWith('judge output'));
+
+type PageResult = { kind: 'done'; copies: number; dropped: number } | { kind: 'skipped' } | { kind: 'capped' } | { kind: 'gone' };
+
+/** LLM calls of the scan so far (shared by the pages of one run). */
+interface LlmBudget {
+  used: number;
+}
+
+/** Writes the copies of a page, unless the source was unmarked meanwhile (then the caller discards the scan). */
+async function savePage(scan: ScanRow, pageId: string, copies: readonly CopyInput[], dropped: number, deps: ScanJobDeps): Promise<PageResult> {
+  if (!(await deps.facts.getSource(scan.sourcePageId))) return { kind: 'gone' };
+  await deps.scans.finishPage(scan.id, scan.sourcePageId, pageId, copies);
+  return { kind: 'done', copies: copies.length, dropped };
+}
+
+async function skipPage(scan: ScanRow, pageId: string, why: string, deps: ScanJobDeps): Promise<PageResult> {
+  console.warn('ripple judge: page skipped', { scanId: scan.id, pageId, error: why });
+  await deps.scans.skipPage(scan.id, pageId);
+  return { kind: 'skipped' };
+}
+
+/**
+ * Judges one candidate page: chunks that mention its facts → LLM (results saved per chunk, so a retry continues with
+ * the chunks not judged yet) → verified quotes → one status per fact. A page the app cannot read (e.g. 403) or the
+ * model refuses (non-retryable LLM error) is skipped, not the whole scan.
+ */
+async function judgePage(scan: ScanRow, page: PendingPage, facts: readonly ScanFact[], budget: LlmBudget, deps: ScanJobDeps): Promise<PageResult> {
   const byId = new Map(facts.map((f) => [f.id, f]));
   const pageFacts = page.factIds.map((id) => byId.get(id)).filter((f): f is ScanFact => f !== undefined);
-  if (pageFacts.length === 0 || page.pageId === scan.sourcePageId) {
-    await deps.scans.finishPage(scan.id, scan.sourcePageId, page.pageId, []);
-    return { copies: 0, dropped: 0 };
-  }
+  if (pageFacts.length === 0 || page.pageId === scan.sourcePageId) return savePage(scan, page.pageId, [], 0, deps);
   let copyPage: SourcePage;
   try {
     copyPage = await deps.page(page.pageId);
   } catch (err) {
-    if (!(err instanceof PageNotFoundError)) throw err;
-    await deps.scans.finishPage(scan.id, scan.sourcePageId, page.pageId, []);
-    return { copies: 0, dropped: 0 };
+    if (err instanceof PageNotFoundError) return savePage(scan, page.pageId, [], 0, deps);
+    if (err instanceof ConfluenceRetryableError || isSqlRateLimited(err)) throw err;
+    return skipPage(scan, page.pageId, errorText(err), deps);
   }
   const text = storageToText(copyPage.body, MAX_COPY_PAGE_CHARS);
   const terms = scan.terms ?? {};
@@ -322,28 +417,63 @@ async function judgePage(scan: ScanRow, page: PendingPage, facts: readonly ScanF
     pageFacts.map((f) => ({ id: f.id, terms: factTerms(f, terms[f.id] ?? []) })),
   );
   const title = copyPage.title || page.title;
-  let dropped = 0;
-  const found = new Map<string, CopyInput[]>();
-  const results = await Promise.all(
-    chunks.map(async (chunk) => {
+  const saved = await deps.scans.chunkResults(scan.id, page.pageId);
+  const results: ChunkResult[] = [];
+  const todo: { chunk: Chunk; key: string }[] = [];
+  for (const chunk of chunks) {
+    const key = chunkKey(chunk);
+    const done = saved.get(key);
+    if (done) results.push(done);
+    else todo.push({ chunk, key });
+  }
+
+  let capped = false;
+  let refused: string | undefined;
+  let calls = 0;
+  try {
+    await forEachLimit(todo, JUDGE_CONCURRENCY, async ({ chunk, key }) => {
+      if (capped || refused !== undefined) return;
+      if (budget.used >= MAX_LLM_CALLS_PER_SCAN) {
+        capped = true;
+        return;
+      }
+      budget.used++;
+      calls++;
       const chunkFacts = chunk.factIds.map((id) => byId.get(id)).filter((f): f is ScanFact => f !== undefined);
+      let result: ChunkResult;
       try {
         const { args } = await judgeChunk(chunkFacts, chunk.text, title, deps.llm);
-        return { chunkFacts, parsed: parseJudgement(args, chunk.text, chunkFacts.map((f) => f.id)) };
+        const parsed = parseJudgement(
+          args,
+          chunk.text,
+          chunkFacts.map((f) => f.id),
+        );
+        result = { judgements: parsed.judgements, dropped: parsed.dropped.length };
       } catch (err) {
-        if (isLlmRateLimited(err) || err instanceof ConfluenceRetryableError) throw err;
-        // An unusable answer for one chunk loses that chunk only.
-        if (!(err instanceof LlmOutputError) && !(err instanceof Error && err.message.startsWith('judge output'))) throw err;
-        console.warn('ripple judge: unusable answer for a chunk', { scanId: scan.id, pageId: page.pageId, line: chunk.firstLine, error: errorText(err) });
-        dropped++;
-        return undefined;
+        if (isLlmRetryable(err)) throw err;
+        if (isUnusableAnswer(err)) {
+          // An unusable answer for one chunk loses that chunk only.
+          console.warn('ripple judge: unusable answer for a chunk', { scanId: scan.id, pageId: page.pageId, line: chunk.firstLine, error: errorText(err) });
+          result = { judgements: [], dropped: 1 };
+        } else if (isLlmApiError(err)) {
+          refused = errorText(err);
+          return;
+        } else throw err;
       }
-    }),
-  );
+      await deps.scans.saveChunkResult(scan.id, page.pageId, key, result);
+      results.push(result);
+    });
+  } finally {
+    if (calls > 0) await deps.scans.addLlmCalls(scan.id, calls);
+  }
+  if (refused !== undefined) return skipPage(scan, page.pageId, refused, deps);
+  if (capped) return { kind: 'capped' };
+
+  let dropped = 0;
+  const found = new Map<string, CopyInput[]>();
   for (const r of results) {
-    if (!r) continue;
-    dropped += r.parsed.dropped.length;
-    for (const j of r.parsed.judgements) {
+    dropped += r.dropped;
+    for (const j of r.judgements) {
       const fact = byId.get(j.factId);
       if (!fact) continue;
       const decision = decideStatus(fact, j, siblingsOf(fact, facts));
@@ -367,49 +497,57 @@ async function judgePage(scan: ScanRow, page: PendingPage, facts: readonly ScanF
     }
   }
   const copies = [...found.values()].map((list) => strongest(list)).filter((c): c is CopyInput => c !== undefined);
-  await deps.scans.finishPage(scan.id, scan.sourcePageId, page.pageId, copies);
-  return { copies: copies.length, dropped };
+  return savePage(scan, page.pageId, copies, dropped, deps);
 }
 
 /**
- * `judge` consumer: judges pending candidate pages in batches of 5 until none are left (then finishes the scan) or the
- * run budget is used up (then re-queues itself). A page is marked done only after its copies are saved, so a retry
- * or resume continues with the first unfinished page.
+ * `judge` consumer: judges pending candidate pages in batches of 5 until none are left (then finishes the scan), the
+ * run budget is used up (then re-queues itself) or the per-scan LLM call cap is reached (then finishes the scan as
+ * partial). A page is marked done only after its copies are saved, so a retry or resume continues with the first
+ * unfinished page (and its saved chunk results).
  */
 export async function runJudgeJob(scanId: string, retryCount: number, deps: ScanJobDeps = defaultJobDeps, budgetMs = RUN_BUDGET_MS): Promise<ScanOutcome> {
   const opened = await openScan(scanId, 'judging', deps);
   if (!isScan(opened)) return asOutcome(opened);
   const scan = opened;
   const deadline = deps.now() + budgetMs;
+  const budget: LlmBudget = { used: scan.llmCalls };
   let pages = 0;
   let copies = 0;
   let dropped = 0;
+  let skipped = 0;
+  let partial = false;
   try {
-    if (!(await deps.facts.getSource(scan.sourcePageId))) {
-      await deps.scans.failScan(scanId, 'The page is no longer a source of truth.');
-      return { status: 'failed', error: 'source unmarked' };
-    }
+    if (!(await deps.facts.getSource(scan.sourcePageId))) return await discardUnmarked(scan, deps);
     const facts = await scanFactsOf(deps.facts, scan.sourcePageId);
-    for (;;) {
+    judging: for (;;) {
       const batch = await deps.scans.pendingPages(scanId, PAGES_PER_BATCH);
       if (batch.length === 0) break;
       for (const page of batch) {
         if (deps.now() > deadline) {
           await deps.push(JUDGE_QUEUE, scanId);
-          console.info('ripple judge continued', { scanId, pages, copies, dropped });
-          return { status: 'continued', detail: { pages, copies, dropped } };
+          console.info('ripple judge continued', { scanId, pages, copies, dropped, skipped });
+          return { status: 'continued', detail: { pages, copies, dropped, skipped } };
         }
-        const r = await judgePage(scan, page, facts, deps);
+        const r = await judgePage(scan, page, facts, budget, deps);
+        if (r.kind === 'gone') return await discardUnmarked(scan, deps);
+        if (r.kind === 'capped') {
+          partial = true;
+          break judging;
+        }
         pages++;
-        copies += r.copies;
-        dropped += r.dropped;
+        if (r.kind === 'skipped') skipped++;
+        else {
+          copies += r.copies;
+          dropped += r.dropped;
+        }
       }
     }
-    await deps.scans.finishScan(scanId, scan.sourcePageId);
+    await deps.scans.finishScan(scanId, scan.sourcePageId, partial);
     const counts = await deps.scans.countCopies(scan.sourcePageId);
-    console.info('ripple scan done', { scanId, pages, copies, dropped, ...counts });
-    await deps.facts.audit('scan.finished', null, 'page', scan.sourcePageId, { scanId, ...counts });
-    return { status: 'done', detail: { pages, copies, dropped } };
+    console.info('ripple scan done', { scanId, pages, copies, dropped, skipped, partial, llmCalls: budget.used, ...counts });
+    await deps.facts.audit('scan.finished', null, 'page', scan.sourcePageId, { scanId, partial, skipped, ...counts });
+    return { status: 'done', detail: { pages, copies, dropped, skipped, partial: partial ? 1 : 0 } };
   } catch (err) {
     return failOrRetry('judge', scanId, retryCount, err, deps);
   }

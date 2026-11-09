@@ -138,6 +138,27 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
       KEY idx_copies_source_status (source_page_id, status)
     )`,
   },
+  // Fact ids of a scan, fixed when it starts (the search cursor indexes into this list, not the live facts).
+  { name: 'v010_scan_jobs_fact_ids', statement: 'ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS fact_ids JSON NULL' },
+  // LLM calls used by a scan (capped per scan) and whether the cap stopped it early.
+  { name: 'v011_scan_jobs_llm_calls', statement: 'ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS llm_calls INT NOT NULL DEFAULT 0' },
+  { name: 'v012_scan_jobs_partial', statement: 'ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS partial TINYINT(1) NOT NULL DEFAULT 0' },
+  // Candidate pages skipped because they could not be read or judged (403, unusable model answer).
+  { name: 'v013_scan_jobs_pages_skipped', statement: 'ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS pages_skipped INT NOT NULL DEFAULT 0' },
+  // Source page id while the scan runs, NULL once finished: the unique index allows one running scan per source.
+  { name: 'v014_scan_jobs_active_source', statement: 'ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS active_source VARCHAR(32) NULL' },
+  { name: 'v015_scan_jobs_active_unique', statement: 'ALTER TABLE scan_jobs ADD UNIQUE INDEX IF NOT EXISTS uq_scan_jobs_active (active_source)' },
+  // Judge result per chunk of a candidate page, so a retry continues with the chunks not judged yet.
+  {
+    name: 'v016_create_scan_chunks',
+    statement: `CREATE TABLE IF NOT EXISTS scan_chunks (
+      scan_id VARCHAR(36) NOT NULL,
+      page_id VARCHAR(32) NOT NULL,
+      chunk_hash VARCHAR(64) NOT NULL,
+      result JSON NOT NULL,
+      PRIMARY KEY (scan_id, page_id, chunk_hash)
+    )`,
+  },
 ];
 
 /** Name of the newest migration; the byline reports it so admins can confirm the schema is current. */

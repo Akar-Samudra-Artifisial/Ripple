@@ -40,15 +40,19 @@ const STOPWORDS = new Set(
   ),
 );
 
-/** Letters, digits, spaces and `$ % . , -` only, so a term can never break out of a CQL string. */
+/**
+ * Letters, digits, spaces and `$ % . , -` only, so a term can never break out of a CQL string. A term without any
+ * letter or digit ("--", "$ %") is empty: it would match everything or break the CQL parser.
+ */
 export function cleanTerm(term: string): string {
-  return term
+  const clean = term
     .normalize('NFKC')
     .replace(/[^\p{L}\p{N}$%., -]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, MAX_TERM_CHARS)
     .trim();
+  return /[\p{L}\p{N}]/u.test(clean) ? clean : '';
 }
 
 export interface FactTerms {
@@ -249,7 +253,11 @@ export interface NormalisedValue {
   words: string[];
 }
 
-const canonicalUnit = (text: string): string | null => UNIT_PATTERNS.find(([re]) => re.test(text))?.[1] ?? null;
+/** Canonical unit of `text`; "per day" / "per trip" is a rate, not the unit ("$60 per day" → USD, "60 per day" → none). */
+const canonicalUnit = (text: string): string | null => {
+  const withoutRate = text.replace(/\bper\s+(?!cent\b)\p{L}+/giu, ' ');
+  return UNIT_PATTERNS.find(([re]) => re.test(withoutRate))?.[1] ?? null;
+};
 
 /**
  * "$60", "60 USD", "USD 60", "sixty dollars" → { numbers: [60], unit: 'USD' }; "1.000" and "1,000" → 1000;
@@ -272,19 +280,72 @@ export function normaliseValue(value: string, unit: string | null = null): Norma
 
 export type ValueComparison = 'same' | 'different' | 'unknown';
 
+const MONTHS: Record<string, number> = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, mei: 5, jun: 6, jul: 7, aug: 8, agu: 8, sep: 9, oct: 10, okt: 10, nov: 11, dec: 12, des: 12,
+};
+
+const isoDate = (y: number, m: number, d: number): string | undefined =>
+  m >= 1 && m <= 12 && d >= 1 && d <= 31 ? `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}` : undefined;
+
 /**
- * Compares a stated value with the official one after normalisation. Numbers: same set of numbers, and units equal
- * when both are known. Text: same words, or one contains the other ("economy" ≈ "economy class"). `unknown` when
- * the stated value cannot be parsed the same way (the PRD drops such candidates).
+ * Simple date parsing: "2026-01-15", "15/01/2026", "15.01.2026", "January 15, 2026", "15 Jan 2026" → "2026-01-15".
+ * `ambiguous` for "03/04/2026" (day/month order unknown); undefined when the text has no full date.
+ */
+export function parseDate(text: string): string | 'ambiguous' | undefined {
+  const t = text.toLowerCase();
+  let m = /\b(\d{4})-(\d{1,2})-(\d{1,2})\b/.exec(t);
+  if (m) return isoDate(Number(m[1]), Number(m[2]), Number(m[3]));
+  m = /\b(\d{1,2})[/.](\d{1,2})[/.](\d{4})\b/.exec(t);
+  if (m) {
+    const a = Number(m[1]);
+    const b = Number(m[2]);
+    const y = Number(m[3]);
+    if (a > 12) return isoDate(y, b, a);
+    if (b > 12 || a === b) return isoDate(y, a, b);
+    return 'ambiguous';
+  }
+  m = /\b(\d{1,2})(?:st|nd|rd|th)?\s+(\p{L}{3,})\.?,?\s+(\d{4})\b/u.exec(t);
+  const dayFirst = m && MONTHS[m[2]?.slice(0, 3) ?? ''];
+  if (m && dayFirst) return isoDate(Number(m[3]), dayFirst, Number(m[1]));
+  m = /\b(\p{L}{3,})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b/u.exec(t);
+  const monthFirst = m && MONTHS[m[1]?.slice(0, 3) ?? ''];
+  if (m && monthFirst) return isoDate(Number(m[3]), monthFirst, Number(m[2]));
+  return undefined;
+}
+
+/** Factor to turn a number in `from` into `to`; only cheap, exact conversions (weeks ↔ days). */
+const UNIT_FACTORS: Record<string, number> = { 'weeks>days': 7, 'days>weeks': 1 / 7 };
+
+/**
+ * Compares a stated value with the official one after normalisation.
+ * - Dates: both must parse to the same day; a date that cannot be parsed (or is ambiguous) → `unknown`.
+ * - Numbers: `same` when every official number is among the stated ones ("$60 per day (max 3 days)"); `different`
+ *   only when the stated value has no extra numbers; otherwise `unknown`. Different units are converted when cheap
+ *   (2 weeks = 14 days); other unit mismatches (USD vs EUR) → `unknown`.
+ * - Text: same words, or one contains the other ("economy" ≈ "economy class").
+ * `unknown` = cannot be compared reliably; the PRD drops such candidates.
  */
 export function compareValues(official: { value: string; unit: string | null }, stated: { value: string; unit: string | null }): ValueComparison {
+  const od = parseDate(official.value);
+  const sd = parseDate(stated.value);
+  if (od !== undefined || sd !== undefined) {
+    if (od === undefined || sd === undefined || od === 'ambiguous' || sd === 'ambiguous') {
+      return normaliseKeyPart(official.value) === normaliseKeyPart(stated.value) ? 'same' : 'unknown';
+    }
+    return od === sd ? 'same' : 'different';
+  }
   const o = normaliseValue(official.value, official.unit);
   const s = normaliseValue(stated.value, stated.unit);
   if (o.numbers.length > 0) {
     if (s.numbers.length === 0) return 'unknown';
-    const same = o.numbers.length === s.numbers.length && o.numbers.every((n) => s.numbers.includes(n));
-    if (!same) return 'different';
-    return o.unit && s.unit && o.unit !== s.unit ? 'different' : 'same';
+    let statedNumbers = s.numbers;
+    if (o.unit && s.unit && o.unit !== s.unit) {
+      const factor = UNIT_FACTORS[`${s.unit}>${o.unit}`];
+      if (factor === undefined) return 'unknown';
+      statedNumbers = s.numbers.map((n) => Math.round(n * factor * 1000) / 1000);
+    }
+    if (o.numbers.every((n) => statedNumbers.includes(n))) return 'same';
+    return s.numbers.length <= o.numbers.length ? 'different' : 'unknown';
   }
   if (o.words.length === 0 || s.words.length === 0) return 'unknown';
   const ow = new Set(o.words);
@@ -363,9 +424,38 @@ export function parseJudgement(args: unknown, chunkText: string, factIds: readon
       return;
     }
     seen.add(factId);
-    judgements.push({ factId, sameFact, mention, statedValue, statedUnit, statedCondition, quote });
+    judgements.push(groundJudgement({ factId, sameFact, mention, statedValue, statedUnit, statedCondition, quote }, chunkText));
   });
   return { judgements, dropped };
+}
+
+/** "from $50 to $60", "dari $50 menjadi $60": the number after "from" is the old value. */
+const FROM_TO = /\b(?:from|dari)\s+(\S+(?:\s+\p{L}+)?)\s+(?:to|menjadi|ke)\b/giu;
+/** "previously $50", "was $50", "used to be 50 days": the number right after the cue is a past value. */
+const PAST_VALUE = /\b(?:previously|formerly|used to be|was|sebelumnya)\s+(?:\p{L}+\s+){0,2}?(\S*\d[\d.,]*)/giu;
+
+/**
+ * Checks the judge's reading against the quote itself (the LLM is not trusted):
+ * - stated value is the old side of "from X to Y" → `historical`;
+ * - stated value follows "previously" / "was" → `sameFact: unsure` (a past value is never drift);
+ * - stated condition with no word in the excerpt (invented) → `sameFact: unsure`.
+ */
+function groundJudgement(j: Judgement, chunkText: string): Judgement {
+  const stated = new Set(numbersIn(j.statedValue));
+  const hasStated = (text: string | undefined) => stated.size > 0 && numbersIn(text ?? '').some((n) => stated.has(n));
+  const out = { ...j };
+  if (out.mention === 'current') {
+    if ([...j.quote.matchAll(FROM_TO)].some((m) => hasStated(m[1]))) out.mention = 'historical';
+    else if ([...j.quote.matchAll(PAST_VALUE)].some((m) => hasStated(m[1]))) out.sameFact = out.sameFact === 'no' ? 'no' : 'unsure';
+  }
+  if (out.statedCondition && out.sameFact === 'yes') {
+    const chunk = ` ${normaliseKeyPart(chunkText)} `;
+    const words = normaliseKeyPart(out.statedCondition)
+      .split(' ')
+      .filter((w) => w.length >= 3 && !STOPWORDS.has(w));
+    if (words.length > 0 && !words.some((w) => chunk.includes(` ${w}`))) out.sameFact = 'unsure';
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -386,9 +476,25 @@ function distinctiveWords(condition: string, fact: ScanFact): string[] {
   return distinct.length > 0 ? distinct : words;
 }
 
-/** Same condition, or the copy states none. Only false when both are stated and share no distinctive word. */
+/** Words a condition may repeat without narrowing the fact ("after the trip ends" for a claims deadline). */
+const CONDITION_FILLER = new Set(['travel', 'trip', 'trips', 'all', 'any', 'every', 'always', 'end', 'ends', 'employee', 'employees', 'staff', 'company']);
+
+const stems = (w: string): string[] => [w, w.replace(/s$/, ''), `${w}s`];
+
+/**
+ * Same condition, or the copy states none. When both are stated: false when they share no distinctive word. When
+ * the source fact has no condition: false when the copy narrows it to something new ("External training"), using
+ * only words that are not already part of the fact.
+ */
 export function sameCondition(fact: ScanFact, statedCondition: string | null): boolean {
-  if (!fact.condition || !statedCondition) return true;
+  if (!statedCondition) return true;
+  if (!fact.condition) {
+    const known = new Set(normaliseKeyPart(`${fact.subject} ${fact.attribute} ${fact.value} ${fact.unit ?? ''}`).split(' '));
+    const extra = normaliseKeyPart(statedCondition)
+      .split(' ')
+      .filter((w) => w.length >= 3 && !STOPWORDS.has(w) && !CONDITION_FILLER.has(w) && !/^\d/.test(w) && !stems(w).some((x) => known.has(x)));
+    return extra.length === 0;
+  }
   const stated = new Set(normaliseKeyPart(statedCondition).split(' '));
   return distinctiveWords(fact.condition, fact).some((w) => stated.has(w) || stated.has(w.replace(/s$/, '')) || stated.has(`${w}s`));
 }
@@ -408,7 +514,7 @@ export function decideStatus(fact: ScanFact, j: Judgement, siblings: readonly Sc
   if (j.sameFact === 'no' || j.mention === 'example') return null;
   if (j.mention === 'historical') return { status: 'historical', reason: 'Past value (historical mention); not checked.' };
   if (!sameCondition(fact, j.statedCondition)) {
-    return { status: 'unsure', reason: `Different condition: "${j.statedCondition}" vs "${fact.condition}".` };
+    return { status: 'unsure', reason: fact.condition ? `Different condition: "${j.statedCondition}" vs "${fact.condition}".` : `Only for "${j.statedCondition}"; the source has no condition.` };
   }
   const cmp = compareValues({ value: fact.value, unit: fact.unit }, { value: j.statedValue, unit: j.statedUnit });
   if (cmp === 'unknown') return null;

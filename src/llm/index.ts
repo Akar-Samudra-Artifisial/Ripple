@@ -98,3 +98,12 @@ export async function chatTool<T = unknown>(messages: Message[], tool: ToolSpec,
 export function isLlmRateLimited(err: unknown): boolean {
   return statusOf(err) === 429;
 }
+
+/** 429 or 5xx from Forge LLM: worth retrying later (the queue backs off). */
+export function isLlmRetryable(err: unknown): boolean {
+  const status = statusOf(err);
+  return status === 429 || (status !== undefined && status >= 500);
+}
+
+/** Any error from the Forge LLM API (as opposed to our own code or storage). */
+export const isLlmApiError = (err: unknown): boolean => err instanceof ForgeLlmError;

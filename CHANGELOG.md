@@ -33,8 +33,17 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Byline tidak lagi menampilkan detail database saat sudah siap dan tidak mengulang daftar tim space (tim tetap tampil di baris Owner).
 - Byline hanya menampilkan "Ripple is ready" bila database siap; saat setup atau cek gagal tampil status yang jelas.
 - Permintaan ke `claude-sonnet-5` tidak lagi mengirim `temperature` (parameter ini ditolak model tersebut).
+- Jumlah salinan per status di tab Copies hanya menghitung halaman yang boleh dibuka pengguna (NFR-3); salinan di halaman lain tetap hanya satu total ("N copies are in pages you can't view").
+- Penilaian salinan dibatasi 2 panggilan LLM paralel per halaman dan maks. 300 panggilan per scan; bila batas tercapai scan selesai sebagai `partial` dan salinan dari scan sebelumnya tidak dihapus. Status scan memuat `pagesSkipped` dan `partial` (migrasi v010–v016).
+- Halaman arsip/draft tidak lagi menjadi kandidat salinan. Pengecualian space lewat pengaturan belum ada.
 
 ### Fixed
+- Salinan yang menyebut kondisi sendiri (mis. "training $40") untuk fakta tanpa kondisi kini Tidak pasti, bukan Menyimpang.
+- Nilai dengan angka tambahan ("$60 per day (max 3 days)"), tanggal beda format, dan satuan beda (2 weeks = 14 days; USD vs EUR → tidak dinilai) tidak lagi ditandai menyimpang secara keliru.
+- Kutipan diperiksa ulang: nilai lama di "from X to Y" jadi Historis, nilai setelah "previously"/"was" jadi Tidak pasti, dan kondisi yang tidak ada di teks jadi Tidak pasti. Istilah pencarian tanpa huruf/angka dibuang.
+- Halaman yang tidak bisa dibaca app (mis. 403) atau ditolak LLM dilewati dan dihitung, bukan menggagalkan seluruh scan; error LLM 5xx di-retry dan retry melanjutkan dari potongan teks yang belum dinilai.
+- Scan memakai daftar fakta saat scan dimulai, berhenti dan membersihkan diri bila sumber di-unmark di tengah jalan, dan dua klik "Find copies" bersamaan hanya membuat satu scan (unique key di database).
+- Daftar salinan memfilter visibilitas sebelum batas 500 baris, dan hitungan/daftar hanya memuat salinan dari fakta yang masih terkonfirmasi.
 - Panel sumber resmi tidak lagi sesaat menampilkan "No facts were found" setelah reload: status dan daftar fakta tampil bersamaan, dengan "Loading facts…" (skeleton) sampai daftar pertama datang dan error + Retry bila gagal.
 - Byline tidak lagi tertahan di "setting up" sampai popup dibuka ulang: selama setup database, status di-poll tiap 3 detik dengan progres langkah, berhenti saat siap/error/popup ditutup, dan setelah 3 menit menampilkan pesan + tombol Retry.
 - Ekstraksi ulang tidak lagi menimpa review yang masuk di tengah ekstraksi dan tidak pernah menghidupkan lagi fakta yang ditolak (UPDATE dengan guard status).

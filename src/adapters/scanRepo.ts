@@ -1,15 +1,21 @@
 import { randomUUID } from 'node:crypto';
+import type { Judgement } from '../core/copies';
 import type { CopyCounts, CopyStatus, CopyView, ScanState, ScanView } from '../core/views';
 import { execute, query } from './sql';
 
 /** No progress for this long while running = stalled (a consumer died); `startScan` resumes it. */
 export const STALL_SECONDS = 15 * 60;
+/** Copies returned by one `listCopies` call (after the visibility filter). */
+export const MAX_LISTED_COPIES = 500;
 
 export interface ScanRow extends ScanView {
   sourcePageId: string;
   factCursor: number;
+  /** Confirmed fact ids when the scan started, sorted; the search cursor indexes into it. Null for old scans. */
+  factIds: string[] | null;
   /** Fact id → extra search phrases, decided once per scan; null until the search consumer set them. */
   terms: Record<string, string[]> | null;
+  llmCalls: number;
 }
 
 export interface HitInput {
@@ -41,27 +47,51 @@ export interface CopyInput {
   reason: string;
 }
 
+/** Saved judge result of one chunk (verified judgements only), reused when a page is judged again after a retry. */
+export interface ChunkResult {
+  judgements: Judgement[];
+  dropped: number;
+}
+
 /** Storage of scans, candidate hits and copies (an in-memory fake implements it in tests). */
 export interface ScanRepo {
   latestScan(sourcePageId: string): Promise<ScanRow | undefined>;
   getScan(scanId: string): Promise<ScanRow | undefined>;
-  createScan(sourcePageId: string, factsTotal: number, actor: string): Promise<string>;
+  /** Undefined when the source already has a running scan (unique `active_source`). */
+  createScan(sourcePageId: string, factIds: readonly string[], actor: string): Promise<string | undefined>;
   /** Bumps `updated_at` (resume of a stalled scan). */
   touchScan(scanId: string): Promise<void>;
   setTerms(scanId: string, terms: Record<string, string[]>): Promise<void>;
+  addLlmCalls(scanId: string, n: number): Promise<void>;
   /** Idempotent (a resumed batch inserts the same hits again). */
   addHits(scanId: string, hits: readonly HitInput[]): Promise<void>;
   /** Fact `factCursor - 1` is searched; stores the distinct candidate count. */
   advanceSearch(scanId: string, factCursor: number): Promise<void>;
   startJudging(scanId: string): Promise<void>;
   pendingPages(scanId: string, limit: number): Promise<PendingPage[]>;
-  /** Saves the copies of one judged page and marks its hits done (idempotent; `ignored`/`updated` copies are kept). */
+  chunkResults(scanId: string, pageId: string): Promise<Map<string, ChunkResult>>;
+  saveChunkResult(scanId: string, pageId: string, chunkHash: string, result: ChunkResult): Promise<void>;
+  /**
+   * Replaces the copies of one judged page (stale ones from earlier scans removed, `ignored`/`updated` kept) and
+   * marks its hits done. Idempotent.
+   */
   finishPage(scanId: string, sourcePageId: string, pageId: string, copies: readonly CopyInput[]): Promise<void>;
-  /** Marks the scan done and removes copies an earlier scan found but this one did not (except ignored/updated). */
-  finishScan(scanId: string, sourcePageId: string): Promise<void>;
+  /** The page could not be read or judged (e.g. 403): its hits are marked skipped and counted. */
+  skipPage(scanId: string, pageId: string): Promise<void>;
+  /**
+   * Marks the scan done. A complete scan also removes copies an earlier scan found on pages this one no longer
+   * found (except ignored/updated); a partial one (LLM call cap reached) keeps them.
+   */
+  finishScan(scanId: string, sourcePageId: string, partial: boolean): Promise<void>;
   failScan(scanId: string, error: string): Promise<void>;
-  countCopies(sourcePageId: string): Promise<CopyCounts>;
-  listCopies(sourcePageId: string, status?: CopyStatus): Promise<CopyView[]>;
+  /** The source was unmarked during the scan: remove the scan and every copy of the source. */
+  discardScan(scanId: string, sourcePageId: string): Promise<void>;
+  /** Distinct pages holding copies of the source's confirmed facts. */
+  copyPageIds(sourcePageId: string): Promise<string[]>;
+  /** Copies of confirmed facts per status; only on `pageIds` when given. */
+  countCopies(sourcePageId: string, pageIds?: readonly string[]): Promise<CopyCounts>;
+  /** Copies of confirmed facts on `pageIds`; `status` omitted = all but historical. At most `MAX_LISTED_COPIES`. */
+  listCopies(sourcePageId: string, status: CopyStatus | undefined, pageIds: readonly string[]): Promise<CopyView[]>;
 }
 
 export const EMPTY_COPY_COUNTS: CopyCounts = { in_sync: 0, drifted: 0, unsure: 0, historical: 0, ignored: 0, updated: 0 };
@@ -72,9 +102,13 @@ interface ScanDbRow {
   status: string;
   facts_total: number;
   fact_cursor: number;
+  fact_ids: unknown;
   terms: unknown;
   candidates: number;
   pages_judged: number;
+  pages_skipped: number | null;
+  llm_calls: number | null;
+  partial: number | boolean | null;
   error: string | null;
   started_at: unknown;
   finished_at: unknown;
@@ -87,13 +121,21 @@ const iso = (v: unknown): string | null => {
   return Number.isNaN(d.getTime()) ? String(v) : d.toISOString();
 };
 
+const json = (v: unknown): unknown => (typeof v === 'string' ? JSON.parse(v) : v);
+
 function parseTerms(v: unknown): Record<string, string[]> | null {
   if (v === null || v === undefined) return null;
-  const obj: unknown = typeof v === 'string' ? JSON.parse(v) : v;
+  const obj = json(v);
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
   const out: Record<string, string[]> = {};
   for (const [k, list] of Object.entries(obj)) if (Array.isArray(list)) out[k] = list.filter((t): t is string => typeof t === 'string');
   return out;
+}
+
+function parseIds(v: unknown): string[] | null {
+  if (v === null || v === undefined) return null;
+  const list = json(v);
+  return Array.isArray(list) ? list.filter((x): x is string => typeof x === 'string') : null;
 }
 
 const RUNNING = new Set<ScanState>(['searching', 'judging']);
@@ -108,9 +150,13 @@ const toScan = (r: ScanDbRow): ScanRow => {
     factsTotal: Number(r.facts_total),
     factsSearched: Number(r.fact_cursor),
     factCursor: Number(r.fact_cursor),
+    factIds: parseIds(r.fact_ids),
     terms: parseTerms(r.terms),
     candidates: Number(r.candidates),
     pagesJudged: Number(r.pages_judged),
+    pagesSkipped: Number(r.pages_skipped ?? 0),
+    llmCalls: Number(r.llm_calls ?? 0),
+    partial: Boolean(Number(r.partial ?? 0)),
     startedAt: iso(r.started_at) ?? '',
     finishedAt: iso(r.finished_at),
     error: r.error,
@@ -118,7 +164,7 @@ const toScan = (r: ScanDbRow): ScanRow => {
 };
 
 const SCAN_COLUMNS =
-  'id, source_page_id, status, facts_total, fact_cursor, terms, candidates, pages_judged, error, started_at, finished_at, TIMESTAMPDIFF(SECOND, updated_at, CURRENT_TIMESTAMP) AS idle_seconds';
+  'id, source_page_id, status, facts_total, fact_cursor, fact_ids, terms, candidates, pages_judged, pages_skipped, llm_calls, partial, error, started_at, finished_at, TIMESTAMPDIFF(SECOND, updated_at, CURRENT_TIMESTAMP) AS idle_seconds';
 
 interface CopyDbRow {
   id: string;
@@ -161,6 +207,10 @@ const toCopy = (r: CopyDbRow): CopyView => ({
 const STATUS_ORDER = "CASE c.status WHEN 'drifted' THEN 0 WHEN 'unsure' THEN 1 WHEN 'in_sync' THEN 2 WHEN 'updated' THEN 3 WHEN 'historical' THEN 4 ELSE 5 END";
 /** Copies the owner settled; a rescan never changes or removes them. */
 const STICKY = "('ignored', 'updated')";
+/** Copies of facts that are still confirmed (a rejected or removed fact's copies are not shown or counted). */
+const CONFIRMED_JOIN = "JOIN facts f ON f.id = c.fact_id AND f.status = 'confirmed'";
+const placeholders = (n: number) => Array.from({ length: n }, () => '?').join(', ');
+const isDuplicateKey = (err: unknown): boolean => err instanceof Error && /duplicate entry|\b1062\b/i.test(err.message);
 
 export const sqlScanRepo: ScanRepo = {
   async latestScan(sourcePageId) {
@@ -173,9 +223,22 @@ export const sqlScanRepo: ScanRepo = {
     return rows[0] ? toScan(rows[0]) : undefined;
   },
 
-  async createScan(sourcePageId, factsTotal, actor) {
+  async createScan(sourcePageId, factIds, actor) {
     const id = randomUUID();
-    await execute("INSERT INTO scan_jobs (id, source_page_id, status, facts_total, requested_by) VALUES (?, ?, 'searching', ?, ?)", id, sourcePageId, factsTotal, actor);
+    try {
+      await execute(
+        "INSERT INTO scan_jobs (id, source_page_id, status, facts_total, fact_ids, requested_by, active_source) VALUES (?, ?, 'searching', ?, ?, ?, ?)",
+        id,
+        sourcePageId,
+        factIds.length,
+        JSON.stringify(factIds),
+        actor,
+        sourcePageId,
+      );
+    } catch (err) {
+      if (isDuplicateKey(err)) return undefined;
+      throw err;
+    }
     return id;
   },
 
@@ -185,6 +248,10 @@ export const sqlScanRepo: ScanRepo = {
 
   async setTerms(scanId, terms) {
     await execute('UPDATE scan_jobs SET terms = ? WHERE id = ?', JSON.stringify(terms), scanId);
+  },
+
+  async addLlmCalls(scanId, n) {
+    await execute('UPDATE scan_jobs SET llm_calls = llm_calls + ? WHERE id = ?', n, scanId);
   },
 
   async addHits(scanId, hits) {
@@ -218,7 +285,7 @@ export const sqlScanRepo: ScanRepo = {
     if (pages.length === 0) return [];
     const ids = pages.map((p) => p.page_id);
     const rows = await query<{ page_id: string; fact_id: string; title: string | null; page_url: string | null }>(
-      `SELECT page_id, fact_id, title, page_url FROM scan_hits WHERE scan_id = ? AND status = 'pending' AND page_id IN (${ids.map(() => '?').join(', ')})`,
+      `SELECT page_id, fact_id, title, page_url FROM scan_hits WHERE scan_id = ? AND status = 'pending' AND page_id IN (${placeholders(ids.length)})`,
       scanId,
       ...ids,
     );
@@ -228,7 +295,28 @@ export const sqlScanRepo: ScanRepo = {
     });
   },
 
+  async chunkResults(scanId, pageId) {
+    const rows = await query<{ chunk_hash: string; result: unknown }>('SELECT chunk_hash, result FROM scan_chunks WHERE scan_id = ? AND page_id = ?', scanId, pageId);
+    const out = new Map<string, ChunkResult>();
+    for (const r of rows) {
+      const v = json(r.result) as Partial<ChunkResult> | null;
+      if (v && Array.isArray(v.judgements)) out.set(r.chunk_hash, { judgements: v.judgements, dropped: Number(v.dropped ?? 0) });
+    }
+    return out;
+  },
+
+  async saveChunkResult(scanId, pageId, chunkHash, result) {
+    await execute(
+      'INSERT INTO scan_chunks (scan_id, page_id, chunk_hash, result) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE result = VALUES(result)',
+      scanId,
+      pageId,
+      chunkHash,
+      JSON.stringify(result),
+    );
+  },
+
   async finishPage(scanId, sourcePageId, pageId, copies) {
+    await execute(`DELETE FROM copies WHERE source_page_id = ? AND page_id = ? AND scan_id <> ? AND status NOT IN ${STICKY}`, sourcePageId, pageId, scanId);
     for (const c of copies) {
       await execute(
         `INSERT INTO copies (id, source_page_id, fact_id, page_id, page_title, page_url, page_version, status, stated_value, stated_unit,
@@ -266,34 +354,67 @@ export const sqlScanRepo: ScanRepo = {
     }
     const updated = await execute("UPDATE scan_hits SET status = 'done' WHERE scan_id = ? AND page_id = ? AND status = 'pending'", scanId, pageId);
     if (updated > 0) await execute('UPDATE scan_jobs SET pages_judged = pages_judged + 1 WHERE id = ?', scanId);
+    await execute('DELETE FROM scan_chunks WHERE scan_id = ? AND page_id = ?', scanId, pageId);
   },
 
-  async finishScan(scanId, sourcePageId) {
-    await execute(`DELETE FROM copies WHERE source_page_id = ? AND scan_id <> ? AND status NOT IN ${STICKY}`, sourcePageId, scanId);
-    await execute("UPDATE scan_jobs SET status = 'done', finished_at = CURRENT_TIMESTAMP, error = NULL WHERE id = ?", scanId);
+  async skipPage(scanId, pageId) {
+    const updated = await execute("UPDATE scan_hits SET status = 'skipped' WHERE scan_id = ? AND page_id = ? AND status = 'pending'", scanId, pageId);
+    if (updated > 0) await execute('UPDATE scan_jobs SET pages_skipped = pages_skipped + 1 WHERE id = ?', scanId);
+    await execute('DELETE FROM scan_chunks WHERE scan_id = ? AND page_id = ?', scanId, pageId);
+  },
+
+  async finishScan(scanId, sourcePageId, partial) {
+    if (!partial) await execute(`DELETE FROM copies WHERE source_page_id = ? AND scan_id <> ? AND status NOT IN ${STICKY}`, sourcePageId, scanId);
+    await execute(
+      "UPDATE scan_jobs SET status = 'done', partial = ?, finished_at = CURRENT_TIMESTAMP, error = NULL, active_source = NULL WHERE id = ?",
+      partial ? 1 : 0,
+      scanId,
+    );
     await execute('DELETE FROM scan_hits WHERE scan_id = ?', scanId);
+    await execute('DELETE FROM scan_chunks WHERE scan_id = ?', scanId);
   },
 
   async failScan(scanId, error) {
-    await execute("UPDATE scan_jobs SET status = 'error', error = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?", error.slice(0, 255), scanId);
+    await execute("UPDATE scan_jobs SET status = 'error', error = ?, finished_at = CURRENT_TIMESTAMP, active_source = NULL WHERE id = ?", error.slice(0, 255), scanId);
   },
 
-  async countCopies(sourcePageId) {
-    const rows = await query<{ status: string; n: number | string }>('SELECT status, COUNT(*) AS n FROM copies WHERE source_page_id = ? GROUP BY status', sourcePageId);
+  async discardScan(scanId, sourcePageId) {
+    await execute('DELETE FROM copies WHERE source_page_id = ?', sourcePageId);
+    await execute('DELETE FROM scan_hits WHERE scan_id = ?', scanId);
+    await execute('DELETE FROM scan_chunks WHERE scan_id = ?', scanId);
+    await execute('DELETE FROM scan_jobs WHERE id = ?', scanId);
+  },
+
+  async copyPageIds(sourcePageId) {
+    const rows = await query<{ page_id: string }>(`SELECT DISTINCT c.page_id FROM copies c ${CONFIRMED_JOIN} WHERE c.source_page_id = ?`, sourcePageId);
+    return rows.map((r) => r.page_id);
+  },
+
+  async countCopies(sourcePageId, pageIds) {
     const counts: CopyCounts = { ...EMPTY_COPY_COUNTS };
+    if (pageIds && pageIds.length === 0) return counts;
+    const pageFilter = pageIds ? `AND c.page_id IN (${placeholders(pageIds.length)})` : '';
+    const rows = await query<{ status: string; n: number | string }>(
+      `SELECT c.status, COUNT(*) AS n FROM copies c ${CONFIRMED_JOIN} WHERE c.source_page_id = ? ${pageFilter} GROUP BY c.status`,
+      sourcePageId,
+      ...(pageIds ?? []),
+    );
     for (const r of rows) if (r.status in counts) counts[r.status as CopyStatus] = Number(r.n);
     return counts;
   },
 
-  async listCopies(sourcePageId, status) {
+  async listCopies(sourcePageId, status, pageIds) {
+    if (pageIds.length === 0) return [];
     const filter = status ? 'AND c.status = ?' : "AND c.status <> 'historical'";
     const rows = await query<CopyDbRow>(
       `SELECT c.id, c.fact_id, c.page_id, c.page_title, c.page_url, c.status, c.stated_value, c.stated_unit, c.stated_condition, c.quote, c.reason,
          c.judged_at, f.subject, f.attribute, f.fact_condition, f.value, f.unit
-       FROM copies c JOIN facts f ON f.id = c.fact_id
-       WHERE c.source_page_id = ? ${filter}
-       ORDER BY ${STATUS_ORDER}, c.page_title, c.id LIMIT 500`,
-      ...(status ? [sourcePageId, status] : [sourcePageId]),
+       FROM copies c ${CONFIRMED_JOIN}
+       WHERE c.source_page_id = ? ${filter} AND c.page_id IN (${placeholders(pageIds.length)})
+       ORDER BY ${STATUS_ORDER}, c.page_title, c.id LIMIT ${MAX_LISTED_COPIES}`,
+      sourcePageId,
+      ...(status ? [status] : []),
+      ...pageIds,
     );
     return rows.map(toCopy);
   },

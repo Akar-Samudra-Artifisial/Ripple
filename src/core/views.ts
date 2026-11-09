@@ -165,6 +165,10 @@ export interface ScanView {
   /** Distinct candidate pages found by CQL (at most 200 per fact). */
   candidates: number;
   pagesJudged: number;
+  /** Candidate pages that could not be read or judged (e.g. no access for the app); not counted as copies. */
+  pagesSkipped?: number;
+  /** True when the scan stopped at the per-scan LLM call cap: some candidate pages were not checked. */
+  partial?: boolean;
   startedAt: string;
   finishedAt: string | null;
   error: string | null;

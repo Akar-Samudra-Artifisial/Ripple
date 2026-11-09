@@ -16,7 +16,7 @@ vi.mock('@forge/events', () => ({
 import { ForgeLlmError, type Message } from '@forge/llm';
 import type { SearchHit } from '../src/adapters/confluence';
 import type { FactRepo } from '../src/adapters/repo';
-import { EMPTY_COPY_COUNTS, type CopyInput, type HitInput, type PendingPage, type ScanRepo, type ScanRow } from '../src/adapters/scanRepo';
+import { EMPTY_COPY_COUNTS, type ChunkResult, type CopyInput, type HitInput, type PendingPage, type ScanRepo, type ScanRow } from '../src/adapters/scanRepo';
 import {
   buildCql,
   chunkPage,
@@ -27,6 +27,7 @@ import {
   MAX_CANDIDATES_PER_FACT,
   normaliseValue,
   parseJudgement,
+  parseTermSuggestions,
   strongest,
   type Judgement,
   type ScanFact,
@@ -34,7 +35,7 @@ import {
 import type { CopyStatus, CopyView, FactView, SourceView } from '../src/core/views';
 import type { ChatToolFn } from '../src/llm/extract';
 import type { ToolSpec } from '../src/llm/index';
-import { getScanStatus, JUDGE_QUEUE, listCopies, runJudgeJob, runSearchJob, SEARCH_QUEUE, startScan, type CopyDeps, type ScanJobDeps, type ScanQueue } from '../src/surfaces/copies';
+import { getScanStatus, JUDGE_CONCURRENCY, JUDGE_QUEUE, listCopies, MAX_LLM_CALLS_PER_SCAN, runJudgeJob, runSearchJob, SEARCH_QUEUE, startScan, type CopyDeps, type ScanJobDeps, type ScanQueue } from '../src/surfaces/copies';
 import type { SourceContext } from '../src/surfaces/sources';
 import { COPY_PAGES, FACT_KEYS, SOURCE_PAGE_ID, type FactKey } from './fixtures/copies';
 import { TRAVEL_POLICY_FACTS } from './fixtures/travelPolicy';
@@ -86,11 +87,13 @@ class FakeFacts {
   }
 }
 
-/** In-memory `ScanRepo` with the SQL semantics (idempotent hits, sticky ignored/updated copies). */
+/** In-memory `ScanRepo` with the SQL semantics (idempotent hits, sticky ignored/updated copies, one running scan per source). */
 class FakeScans implements ScanRepo {
   scans = new Map<string, ScanRow>();
-  hits: (HitInput & { scanId: string; status: 'pending' | 'done' })[] = [];
+  hits: (HitInput & { scanId: string; status: 'pending' | 'done' | 'skipped' })[] = [];
   copies = new Map<string, CopyInput & { sourcePageId: string; scanId: string }>();
+  chunks = new Map<string, ChunkResult>();
+  active = new Map<string, string>();
   private n = 0;
   stall = false;
 
@@ -103,18 +106,45 @@ class FakeScans implements ScanRepo {
     const s = this.scans.get(id);
     return s ? { ...s } : undefined;
   }
-  async createScan(sourcePageId: string, factsTotal: number, _actor: string) {
+  async createScan(sourcePageId: string, factIds: readonly string[], _actor: string) {
+    if (this.active.has(sourcePageId)) return undefined;
     const id = `00000000-0000-4000-8000-${String(++this.n).padStart(12, '0')}`;
-    this.scans.set(id, { id, sourcePageId, state: 'searching', stalled: false, factsTotal, factsSearched: 0, factCursor: 0, terms: null, candidates: 0, pagesJudged: 0, startedAt: 'now', finishedAt: null, error: null });
+    this.active.set(sourcePageId, id);
+    this.scans.set(id, {
+      id,
+      sourcePageId,
+      state: 'searching',
+      stalled: false,
+      factsTotal: factIds.length,
+      factsSearched: 0,
+      factCursor: 0,
+      factIds: [...factIds],
+      terms: null,
+      candidates: 0,
+      pagesJudged: 0,
+      pagesSkipped: 0,
+      llmCalls: 0,
+      partial: false,
+      startedAt: 'now',
+      finishedAt: null,
+      error: null,
+    });
     return id;
   }
   private patch(id: string, p: Partial<ScanRow>) {
     const s = this.scans.get(id);
     if (s) this.scans.set(id, { ...s, ...p });
   }
+  private release(id: string) {
+    for (const [k, v] of this.active) if (v === id) this.active.delete(k);
+  }
   async touchScan() {}
   async setTerms(id: string, terms: Record<string, string[]>) {
     this.patch(id, { terms });
+  }
+  async addLlmCalls(id: string, n: number) {
+    const s = this.scans.get(id);
+    if (s) this.patch(id, { llmCalls: s.llmCalls + n });
   }
   async addHits(scanId: string, hits: readonly HitInput[]) {
     for (const h of hits) if (!this.hits.some((x) => x.scanId === scanId && x.factId === h.factId && x.pageId === h.pageId)) this.hits.push({ ...h, scanId, status: 'pending' });
@@ -133,6 +163,22 @@ class FakeScans implements ScanRepo {
       return { pageId, title: own[0]?.title ?? '', url: own[0]?.url ?? null, factIds: own.map((h) => h.factId) };
     });
   }
+  async chunkResults(scanId: string, pageId: string) {
+    const out = new Map<string, ChunkResult>();
+    for (const [k, v] of this.chunks) if (k.startsWith(`${scanId}|${pageId}|`)) out.set(k.split('|')[2] as string, v);
+    return out;
+  }
+  async saveChunkResult(scanId: string, pageId: string, hash: string, result: ChunkResult) {
+    this.chunks.set(`${scanId}|${pageId}|${hash}`, JSON.parse(JSON.stringify(result)) as ChunkResult);
+  }
+  private dropChunks(scanId: string, pageId?: string) {
+    for (const k of [...this.chunks.keys()]) if (k.startsWith(pageId ? `${scanId}|${pageId}|` : `${scanId}|`)) this.chunks.delete(k);
+  }
+  private markHits(scanId: string, pageId: string, status: 'done' | 'skipped'): number {
+    let changed = 0;
+    for (const h of this.hits) if (h.scanId === scanId && h.pageId === pageId && h.status === 'pending') (h.status = status), changed++;
+    return changed;
+  }
   async finishPage(scanId: string, sourcePageId: string, pageId: string, copies: readonly CopyInput[]) {
     for (const c of copies) {
       const key = `${c.factId}|${c.pageId}`;
@@ -140,27 +186,49 @@ class FakeScans implements ScanRepo {
       if (old && (old.status === 'ignored' || old.status === 'updated')) this.copies.set(key, { ...old, scanId });
       else this.copies.set(key, { ...c, sourcePageId, scanId });
     }
-    let changed = 0;
-    for (const h of this.hits) if (h.scanId === scanId && h.pageId === pageId && h.status === 'pending') (h.status = 'done'), changed++;
     const s = this.scans.get(scanId);
-    if (s && changed > 0) this.patch(scanId, { pagesJudged: s.pagesJudged + 1 });
+    if (s && this.markHits(scanId, pageId, 'done') > 0) this.patch(scanId, { pagesJudged: s.pagesJudged + 1 });
+    this.dropChunks(scanId, pageId);
   }
-  async finishScan(scanId: string, sourcePageId: string) {
-    for (const [k, c] of this.copies) if (c.sourcePageId === sourcePageId && c.scanId !== scanId && c.status !== 'ignored' && c.status !== 'updated') this.copies.delete(k);
-    this.patch(scanId, { state: 'done', finishedAt: 'now' });
+  async skipPage(scanId: string, pageId: string) {
+    const s = this.scans.get(scanId);
+    if (s && this.markHits(scanId, pageId, 'skipped') > 0) this.patch(scanId, { pagesSkipped: (s.pagesSkipped ?? 0) + 1 });
+    this.dropChunks(scanId, pageId);
+  }
+  async finishScan(scanId: string, sourcePageId: string, partial: boolean) {
+    if (!partial) for (const [k, c] of this.copies) if (c.sourcePageId === sourcePageId && c.scanId !== scanId && c.status !== 'ignored' && c.status !== 'updated') this.copies.delete(k);
+    this.patch(scanId, { state: 'done', finishedAt: 'now', partial });
+    this.release(scanId);
     this.hits = this.hits.filter((h) => h.scanId !== scanId);
+    this.dropChunks(scanId);
   }
   async failScan(id: string, error: string) {
     this.patch(id, { state: 'error', error });
+    this.release(id);
   }
-  async countCopies(sourcePageId: string) {
+  async discardScan(scanId: string, sourcePageId: string) {
+    for (const [k, c] of this.copies) if (c.sourcePageId === sourcePageId) this.copies.delete(k);
+    this.hits = this.hits.filter((h) => h.scanId !== scanId);
+    this.dropChunks(scanId);
+    this.scans.delete(scanId);
+    this.release(scanId);
+  }
+  /** Copies of facts still confirmed (the SQL joins `facts`); tests set `unconfirmed` to drop a fact. */
+  unconfirmed = new Set<string>();
+  private live(sourcePageId: string) {
+    return [...this.copies.values()].filter((c) => c.sourcePageId === sourcePageId && !this.unconfirmed.has(c.factId));
+  }
+  async copyPageIds(sourcePageId: string) {
+    return [...new Set(this.live(sourcePageId).map((c) => c.pageId))];
+  }
+  async countCopies(sourcePageId: string, pageIds?: readonly string[]) {
     const counts = { ...EMPTY_COPY_COUNTS };
-    for (const c of this.copies.values()) if (c.sourcePageId === sourcePageId) counts[c.status]++;
+    for (const c of this.live(sourcePageId)) if (!pageIds || pageIds.includes(c.pageId)) counts[c.status]++;
     return counts;
   }
-  async listCopies(sourcePageId: string, status?: CopyStatus): Promise<CopyView[]> {
-    return [...this.copies.values()]
-      .filter((c) => c.sourcePageId === sourcePageId && (status ? c.status === status : c.status !== 'historical'))
+  async listCopies(sourcePageId: string, status: CopyStatus | undefined, pageIds: readonly string[]): Promise<CopyView[]> {
+    return this.live(sourcePageId)
+      .filter((c) => pageIds.includes(c.pageId) && (status ? c.status === status : c.status !== 'historical'))
       .map((c) => ({ id: `${c.factId}|${c.pageId}`, factId: c.factId, factLabel: '', officialValue: '', officialUnit: null, pageId: c.pageId, pageTitle: c.pageTitle, pageUrl: c.pageUrl, status: c.status, statedValue: c.statedValue, statedUnit: c.statedUnit, statedCondition: c.statedCondition, quote: c.quote, reason: c.reason, judgedAt: null }));
   }
   statusOf(k: FactKey, pageId: string): CopyStatus | null {
@@ -255,9 +323,15 @@ beforeEach(() => {
   clock = 0;
 });
 
+async function newScan(): Promise<string> {
+  const id = await scans.createScan(SOURCE_PAGE_ID, FACTS.map((f) => f.id), 'acc-1');
+  if (!id) throw new Error('a scan is already running');
+  return id;
+}
+
 /** Runs a scan to the end (each consumer re-run as the queue would). */
 async function fullScan(deps: ScanJobDeps = jobDeps()): Promise<string> {
-  const scanId = await scans.createScan(SOURCE_PAGE_ID, FACTS.length, 'acc-1');
+  const scanId = await newScan();
   expect((await runSearchJob(scanId, 0, deps)).status).toBe('done');
   expect((await runJudgeJob(scanId, 0, deps)).status).toBe('done');
   return scanId;
@@ -325,7 +399,7 @@ describe('value normalisation', () => {
     const domestic = { value: '60', unit: 'USD' };
     expect(compareValues(domestic, { value: 'sixty dollars', unit: null })).toBe('same');
     expect(compareValues(domestic, { value: '$75', unit: null })).toBe('different');
-    expect(compareValues(domestic, { value: '60 EUR', unit: null })).toBe('different');
+    expect(compareValues(domestic, { value: '60 EUR', unit: null })).toBe('unknown');
     expect(compareValues({ value: '30', unit: 'days after the trip ends' }, { value: '30 hari', unit: null })).toBe('same');
     expect(compareValues({ value: 'economy class', unit: null }, { value: 'economy', unit: null })).toBe('same');
     expect(compareValues({ value: 'economy class', unit: null }, { value: 'business class', unit: null })).toBe('different');
@@ -420,7 +494,7 @@ describe('copy scan (search + judge consumers)', () => {
       searchCalls.push({ cql, max });
       return Array.from({ length: 250 }, (_, i) => ({ pageId: String(800000 + i), title: `P${i}`, url: null }));
     };
-    const scanId = await scans.createScan(SOURCE_PAGE_ID, FACTS.length, 'acc-1');
+    const scanId = await newScan();
     await runSearchJob(scanId, 0, jobDeps({ search: many }));
     expect(searchCalls.every((c) => c.max === MAX_CANDIDATES_PER_FACT)).toBe(true);
     for (const f of FACTS) expect(scans.hits.filter((h) => h.factId === f.id)).toHaveLength(MAX_CANDIDATES_PER_FACT);
@@ -428,7 +502,7 @@ describe('copy scan (search + judge consumers)', () => {
   });
 
   it('resumes the search from the fact cursor after the run budget is used up', async () => {
-    const scanId = await scans.createScan(SOURCE_PAGE_ID, FACTS.length, 'acc-1');
+    const scanId = await newScan();
     const first = await runSearchJob(scanId, 0, jobDeps(), 2);
     expect(first).toEqual({ status: 'continued', detail: { searched: 2, cursor: 2 } });
     expect(pushes).toEqual([{ queue: SEARCH_QUEUE, scanId }]);
@@ -441,7 +515,7 @@ describe('copy scan (search + judge consumers)', () => {
   });
 
   it('resumes judging with the first unfinished page and reads no page twice', async () => {
-    const scanId = await scans.createScan(SOURCE_PAGE_ID, FACTS.length, 'acc-1');
+    const scanId = await newScan();
     await runSearchJob(scanId, 0, jobDeps());
     pushes = [];
     const first = await runJudgeJob(scanId, 0, jobDeps(), 3);
@@ -467,7 +541,7 @@ describe('copy scan (search + judge consumers)', () => {
       if (tool.name === 'record_search_terms') return { args: { facts: [] }, model: 'm' };
       throw Object.assign(new ForgeLlmError('rate limited'), { status: 429 });
     }) as unknown as ChatToolFn;
-    const scanId = await scans.createScan(SOURCE_PAGE_ID, FACTS.length, 'acc-1');
+    const scanId = await newScan();
     await runSearchJob(scanId, 0, jobDeps());
     expect(await runJudgeJob(scanId, 0, jobDeps({ llm: limited }))).toMatchObject({ status: 'retry', reason: 'llm-rate-limited' });
     expect(await runJudgeJob(scanId, 4, jobDeps({ llm: limited }))).toMatchObject({ status: 'failed' });
@@ -517,7 +591,7 @@ describe('startScan / getScanStatus / listCopies', () => {
   });
 
   it('resumes a stalled scan in its current phase', async () => {
-    const scanId = await scans.createScan(SOURCE_PAGE_ID, 5, 'acc-1');
+    const scanId = await newScan();
     await scans.startJudging(scanId);
     scans.stall = true;
     await startScan(ctx, copyDeps());
@@ -539,5 +613,218 @@ describe('startScan / getScanStatus / listCopies', () => {
     expect(await listCopies(ctx, { status: 'bogus' as CopyStatus }, copyDeps())).toEqual({ error: 'Unknown copy status filter.' });
     const status = await getScanStatus(ctx, copyDeps());
     expect(status).toMatchObject({ scan: { state: 'done' }, counts: { drifted: 2 } });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// M2 review fixes
+// ---------------------------------------------------------------------------------------------------------------
+
+describe('M2 review: judging rules', () => {
+  it('W1: a copy that narrows a fact without a condition is unsure, not drift', () => {
+    const claims = fact('claims');
+    const training = judgement('claims', { statedValue: '45 days', statedCondition: 'External training', quote: 'External training claims are due within 45 days.' });
+    expect(decideStatus(claims, training)?.status).toBe('unsure');
+    // Repeating words of the fact itself ("after the trip ends") is not a new condition.
+    const same = judgement('claims', { statedValue: '45 days', statedCondition: 'after the trip ends', quote: 'Claims are due within 45 days after the trip ends.' });
+    expect(decideStatus(claims, same)?.status).toBe('drifted');
+  });
+
+  it('W2: extra numbers next to the official one are accepted; dates are parsed or unknown', () => {
+    const domestic = { value: '60', unit: 'USD' };
+    expect(compareValues(domestic, { value: '$60 per day (max 3 days)', unit: null })).toBe('same');
+    expect(compareValues(domestic, { value: '$75 per day (max 3 days)', unit: null })).toBe('unknown');
+    expect(compareValues(domestic, { value: '$75 per day', unit: null })).toBe('different');
+    const date = { value: '2026-01-15', unit: null };
+    expect(compareValues(date, { value: 'January 15, 2026', unit: null })).toBe('same');
+    expect(compareValues(date, { value: '15 Jan 2026', unit: null })).toBe('same');
+    expect(compareValues(date, { value: '15/02/2026', unit: null })).toBe('different');
+    expect(compareValues({ value: '2026-03-04', unit: null }, { value: '03/04/2026', unit: null })).toBe('unknown');
+    expect(compareValues(date, { value: 'mid January', unit: null })).toBe('unknown');
+  });
+
+  it('W3: different units are converted when cheap (weeks/days), otherwise unknown', () => {
+    const deadline = { value: '14', unit: 'days' };
+    expect(compareValues(deadline, { value: '2 weeks', unit: null })).toBe('same');
+    expect(compareValues(deadline, { value: '3 weeks', unit: null })).toBe('different');
+    expect(compareValues({ value: '30', unit: 'days' }, { value: '1 month', unit: null })).toBe('unknown');
+    expect(compareValues({ value: '60', unit: 'USD' }, { value: '60 EUR', unit: null })).toBe('unknown');
+  });
+
+  it('S1: a term without letters or digits is empty', () => {
+    expect(cleanTerm('--')).toBe('');
+    expect(cleanTerm('$ %')).toBe('');
+    expect(cleanTerm('"$60"')).toBe('$60');
+    expect(parseTermSuggestions({ facts: [{ fact: 1, terms: ['---', '. , .', 'meal allowance'] }] }, ['a'])).toEqual({ a: ['meal allowance'] });
+  });
+
+  it('S2: the quote is checked for past values and invented conditions', () => {
+    const chunk = 'Changelog\nThe per diem was raised from $50 to $60 per day.\nPreviously the training budget was $500, now $800.\nPer diem: $75 per day.';
+    const base = { fact: 1, same_fact: 'yes', mention: 'current', stated_unit: null, stated_condition: null };
+    const { judgements } = parseJudgement(
+      {
+        mentions: [
+          { ...base, stated_value: '$50', quote: 'The per diem was raised from $50 to $60 per day.' },
+          { ...base, fact: 2, stated_value: '$500', quote: 'Previously the training budget was $500, now $800.' },
+          { ...base, fact: 3, stated_value: '$75', stated_condition: 'weekend trips', quote: 'Per diem: $75 per day.' },
+          { ...base, fact: 4, stated_value: '$75', quote: 'Per diem: $75 per day.' },
+        ],
+      },
+      chunk,
+      ['a', 'b', 'c', 'd'],
+    );
+    expect(judgements.map((j) => [j.factId, j.mention, j.sameFact])).toEqual([
+      ['a', 'historical', 'yes'],
+      ['b', 'current', 'unsure'],
+      ['c', 'current', 'unsure'],
+      ['d', 'current', 'yes'],
+    ]);
+  });
+});
+
+/** A page whose fact mentions are far apart, so each becomes its own chunk. */
+const SPREAD_PAGE = '9700001';
+const SPREAD_LINES = ['Domestic trips: the per diem is $60 per day.', 'Expense claims are due within 30 days after the trip ends.', 'Trips over 2,000 USD need manager approval before booking.'];
+const spreadBody = SPREAD_LINES.map((l) => `<p>${l}</p>${Array.from({ length: 8 }, (_, i) => `<p>Filler line ${i} about the office.</p>`).join('')}`).join('');
+const spreadDeps = (over: Partial<ScanJobDeps> = {}): ScanJobDeps =>
+  jobDeps({
+    search: async () => [{ pageId: SPREAD_PAGE, title: 'Spread', url: null }],
+    page: async (id) => {
+      pageReads.push(id);
+      return { id, title: 'Spread', spaceId: '7', version: 1, versionCreatedAt: null, body: spreadBody };
+    },
+    ...over,
+  });
+
+describe('M2 review: consumers', () => {
+  it('W4: a page the app cannot read (403) or the model refuses is skipped, not the whole scan', async () => {
+    const page = jobDeps().page;
+    const deps = jobDeps({
+      page: async (id) => {
+        if (id === '9600003') throw new Error('Confluence REST v2 page 9600003 failed: HTTP 403');
+        return page(id);
+      },
+    });
+    const scanId = await fullScan(deps);
+    expect(scans.scans.get(scanId)).toMatchObject({ state: 'done', pagesSkipped: 1, pagesJudged: COPY_PAGES.length - 1 });
+    expect(scans.statusOf('domestic', '9600003')).toBeNull();
+    expect(scans.statusOf('claims', '9600004')).toBe('drifted');
+
+    const refusing = fakeLlm(llmCalls);
+    const refused = (async (m: Message[], t: ToolSpec) => {
+      if (String(m[1]?.content ?? '').includes('Finance FAQ')) throw Object.assign(new ForgeLlmError('bad request'), { status: 400 });
+      return (refusing as unknown as (m: Message[], t: ToolSpec) => Promise<unknown>)(m, t);
+    }) as unknown as ChatToolFn;
+    const second = await fullScan(jobDeps({ llm: refused }));
+    expect(scans.scans.get(second)).toMatchObject({ state: 'done', pagesSkipped: 1 });
+  });
+
+  it('W4: an LLM 5xx is retried, then fails the scan', async () => {
+    const down = (async (_m: Message[], tool: ToolSpec) => {
+      if (tool.name === 'record_search_terms') return { args: { facts: [] }, model: 'm' };
+      throw Object.assign(new ForgeLlmError('upstream'), { status: 503 });
+    }) as unknown as ChatToolFn;
+    const scanId = await newScan();
+    await runSearchJob(scanId, 0, jobDeps());
+    expect(await runJudgeJob(scanId, 0, jobDeps({ llm: down }))).toMatchObject({ status: 'retry', reason: 'llm-unavailable' });
+    expect(await runJudgeJob(scanId, 4, jobDeps({ llm: down }))).toMatchObject({ status: 'failed' });
+  });
+
+  it('W5: judge calls are limited in parallel and a retry continues with the chunks not judged yet', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let failClaims = true;
+    const base = fakeLlm(llmCalls, () => ({ mentions: [] }));
+    const llm = (async (m: Message[], t: ToolSpec) => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setImmediate(r));
+      inFlight--;
+      if (t.name !== 'record_search_terms' && failClaims && String(m[1]?.content ?? '').includes('Expense claims are due')) {
+        failClaims = false;
+        throw Object.assign(new ForgeLlmError('rate limited'), { status: 429 });
+      }
+      return (base as unknown as (m: Message[], t: ToolSpec) => Promise<unknown>)(m, t);
+    }) as unknown as ChatToolFn;
+    const scanId = await newScan();
+    await runSearchJob(scanId, 0, spreadDeps({ llm }));
+    llmCalls.length = 0;
+    expect(await runJudgeJob(scanId, 0, spreadDeps({ llm }))).toMatchObject({ status: 'retry' });
+    const firstRun = llmCalls.map((c) => c.chunk ?? '');
+    expect(firstRun.some((c) => c.includes(SPREAD_LINES[0] as string))).toBe(true);
+    llmCalls.length = 0;
+    expect((await runJudgeJob(scanId, 1, spreadDeps({ llm }))).status).toBe('done');
+    const secondRun = llmCalls.map((c) => c.chunk ?? '');
+    expect(secondRun.some((c) => c.includes(SPREAD_LINES[0] as string))).toBe(false); // saved, not judged again
+    expect(secondRun.some((c) => c.includes(SPREAD_LINES[1] as string))).toBe(true);
+    expect(maxInFlight).toBeLessThanOrEqual(JUDGE_CONCURRENCY);
+    expect(scans.chunks.size).toBe(0);
+  });
+
+  it('W5: the per-scan LLM call cap ends the scan as partial and keeps earlier copies', async () => {
+    await fullScan();
+    const before = scans.copies.size;
+    const scanId = await newScan();
+    await runSearchJob(scanId, 0, jobDeps());
+    await scans.addLlmCalls(scanId, MAX_LLM_CALLS_PER_SCAN - 2 - (scans.scans.get(scanId)?.llmCalls ?? 0));
+    llmCalls.length = 0;
+    const r = await runJudgeJob(scanId, 0, jobDeps());
+    expect(r).toMatchObject({ status: 'done', detail: { partial: 1 } });
+    expect(llmCalls).toHaveLength(2);
+    expect(scans.scans.get(scanId)).toMatchObject({ state: 'done', partial: true, llmCalls: MAX_LLM_CALLS_PER_SCAN });
+    expect(scans.copies.size).toBe(before);
+  });
+
+  it('W6: the search uses the fact ids fixed when the scan started', async () => {
+    const id = await scans.createScan(SOURCE_PAGE_ID, [factId('claims'), 'f-9-removed', factId('domestic')], 'acc-1');
+    if (!id) throw new Error('no scan');
+    expect(await runSearchJob(id, 0, jobDeps())).toEqual({ status: 'done', detail: { searched: 2, facts: 3 } });
+    expect(searchCalls).toHaveLength(2);
+    expect(searchCalls[0]?.cql).toContain('Expense claims');
+    expect(scans.scans.get(id)?.factCursor).toBe(3);
+  });
+
+  it('W7: a source unmarked during the scan stops it and leaves nothing behind', async () => {
+    const scanId = await newScan();
+    await runSearchJob(scanId, 0, jobDeps());
+    const page = jobDeps().page;
+    const deps = jobDeps({
+      page: async (id) => {
+        facts.sources.clear();
+        return page(id);
+      },
+    });
+    expect(await runJudgeJob(scanId, 0, deps)).toEqual({ status: 'skipped', reason: 'source unmarked' });
+    expect(scans.copies.size).toBe(0);
+    expect(scans.scans.has(scanId)).toBe(false);
+    expect(scans.hits).toEqual([]);
+  });
+});
+
+describe('M2 review: resolvers', () => {
+  it('W8: two concurrent starts give one running scan', async () => {
+    const [a, b] = await Promise.all([startScan(ctx, copyDeps()), startScan(ctx, copyDeps())]);
+    expect(scans.scans.size).toBe(1);
+    expect(pushes).toHaveLength(1);
+    const ids = [a, b].map((r) => ('scan' in r ? r.scan?.id : undefined));
+    expect(ids[0]).toBeDefined();
+    expect(ids[0]).toBe(ids[1]);
+  });
+
+  it('W9 + NFR-3: status counts and the list cover visible pages only; the rest is one total', async () => {
+    await fullScan();
+    const visible = async (ids: readonly string[]) => new Set(ids.filter((id) => id !== '9600003'));
+    const status = await getScanStatus(ctx, copyDeps({ visible }));
+    expect(status).toMatchObject({ counts: { drifted: 1, in_sync: 5, unsure: 1, historical: 1 } });
+    const list = vi.spyOn(scans, 'listCopies');
+    const all = await listCopies(ctx, undefined, copyDeps({ visible }));
+    expect(list.mock.calls[0]?.[2]).not.toContain('9600003'); // filtered before the row limit
+    expect(all).toMatchObject({ hiddenCount: 1 });
+    expect(await listCopies(ctx, { status: 'drifted' }, copyDeps({ visible }))).toMatchObject({ hiddenCount: 1 });
+    expect(await listCopies(ctx, { status: 'in_sync' }, copyDeps({ visible }))).toMatchObject({ hiddenCount: 0 });
+    // Copies of a fact that is no longer confirmed are neither listed nor counted.
+    scans.unconfirmed.add(factId('claims'));
+    const after = await getScanStatus(ctx, copyDeps());
+    expect(after).toMatchObject({ counts: { drifted: 1, in_sync: 4 } });
   });
 });

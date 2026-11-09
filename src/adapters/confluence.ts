@@ -65,7 +65,7 @@ export interface SearchHit {
 }
 
 interface RawSearch {
-  results?: { content?: { id?: string | number; type?: string; title?: string; _links?: { webui?: string } }; url?: string; title?: string }[];
+  results?: { content?: { id?: string | number; type?: string; status?: string; title?: string; _links?: { webui?: string } }; url?: string; title?: string }[];
   _links?: { next?: string };
 }
 
@@ -91,7 +91,8 @@ async function cqlSearch(requester: Requester, cql: string, max: number): Promis
     const results = body.results ?? [];
     for (const r of results) {
       const c = r.content;
-      if (!c || c.type !== 'page' || c.id === undefined || hits.size >= max) continue;
+      // Archived (or draft/trashed) pages are not copies anyone reads (PRD business rules); only `current` counts.
+      if (!c || c.type !== 'page' || c.id === undefined || (c.status !== undefined && c.status !== 'current') || hits.size >= max) continue;
       const pageId = String(c.id);
       if (!hits.has(pageId)) hits.set(pageId, { pageId, title: c.title ?? r.title ?? '', url: c._links?.webui ?? r.url ?? null });
     }
