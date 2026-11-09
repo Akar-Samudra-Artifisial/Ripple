@@ -1,7 +1,8 @@
+import { view } from '@forge/bridge';
 import { useCallback, useEffect, useState } from 'react';
 import type { BylineStatus } from '../../src/core/views';
 import { call } from './bridge';
-import { ChangePanel } from './changePanel';
+import { CHANGE_MODAL_VIEW, ChangeModalView, ChangePanel } from './changePanel';
 import { mount } from './mount';
 import { SourcePanel } from './sourcePanel';
 
@@ -56,6 +57,9 @@ function useBylineStatus(): BylineState & { retry: () => void } {
 /** Byline popup: readiness, database setup progress (polled while not ready), owner/team and the source-of-truth panel. */
 function Byline() {
   const { data, error, timedOut, retry } = useBylineStatus();
+  /** Bumped after a change is confirmed/dismissed so the source panel reloads facts and copies. */
+  const [revision, setRevision] = useState(0);
+  const onDecided = useCallback(() => setRevision((r) => r + 1), []);
   if (error) {
     return (
       <div className="alert" role="alert">
@@ -108,6 +112,7 @@ function Byline() {
           </button>
         </div>
       ) : null}
+      {schema.status === 'ready' && data.pendingChange ? <ChangePanel onDecided={onDecided} /> : null}
       <p>
         <strong>Owner: {ownerName}</strong> · Team: {teamNames} <span className="muted">(via Teamwork Graph)</span>
       </p>
@@ -116,14 +121,38 @@ function Byline() {
         <p className="muted">{spaceTeams.dataPresent ? 'No team is linked to this space.' : 'Teamwork Graph returned no data.'}</p>
       ) : null}
       {spaceTeams.errors.length > 0 ? <p className="error">{spaceTeams.errors.join(' | ')}</p> : null}
-      {schema.status === 'ready' && data.pendingChange ? <ChangePanel /> : null}
-      {schema.status === 'ready' ? <SourcePanel /> : null}
+      {schema.status === 'ready' ? <SourcePanel key={revision} /> : null}
     </>
   );
 }
 
+/**
+ * The byline resource also serves the change-review modal (opened with `Modal` and no `resource`, so the manifest is
+ * unchanged); `extension.modal.view` tells the two apart.
+ */
+function Root() {
+  const [isModal, setIsModal] = useState<boolean>();
+  useEffect(() => {
+    view
+      .getContext()
+      .then((ctx) => {
+        const modal: unknown = ctx.extension.modal;
+        setIsModal(typeof modal === 'object' && modal !== null && (modal as { view?: unknown }).view === CHANGE_MODAL_VIEW);
+      })
+      .catch(() => setIsModal(false));
+  }, []);
+  if (isModal === undefined) {
+    return (
+      <p className="muted" role="status">
+        Loading…
+      </p>
+    );
+  }
+  return isModal ? <ChangeModalView /> : <Byline />;
+}
+
 mount(
   <main className="shell">
-    <Byline />
+    <Root />
   </main>,
 );
