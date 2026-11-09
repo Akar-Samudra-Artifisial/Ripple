@@ -1,0 +1,29 @@
+modules:
+  confluence:contentBylineItem:
+    - key: ripple-page-owners
+      resource: main
+      resolver:
+        function: resolver
+      render: native
+      title: Ripple owners
+  function:
+    - key: resolver
+      handler: index.handler
+resources:
+  - key: main
+    path: src/frontend/index.jsx
+permissions:
+  scopes:
+    # Confluence REST v2 fallback: GET /wiki/api/v2/pages/{id}
+    - read:page:confluence
+    # Teamwork Graph (Preview, read-only; a missing scope returns empty data, not an error)
+    - read:graph:page:confluence
+    - read:graph:space:confluence
+    - read:graph:team:atlassian
+    - read:graph:user:atlassian
+app:
+  runtime:
+    name: nodejs24.x
+    memoryMB: 256
+    architecture: arm64
+  id: ari:cloud:ecosystem::app/c5c7e62a-0653-4083-ab31-3a3bc498ad87
