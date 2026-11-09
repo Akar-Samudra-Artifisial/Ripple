@@ -4,6 +4,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const calls: { statement: string; params: unknown[] }[] = [];
 let failWith: unknown;
+/** Affected rows per statement (undefined: 0 for every write). */
+let affected: ((statement: string) => number) | undefined;
 
 vi.mock('@forge/events', () => ({ Queue: class {} }));
 vi.mock('@forge/sql', () => ({
@@ -14,7 +16,8 @@ vi.mock('@forge/sql', () => ({
         execute: async () => {
           calls.push({ statement, params });
           if (failWith) throw failWith;
-          return { rows: [{ page_id: '9600001', fact_id: 'f-1', chunk_text: 'x' }] };
+          const rows = [{ page_id: '9600001', fact_id: 'f-1', chunk_text: 'x' }];
+          return { rows: affected === undefined ? rows : Object.assign(rows, { affectedRows: affected(statement) }) };
         },
       }),
     }),
@@ -22,6 +25,7 @@ vi.mock('@forge/sql', () => ({
 }));
 
 import { sqlChangeRepo } from '../src/adapters/changeRepo';
+import { sqlProposalRepo } from '../src/adapters/proposalRepo';
 import { sqlRepo } from '../src/adapters/repo';
 import { sqlScanRepo } from '../src/adapters/scanRepo';
 import { sqlErrorInfo, sqlInt, sqlOp } from '../src/core/schema';
@@ -29,6 +33,37 @@ import { sqlErrorInfo, sqlInt, sqlOp } from '../src/core/schema';
 beforeEach(() => {
   calls.length = 0;
   failWith = undefined;
+  affected = undefined;
+});
+
+describe('M4 proposal writes', () => {
+  const FC = { factId: 'f-1', oldValue: '$60', oldUnit: null, newValue: '$75', newUnit: null, newQuote: 'q', version: 4, versionAt: null };
+
+  it('revertFactChange rejects the open proposals of that change as reverted', async () => {
+    affected = () => 1;
+    const r = await sqlChangeRepo.revertFactChange('9600001', FC, ['c-1'], 'ch-1');
+    expect(r).toMatchObject({ reverted: true, proposals: 1 });
+    const reject = calls.find((c) => c.statement.startsWith('UPDATE proposals'));
+    expect(reject?.statement).toBe("UPDATE proposals SET status = 'rejected', error_code = 'reverted' WHERE change_id = ? AND fact_id = ? AND status IN ('proposed', 'stale', 'needs_manual')");
+    expect(reject?.params).toEqual(['ch-1', 'f-1']);
+  });
+
+  it('supersedeOlder only touches open proposals of other changes of these facts', async () => {
+    affected = () => 2;
+    expect(await sqlProposalRepo.supersedeOlder('9600001', 'ch-2', ['f-1', 'f-2'])).toBe(2);
+    expect(calls[0]?.statement).toContain("status IN ('proposed', 'stale', 'needs_manual') AND fact_id IN (?, ?)");
+    expect(calls[0]?.params).toEqual(['9600001', 'ch-2', 'f-1', 'f-2']);
+  });
+
+  it('claimRequeue: first claim now, then delayed once within 2 minutes, then skip', async () => {
+    affected = () => 1;
+    expect(await sqlProposalRepo.claimRequeue('ch-1', '9700001', '9600001')).toBe('now');
+    affected = (s) => (s.includes('delayed = 1') ? 1 : 0);
+    expect(await sqlProposalRepo.claimRequeue('ch-1', '9700001', '9600001')).toBe('delayed');
+    expect(calls.some((c) => c.statement.includes('INTERVAL 120 SECOND'))).toBe(true);
+    affected = () => 0;
+    expect(await sqlProposalRepo.claimRequeue('ch-1', '9700001', '9600001')).toBe('skip');
+  });
 });
 
 describe('Forge SQL LIMIT (TiDB rejects a bound LIMIT with ER_WRONG_ARGUMENTS)', () => {
@@ -73,6 +108,7 @@ describe('page_events stays bounded', () => {
     expect(deletes).toContain('DELETE FROM page_events WHERE page_id = ?');
     expect(deletes).toContain('DELETE FROM change_dismissals WHERE source_page_id = ?');
     expect(deletes).toContain('DELETE FROM proposals WHERE source_page_id = ?');
+    expect(deletes).toContain('DELETE FROM propose_requeues WHERE source_page_id = ?');
     expect(deletes.indexOf('DELETE FROM proposals WHERE source_page_id = ?')).toBeLessThan(deletes.indexOf('DELETE FROM changes WHERE source_page_id = ?'));
     expect(deletes.at(-1)).toBe('DELETE FROM sources WHERE page_id = ?');
   });

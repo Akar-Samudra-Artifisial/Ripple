@@ -35,6 +35,12 @@ export function proposalProblem(status: ProposalState, code: string | null): str
     case 'validation_failed':
     case 'llm_failed':
       return 'Ripple could not write a safe new sentence.';
+    case 'superseded':
+      return 'A newer change to the source replaced this value.';
+    case 'reverted':
+      return 'The source change was undone.';
+    case 'http_error':
+      return 'Confluence did not answer. Try again in a moment.';
     default:
       return status === 'needs_manual' ? 'Ripple could not edit this sentence safely.' : 'Something went wrong. Try again in a moment.';
   }

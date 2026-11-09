@@ -81,6 +81,13 @@ export interface ProposalRepo {
   markCopyUpdated(copyId: string, value: string, unit: string | null, sentence: string, version: number): Promise<boolean>;
   /** Not the same fact: the copy is ignored (sticky). */
   ignoreCopy(copyId: string): Promise<boolean>;
+  /** Open proposals of other (older) changes of these facts → `rejected` (`superseded`); returns how many. */
+  supersedeOlder(sourcePageId: string, changeId: string, factIds: readonly string[]): Promise<number>;
+  /**
+   * Rate limit for queueing the stale proposals of (change, page) again: `now` at most once per 2 minutes, `delayed`
+   * once within that window (the caller queues a delayed job), `skip` otherwise.
+   */
+  claimRequeue(changeId: string, pageId: string, sourcePageId: string): Promise<'now' | 'delayed' | 'skip'>;
 }
 
 interface ProposalDbRow {
@@ -132,6 +139,8 @@ const MAX_CHANGE_PROPOSALS = 500;
 const OPEN_FIRST = "CASE status WHEN 'proposed' THEN 0 WHEN 'approved' THEN 1 WHEN 'stale' THEN 2 WHEN 'needs_manual' THEN 3 WHEN 'failed' THEN 4 ELSE 5 END";
 const UPDATED_REASON = 'Updated by Ripple to the new official value.';
 const IGNORED_REASON = 'Marked as not the same fact.';
+/** Stale proposals of one (change, page) are queued again at most once per window. */
+export const REQUEUE_WINDOW_SECONDS = 120;
 
 export const sqlProposalRepo: ProposalRepo = {
   async copiesByIds(ids) {
@@ -257,5 +266,30 @@ export const sqlProposalRepo: ProposalRepo = {
   async ignoreCopy(copyId) {
     const n = await execute("UPDATE copies SET status = 'ignored', reason = ? WHERE id = ? AND status IN ('in_sync', 'drifted', 'unsure')", IGNORED_REASON, copyId);
     return n > 0;
+  },
+
+  async supersedeOlder(sourcePageId, changeId, factIds) {
+    if (factIds.length === 0) return 0;
+    return execute(
+      `UPDATE proposals SET status = 'rejected', error_code = 'superseded'
+       WHERE source_page_id = ? AND change_id <> ? AND status IN ('proposed', 'stale', 'needs_manual') AND fact_id IN (${placeholders(factIds.length)})`,
+      sourcePageId,
+      changeId,
+      ...factIds,
+    );
+  },
+
+  async claimRequeue(changeId, pageId, sourcePageId) {
+    const inserted = await execute('INSERT IGNORE INTO propose_requeues (change_id, page_id, source_page_id) VALUES (?, ?, ?)', changeId, pageId, sourcePageId);
+    if (inserted > 0) return 'now';
+    const renewed = await execute(
+      `UPDATE propose_requeues SET requeued_at = CURRENT_TIMESTAMP, delayed = 0
+       WHERE change_id = ? AND page_id = ? AND requeued_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL ${REQUEUE_WINDOW_SECONDS} SECOND)`,
+      changeId,
+      pageId,
+    );
+    if (renewed > 0) return 'now';
+    const delayed = await execute('UPDATE propose_requeues SET delayed = 1 WHERE change_id = ? AND page_id = ? AND delayed = 0', changeId, pageId);
+    return delayed > 0 ? 'delayed' : 'skip';
   },
 };

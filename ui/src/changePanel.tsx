@@ -3,7 +3,6 @@ import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { ChangeDecision, ChangePageView, ChangeSpaceView, PendingChangeReply, PendingChangeView } from '../../src/core/views';
 import { call } from './bridge';
 import { Alert, LoadingRows, errorOf } from './components';
-import { rememberChange } from './rollout';
 
 /** Value sent in the modal context so the byline resource renders the change review instead of the byline. */
 export const CHANGE_MODAL_VIEW = 'ripple-change-review';
@@ -119,7 +118,6 @@ function ChangeReview({ mode, onDecided }: ChangeReviewProps) {
     try {
       const payload = action === 'confirmChange' ? { changeId: change.id, deadlineDays: days, version: change.version } : { changeId: change.id, version: change.version };
       const decision = await call<ChangeDecision>(action, payload);
-      if (decision.status === 'confirmed' && pageId) rememberChange(pageId, decision.changeId);
       setDone(decision);
       onDecided?.();
     } catch (e) {

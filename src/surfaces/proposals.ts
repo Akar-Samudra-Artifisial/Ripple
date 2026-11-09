@@ -12,8 +12,21 @@
  */
 import { Queue } from '@forge/events';
 import { sqlChangeRepo, type ChangeRepo, type ChangeRow } from '../adapters/changeRepo';
-import { canEditPage, ConfluenceRetryableError, getPageAsUser, getSourcePage, PageNotFoundError, updatePageAsUser, visiblePageIds, type SourcePage, type UserPage, type UserResult } from '../adapters/confluence';
-import { sqlProposalRepo, type CopyForProposal, type ProposalRepo, type ProposalRow } from '../adapters/proposalRepo';
+import {
+  canEditPage,
+  ConfluenceRetryableError,
+  getPageAsUser,
+  getSourcePage,
+  PageNotFoundError,
+  pageIsOpen,
+  updatePageAsUser,
+  visiblePageIds,
+  type SourcePage,
+  type UserPage,
+  type UserResult,
+} from '../adapters/confluence';
+import { displayNames } from '../adapters/confluenceUsers';
+import { REQUEUE_WINDOW_SECONDS, sqlProposalRepo, type CopyForProposal, type ProposalRepo, type ProposalRow } from '../adapters/proposalRepo';
 import { sqlRepo, type FactRepo } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
 import { scrubErrorText } from '../adapters/teamworkGraph';
@@ -21,7 +34,7 @@ import { RIPPLE_VERSION_PREFIX, type FactChange } from '../core/changes';
 import { MAX_COPY_PAGE_CHARS, valueLabel } from '../core/copies';
 import { quoteInText } from '../core/facts';
 import { storageToText } from '../core/pageText';
-import { MANUAL_CODES, replaceValueToken, validateRewrite, type ProposalErrorCode, type ProposalMethod, type ValueText } from '../core/proposals';
+import { MANUAL_CODES, MAX_SENTENCE_CHARS, replaceValueToken, validateRewrite, type ProposalErrorCode, type ProposalMethod, type ValueText } from '../core/proposals';
 import { isSqlRateLimited, SchemaSettingUpError } from '../core/schema';
 import { replaceSentence, sentenceCount } from '../core/storageEdit';
 import type {
@@ -53,11 +66,18 @@ const BAD_EDIT = 'Your sentence must state the new value and no longer the old o
 
 const extractQueue = new Queue({ key: EXTRACT_QUEUE });
 
-/** Queues proposals of a confirmed change (all copies, or one copy again after it went stale). */
-export async function enqueuePropose(sourcePageId: string, changeId: string, copyId?: string): Promise<string> {
+/** Which copies a propose job handles again: the stale ones of one copy page, optionally after a delay. */
+export interface ProposeTarget {
+  copyPageId: string;
+  delaySeconds?: number;
+}
+
+/** Queues proposals of a confirmed change (all copies, or the stale ones of one copy page). */
+export async function enqueuePropose(sourcePageId: string, changeId: string, target?: ProposeTarget): Promise<string> {
   const { jobId } = await extractQueue.push({
-    body: { pageId: sourcePageId, kind: 'propose', changeId, ...(copyId ? { copyId } : {}) },
+    body: { pageId: sourcePageId, kind: 'propose', changeId, ...(target ? { copyPageId: target.copyPageId } : {}) },
     concurrency: { key: `extract-page-${sourcePageId}`, limit: 1 },
+    ...(target?.delaySeconds ? { delayInSeconds: target.delaySeconds } : {}),
   });
   return jobId;
 }
@@ -131,10 +151,16 @@ async function draftFor(copy: CopyForProposal, fc: FactChange, page: SourcePage,
 }
 
 /**
- * Proposals of a confirmed change, one per affected copy (`copyId`: only that copy, after it went stale). A copy
- * that already has a proposal (other than `stale`) is skipped, so a redelivered job changes nothing.
+ * Proposals of a confirmed change, one per affected copy (`scope`: one copy id, or the copies of one page after they
+ * went stale). A copy that already has a proposal (other than `stale`) is skipped, so a redelivered job changes
+ * nothing.
  */
-export async function runProposeJob(changeId: string, copyId: string | undefined, retryCount: number, deps: ProposeDeps = defaultProposeDeps): Promise<ProposeOutcome> {
+export async function runProposeJob(
+  changeId: string,
+  scope: string | { copyPageId: string } | undefined,
+  retryCount: number,
+  deps: ProposeDeps = defaultProposeDeps,
+): Promise<ProposeOutcome> {
   try {
     await deps.ensure();
   } catch (err) {
@@ -145,7 +171,7 @@ export async function runProposeJob(changeId: string, copyId: string | undefined
   try {
     const change = await deps.changes.getChange(changeId);
     if (!change || change.status !== 'confirmed') return { status: 'skipped', reason: 'change not confirmed' };
-    const targets = (change.impact?.copies ?? []).filter((c) => copyId === undefined || c.copyId === copyId);
+    const targets = (change.impact?.copies ?? []).filter((c) => (scope === undefined ? true : typeof scope === 'string' ? c.copyId === scope : c.pageId === scope.copyPageId));
     const copies = new Map((await deps.proposals.copiesByIds(targets.map((t) => t.copyId))).map((c) => [c.id, c]));
     const byFact = new Map(change.factChanges.map((c) => [c.factId, c]));
     const pages = new Map<string, SourcePage | ProposalErrorCode>();
@@ -214,12 +240,16 @@ export async function runProposeJob(changeId: string, copyId: string | undefined
 export interface ProposalDeps {
   proposals: ProposalRepo;
   changes: Pick<ChangeRepo, 'getChange' | 'copiesForFacts'>;
-  facts: Pick<FactRepo, 'audit' | 'getSource'>;
+  facts: Pick<FactRepo, 'audit' | 'getSource' | 'getFact'>;
   canEdit: (pageId: string) => Promise<boolean>;
   visible: (pageIds: readonly string[]) => Promise<Set<string>>;
   getPage: (pageId: string) => Promise<UserResult<UserPage>>;
   updatePage: (pageId: string, page: { title: string; body: string; version: number; message: string }) => Promise<UserResult<number>>;
-  enqueuePropose: (sourcePageId: string, changeId: string, copyId?: string) => Promise<string>;
+  enqueuePropose: (sourcePageId: string, changeId: string, target?: ProposeTarget) => Promise<string>;
+  /** The source page has no read restriction (page or ancestors) and its space is readable: its title may be named. */
+  sourceIsOpen: (pageId: string) => Promise<boolean>;
+  /** Display names as the viewer may see them (users-bulk, as the user). */
+  names: (accountIds: readonly string[]) => Promise<Map<string, string>>;
   ensure: () => Promise<void>;
 }
 
@@ -232,6 +262,8 @@ const defaultDeps: ProposalDeps = {
   getPage: getPageAsUser,
   updatePage: updatePageAsUser,
   enqueuePropose,
+  sourceIsOpen: pageIsOpen,
+  names: (ids) => displayNames(ids),
   ensure: ensureSchema,
 };
 
@@ -253,10 +285,43 @@ async function guarded<T>(ctx: SourceContext, deps: ProposalDeps, what: string, 
   }
 }
 
-/** Version message of Ripple's edits; starts with `RIPPLE_VERSION_PREFIX` so the updated:page trigger skips it. */
+/**
+ * Version message of Ripple's edits; starts with `RIPPLE_VERSION_PREFIX` so the updated:page trigger skips it. The
+ * source title only when it may be named to anyone (see `versionMessageFor`).
+ */
 export function versionMessage(sourceTitle: string | null | undefined): string {
   const title = (sourceTitle ?? '').replace(/\s+/g, ' ').trim().slice(0, 150);
-  return `${RIPPLE_VERSION_PREFIX} from ${title === '' ? 'the source page' : title}`;
+  return title === '' ? RIPPLE_VERSION_PREFIX : `${RIPPLE_VERSION_PREFIX} from ${title}`;
+}
+
+/**
+ * Message of a version that applies proposals of these sources: the title of a single unrestricted source, else the
+ * generic message (a page history is visible to more people than the source may be).
+ */
+async function versionMessageFor(deps: ProposalDeps, sourcePageIds: readonly string[]): Promise<string> {
+  const ids = [...new Set(sourcePageIds)];
+  const [only] = ids;
+  if (ids.length !== 1 || only === undefined || !(await deps.sourceIsOpen(only))) return versionMessage(null);
+  return versionMessage((await deps.facts.getSource(only))?.title);
+}
+
+/**
+ * The proposal still writes the current official value: its change is confirmed and the fact's value is the change's
+ * new value (a newer confirmed change or an undo replaced it otherwise).
+ */
+async function stillCurrent(deps: ProposalDeps, p: ProposalRow): Promise<boolean> {
+  const change = await deps.changes.getChange(p.changeId);
+  const fc = change?.factChanges.find((c) => c.factId === p.factId);
+  if (!change || change.status !== 'confirmed' || !fc) return false;
+  const fact = await deps.facts.getFact(p.factId);
+  return fact !== undefined && fact.status === 'confirmed' && fact.value === fc.newValue && (fact.unit ?? null) === (fc.newUnit ?? null);
+}
+
+/** Rejects an outdated proposal (`superseded`); false when its status moved on meanwhile. */
+async function supersede(deps: ProposalDeps, actor: string, p: ProposalRow): Promise<boolean> {
+  if (!(await deps.proposals.setStatus(p.id, ['proposed', 'approved', 'stale', 'needs_manual'], 'rejected', 'superseded'))) return false;
+  await deps.facts.audit('proposal.superseded', actor, 'proposal', p.id, { changeId: p.changeId, pageId: p.pageId });
+  return true;
 }
 
 const decision = (p: Pick<ProposalRow, 'id' | 'status' | 'errorCode' | 'appliedVersion'>): ProposalDecision => ({ proposalId: p.id, status: p.status, errorCode: p.errorCode, version: p.appliedVersion });
@@ -277,17 +342,26 @@ const userFailure = (status: number): ProposalErrorCode => (status === 401 || st
 /** A failure where trying again later may work: the proposal goes back to `proposed`. */
 const transient = (code: ProposalErrorCode): boolean => code === 'http_error';
 
-/** Marks proposals stale (version changed) and queues them again from the new version. */
+/**
+ * Marks proposals stale (version changed) and queues them again from the new version: one job per (change, copy
+ * page), at most once per `REQUEUE_WINDOW_SECONDS` plus one delayed follow-up within the window.
+ */
 async function goStale(deps: ProposalDeps, actor: string, rows: readonly ProposalRow[], code: ProposalErrorCode): Promise<number> {
   let n = 0;
+  const queue = new Map<string, ProposalRow>();
   for (const p of rows) {
     if (!(await deps.proposals.setStatus(p.id, ['approved', 'proposed'], 'stale', code))) continue;
     n++;
     await deps.facts.audit('proposal.stale', actor, 'proposal', p.id, { changeId: p.changeId, pageId: p.pageId, errorCode: code });
+    queue.set(`${p.changeId}:${p.pageId}`, p);
+  }
+  for (const p of queue.values()) {
     try {
-      await deps.enqueuePropose(p.sourcePageId, p.changeId, p.copyId);
+      const claim = await deps.proposals.claimRequeue(p.changeId, p.pageId, p.sourcePageId);
+      if (claim === 'skip') continue;
+      await deps.enqueuePropose(p.sourcePageId, p.changeId, { copyPageId: p.pageId, ...(claim === 'delayed' ? { delaySeconds: REQUEUE_WINDOW_SECONDS } : {}) });
     } catch (err) {
-      console.warn('ripple proposal: re-propose not queued', { proposalId: p.id, error: errorText(err) });
+      console.warn('ripple proposal: re-propose not queued', { changeId: p.changeId, pageId: p.pageId, error: errorText(err) });
     }
   }
   return n;
@@ -343,7 +417,8 @@ export async function approveProposal(ctx: SourceContext, payload: Partial<Appro
     let sentence = p.newSentence;
     let edited = false;
     if (raw !== undefined && raw !== null) {
-      if (typeof raw !== 'string') return { error: BAD_EDIT };
+      // Length first: nothing below runs a regex over an unbounded string.
+      if (typeof raw !== 'string' || raw.length > MAX_SENTENCE_CHARS) return { error: BAD_EDIT };
       const text = raw.replace(/\s+/g, ' ').trim();
       const oldValue = { value: p.oldValue ?? '', unit: null };
       const newValue = { value: p.newValue ?? '', unit: null };
@@ -356,6 +431,22 @@ export async function approveProposal(ctx: SourceContext, payload: Partial<Appro
     if (!(await deps.proposals.lock(p.id))) {
       const now = await deps.proposals.get(p.id);
       return decision(now ?? p);
+    }
+    try {
+      return await applyLocked(deps, actor, pageId, { ...p, oldSentence: p.oldSentence, pageVersion: p.pageVersion }, sentence, edited);
+    } catch (err) {
+      // Never leave the lock held: back to `proposed` so the editor can try again (no-op once applied).
+      await deps.proposals.setStatus(p.id, ['approved'], 'proposed', 'http_error').catch(() => false);
+      throw err;
+    }
+  });
+}
+
+/** Approval of a locked (`approved`) proposal; every exit moves it out of `approved`, an exception is the caller's. */
+async function applyLocked(deps: ProposalDeps, actor: string, pageId: string, p: ProposalRow & { oldSentence: string; pageVersion: number }, sentence: string, edited: boolean): Promise<ProposalDecision> {
+  if (!(await stillCurrent(deps, p))) {
+      await supersede(deps, actor, p);
+      return { proposalId: p.id, status: 'rejected', errorCode: 'superseded', version: null };
     }
     const finish = async (status: 'proposed' | 'stale' | 'needs_manual' | 'failed', code: ProposalErrorCode | null): Promise<ProposalDecision> => {
       if (status === 'stale') await goStale(deps, actor, [{ ...p, status: 'approved' }], code ?? 'version_changed');
@@ -381,9 +472,9 @@ export async function approveProposal(ctx: SourceContext, payload: Partial<Appro
       return finish('stale', 'version_changed');
     }
     const edit = replaceSentence(page.body, p.oldSentence, sentence);
-    if (!edit.ok) return finish(edited && edit.code === 'validation_failed' ? 'proposed' : 'needs_manual', edit.code);
-    const source = await deps.facts.getSource(p.sourcePageId);
-    const saved = await deps.updatePage(pageId, { title: page.title, body: edit.body, version: page.version + 1, message: versionMessage(source?.title) });
+    // The editor's own wording that cannot be placed (e.g. crosses markup) leaves Ripple's proposal as it was.
+    if (!edit.ok) return finish(edited ? 'proposed' : 'needs_manual', edit.code);
+    const saved = await deps.updatePage(pageId, { title: page.title, body: edit.body, version: page.version + 1, message: await versionMessageFor(deps, [p.sourcePageId]) });
     if (!saved.ok) {
       const code = userFailure(saved.status);
       if (code === 'conflict') return finish('stale', 'conflict');
@@ -393,7 +484,6 @@ export async function approveProposal(ctx: SourceContext, payload: Partial<Appro
     await rebaseOthers(deps, actor, pageId, new Set([p.id]), edit.body, page.version, saved.value);
     console.info('ripple proposal applied', { proposalId: p.id, pageId, version: saved.value, method: p.method, edited });
     return { proposalId: p.id, status: 'applied', errorCode: null, version: saved.value };
-  });
 }
 
 /**
@@ -406,12 +496,30 @@ export async function approveAll(ctx: SourceContext, deps: ProposalDeps = defaul
     const actor = ctx.accountId;
     const result: ApproveAllResult = { applied: 0, stale: 0, needsManual: 0, failed: 0, version: null };
     const open = (await deps.proposals.listForPage(pageId)).filter((p) => p.status === 'proposed' && p.oldSentence !== null && p.newSentence !== null);
-    const locked: ProposalRow[] = [];
-    for (const p of open) if (await deps.proposals.lock(p.id)) locked.push(p);
-    if (locked.length === 0) return result;
+    const all: ProposalRow[] = [];
+    for (const p of open) if (await deps.proposals.lock(p.id)) all.push(p);
+    if (all.length === 0) return result;
+    try {
+      return await applyAllLocked(deps, actor, pageId, all, result);
+    } catch (err) {
+      // Never leave locks held: whatever is still `approved` goes back to `proposed`.
+      for (const p of all) await deps.proposals.setStatus(p.id, ['approved'], 'proposed', 'http_error').catch(() => false);
+      throw err;
+    }
+  });
+}
+
+async function applyAllLocked(deps: ProposalDeps, actor: string, pageId: string, all: readonly ProposalRow[], result: ApproveAllResult): Promise<ApproveAllResult | ErrorReply> {
     const release = async (rows: readonly ProposalRow[], to: 'proposed' | 'failed', code: ProposalErrorCode | null) => {
       for (const p of rows) await deps.proposals.setStatus(p.id, ['approved'], to, code);
     };
+    // Outdated proposals (a newer confirmed change, an undone confirmation) are rejected, not applied.
+    const locked: ProposalRow[] = [];
+    for (const p of all) {
+      if (await stillCurrent(deps, p)) locked.push(p);
+      else await supersede(deps, actor, p);
+    }
+    if (locked.length === 0) return result;
     const got = await deps.getPage(pageId);
     if (!got.ok) {
       const code = userFailure(got.status);
@@ -441,8 +549,11 @@ export async function approveAll(ctx: SourceContext, deps: ProposalDeps = defaul
       applied.push(p);
     }
     if (applied.length === 0) return result;
-    const source = await deps.facts.getSource(applied[0]?.sourcePageId ?? '');
-    const saved = await deps.updatePage(pageId, { title: page.title, body, version: page.version + 1, message: versionMessage(source?.title) });
+    const message = await versionMessageFor(
+      deps,
+      applied.map((p) => p.sourcePageId),
+    );
+    const saved = await deps.updatePage(pageId, { title: page.title, body, version: page.version + 1, message });
     if (!saved.ok) {
       const code = userFailure(saved.status);
       if (code === 'conflict') result.stale += await goStale(deps, actor, applied, 'conflict');
@@ -459,7 +570,6 @@ export async function approveAll(ctx: SourceContext, deps: ProposalDeps = defaul
     await rebaseOthers(deps, actor, pageId, new Set(applied.map((p) => p.id)), body, page.version, saved.value);
     console.info('ripple proposals applied', { pageId, applied: result.applied, stale: result.stale, needsManual: result.needsManual, version: saved.value });
     return result;
-  });
 }
 
 /** The editor does not want this edit; the copy keeps its status. */
@@ -497,21 +607,35 @@ export async function listProposalsForPage(ctx: SourceContext, deps: ProposalDep
     const seen = sourceIds.length > 0 ? await deps.visible(sourceIds) : new Set<string>();
     const titles = new Map<string, string | null>();
     for (const id of sourceIds) titles.set(id, seen.has(id) ? ((await deps.facts.getSource(id))?.title ?? null) : null);
+    // Fact labels only for facts of sources the viewer can open.
+    const labels = new Map<string, string | null>();
+    for (const p of rows) {
+      if (!seen.has(p.sourcePageId) || labels.has(p.factId)) continue;
+      const fact = await deps.facts.getFact(p.factId);
+      labels.set(p.factId, fact && fact.sourcePageId === p.sourcePageId ? `${fact.subject} · ${fact.attribute}` : null);
+    }
     const canEdit = rows.length > 0 && ctx.accountId ? await deps.canEdit(pageId) : false;
-    const proposals: ProposalView[] = rows.map((p) => ({
-      id: p.id,
-      changeId: p.changeId,
-      status: p.status,
-      oldSentence: p.oldSentence,
-      newSentence: p.newSentence,
-      oldValue: p.oldValue,
-      newValue: p.newValue,
-      method: p.method,
-      errorCode: p.errorCode,
-      sourcePageId: p.sourcePageId,
-      sourceTitle: titles.get(p.sourcePageId) ?? null,
-      appliedVersion: p.appliedVersion,
-    }));
+    const proposals: ProposalView[] = rows.map((p) => {
+      const shown = seen.has(p.sourcePageId);
+      // Editors of this page apply the new sentence, so they see it even when the source is hidden from them.
+      const showNew = shown || canEdit;
+      return {
+        id: p.id,
+        changeId: p.changeId,
+        status: p.status,
+        oldSentence: p.oldSentence,
+        newSentence: showNew ? p.newSentence : null,
+        oldValue: p.oldValue,
+        newValue: showNew ? p.newValue : null,
+        method: p.method,
+        errorCode: p.errorCode,
+        sourcePageId: shown ? p.sourcePageId : null,
+        sourceTitle: shown ? (titles.get(p.sourcePageId) ?? null) : null,
+        sourceHidden: !shown,
+        factLabel: shown ? (labels.get(p.factId) ?? null) : null,
+        appliedVersion: p.appliedVersion,
+      };
+    });
     return { pageId, canEdit, proposals };
   });
 }
@@ -535,7 +659,29 @@ export async function listRollout(ctx: SourceContext, payload: Partial<ChangeIdO
       ).map((c) => [c.pageId, { title: c.pageTitle, url: c.pageUrl }]),
     );
     const shown = rows.filter((p) => seen.has(p.pageId));
-    const items: RolloutItem[] = shown.map((p) => ({ proposalId: p.id, pageId: p.pageId, pageTitle: titles.get(p.pageId)?.title ?? null, pageUrl: titles.get(p.pageId)?.url ?? null, status: p.status, errorCode: p.errorCode }));
+    // Owners recorded at confirm time; names as the viewer may see them (a failed lookup only hides the names).
+    const ownerOf = new Map((change.routing?.pages ?? []).map((r) => [r.pageId, r.ownerAccountId]));
+    const ownerIds = [...new Set(shown.map((p) => ownerOf.get(p.pageId)).filter((id): id is string => typeof id === 'string' && id !== ''))];
+    let names = new Map<string, string>();
+    if (ownerIds.length > 0) {
+      try {
+        names = await deps.names(ownerIds);
+      } catch (err) {
+        console.warn('ripple rollout: owner names failed', { changeId, owners: ownerIds.length, error: errorText(err) });
+      }
+    }
+    const items: RolloutItem[] = shown.map((p) => {
+      const accountId = ownerOf.get(p.pageId) ?? null;
+      return {
+        proposalId: p.id,
+        pageId: p.pageId,
+        pageTitle: titles.get(p.pageId)?.title ?? null,
+        pageUrl: titles.get(p.pageId)?.url ?? null,
+        status: p.status,
+        errorCode: p.errorCode,
+        owner: { accountId, displayName: accountId ? (names.get(accountId) ?? null) : null },
+      };
+    });
     const counts: Rollout['counts'] = {};
     for (const p of shown) counts[p.status] = (counts[p.status] ?? 0) + 1;
     return { changeId, items, counts, hiddenCount: rows.length - shown.length };

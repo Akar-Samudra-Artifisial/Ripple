@@ -75,7 +75,7 @@ export interface ChangeRepo {
    * Undoes `applyFactChange` (old value and unit back, quote kept): only while the fact still holds the change's new
    * value with its old value as `previous_value`. Then the given copies drifted by that confirmation are in sync again.
    */
-  revertFactChange(sourcePageId: string, change: FactChange, copyIds: readonly string[]): Promise<{ reverted: boolean; copies: number }>;
+  revertFactChange(sourcePageId: string, change: FactChange, copyIds: readonly string[], changeId?: string): Promise<{ reverted: boolean; copies: number; proposals?: number }>;
 }
 
 export const sha256 = (text: string): string => createHash('sha256').update(text).digest('hex');
@@ -243,7 +243,8 @@ export const sqlChangeRepo: ChangeRepo = {
     let n = 0;
     // Status guards: sticky ignored/updated copies and copies re-judged meanwhile are left alone.
     if (toDrift.length > 0) {
-      n = await execute(`UPDATE copies SET status = 'drifted', reason = ? WHERE status = 'in_sync' AND id IN (${placeholders(toDrift.length)})`, DRIFT_REASON, ...toDrift);
+      // `updated` copies (Ripple applied an earlier change) state a value this change replaces again.
+      n = await execute(`UPDATE copies SET status = 'drifted', reason = ? WHERE status IN ('in_sync', 'updated') AND id IN (${placeholders(toDrift.length)})`, DRIFT_REASON, ...toDrift);
     }
     if (toSync.length > 0) {
       await execute(`UPDATE copies SET status = 'in_sync', reason = ? WHERE status = 'drifted' AND id IN (${placeholders(toSync.length)})`, SAME_REASON, ...toSync);
@@ -279,7 +280,7 @@ export const sqlChangeRepo: ChangeRepo = {
     return rows.map(toChange);
   },
 
-  async revertFactChange(sourcePageId, c, copyIds) {
+  async revertFactChange(sourcePageId, c, copyIds, changeId) {
     const n = await execute(
       `UPDATE facts SET value = ?, unit = ?, previous_value = NULL
        WHERE id = ? AND source_page_id = ? AND status = 'confirmed' AND value = ? AND previous_value = ?`,
@@ -290,7 +291,17 @@ export const sqlChangeRepo: ChangeRepo = {
       c.newValue,
       c.oldValue,
     );
-    if (n === 0 || copyIds.length === 0) return { reverted: n > 0, copies: 0 };
+    if (n === 0) return { reverted: false, copies: 0, proposals: 0 };
+    // M4: open edit proposals of that confirmation would write the reverted value; applied ones stay as history.
+    const proposals =
+      changeId === undefined
+        ? 0
+        : await execute(
+            "UPDATE proposals SET status = 'rejected', error_code = 'reverted' WHERE change_id = ? AND fact_id = ? AND status IN ('proposed', 'stale', 'needs_manual')",
+            changeId,
+            c.factId,
+          );
+    if (copyIds.length === 0) return { reverted: true, copies: 0, proposals };
     // Only copies still drifted for the reason the confirmation gave (a rescan may have re-judged them meanwhile).
     const copies = await execute(
       `UPDATE copies SET status = 'in_sync', reason = ? WHERE status = 'drifted' AND reason = ? AND fact_id = ? AND id IN (${placeholders(copyIds.length)})`,
@@ -299,6 +310,6 @@ export const sqlChangeRepo: ChangeRepo = {
       c.factId,
       ...copyIds,
     );
-    return { reverted: true, copies };
+    return { reverted: true, copies, proposals };
   },
 };

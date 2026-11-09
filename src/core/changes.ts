@@ -98,6 +98,26 @@ const valueWords = (value: string, unit: string | null): string[] => normaliseVa
 /** Same unit on both sides; a unit written on one side only is a change ("60" → "60 days"). */
 const sameUnit = (a: string | null, b: string | null): boolean => a === b;
 
+const PERIODS: readonly [RegExp, string][] = [
+  [/\b(?:per|a|an|each|every)\s+(?:calendar\s+|working\s+|business\s+)?(?:day|night)s?\b|\/\s*(?:day|night|d)\b|\bdaily\b|\bper\s+hari\b|\/\s*hari\b|\bsehari\b|\bharian\b/i, 'day'],
+  [/\b(?:per|a|an|each|every)\s+week\b|\/\s*(?:week|wk)\b|\bweekly\b|\bper\s+minggu\b|\/\s*minggu\b|\bmingguan\b/i, 'week'],
+  [/\b(?:per|a|an|each|every)\s+month\b|\/\s*(?:month|mo)\b|\bmonthly\b|\bper\s+bulan\b|\/\s*bulan\b|\bbulanan\b/i, 'month'],
+  [/\b(?:per|a|an|each|every)\s+(?:year|annum)\b|\/\s*(?:year|yr)\b|\b(?:yearly|annually|annual)\b|\bper\s+tahun\b|\/\s*tahun\b|\btahunan\b/i, 'year'],
+  [/\b(?:per|a|an|each|every)\s+hour\b|\/\s*(?:hour|hr|h)\b|\bhourly\b|\bper\s+jam\b|\/\s*jam\b/i, 'hour'],
+];
+
+/** Rate period of a value or sentence ("$60 per day", "60/day", "per hari" → day); null when none is written. */
+export function ratePeriod(text: string | null | undefined): string | null {
+  const t = text ?? '';
+  return PERIODS.find(([re]) => re.test(t))?.[1] ?? null;
+}
+
+/** Period of a fact: its value and unit, else its sentence. */
+const periodOf = (v: Valued, quote: string | null | undefined): string | null => ratePeriod(`${v.value} ${v.unit ?? ''}`) ?? ratePeriod(quote);
+
+/** Words that change what a number means ("30 days" → "30 business days", "$60" → "max $60"). */
+const QUALIFIERS = new Set(['business', 'working', 'calendar', 'weekday', 'weekdays', 'net', 'gross', 'minimum', 'min', 'maximum', 'max', 'least', 'most', 'before', 'after', 'excluding', 'including', 'excl', 'incl', 'tax', 'kerja', 'minimal', 'maksimal', 'bersih', 'kotor']);
+
 type Quoted = Valued & { quote?: string | null };
 
 /**
@@ -116,6 +136,8 @@ export function factChanged(old: Quoted, now: Valued & { quote: string }): boole
   const oldQuote = old.quote ?? '';
   if (oldQuote.trim() === '') return !sameValue(old, now);
   if (sameText(oldQuote, now.quote)) return false;
+  // The rate period is part of the unit: "$60 per day" → "$60 per week" is a change.
+  if (periodOf(old, oldQuote) !== periodOf(now, now.quote)) return true;
   const negationOk = sameNegation(oldQuote, now.quote);
   const x = normaliseValue(old.value, old.unit);
   const y = normaliseValue(now.value, now.unit);
@@ -195,6 +217,10 @@ export function wordingOnlyChange(c: Pick<FactChange, 'oldValue' | 'oldUnit' | '
   const newValueWords = new Set([...words(c.newValue), ...valueWords(c.newValue, c.newUnit)]);
   if (!allIn(oldWords, newValueWords) || !allIn(oldWords, words(c.newQuote))) return false;
   if (!/\d/.test(c.oldValue)) return oldWords.length > 0;
+  // A qualifier or rate period the new value adds is a real change ("30 days" → "30 business days").
+  const oldAll = new Set([...words(`${c.oldValue} ${c.oldUnit ?? ''}`)]);
+  if ([...words(`${c.newValue} ${c.newUnit ?? ''}`)].some((w) => QUALIFIERS.has(w) && !oldAll.has(w))) return false;
+  if (ratePeriod(`${c.oldValue} ${c.oldUnit ?? ''}`) !== ratePeriod(`${c.newValue} ${c.newUnit ?? ''}`)) return false;
   const x = normaliseValue(c.oldValue, c.oldUnit);
   const y = normaliseValue(c.newValue, c.newUnit);
   return sameNumbers(x.numbers, y.numbers) && sameUnit(x.unit, y.unit);
@@ -377,7 +403,8 @@ export interface ImpactCopy {
   pageId: string;
   /** Null when the page could not be read as the app. */
   spaceId: string | null;
-  status: 'in_sync' | 'drifted';
+  /** `updated`: Ripple applied an earlier change there; compared again with this change like an in-sync copy. */
+  status: 'in_sync' | 'drifted' | 'updated';
 }
 
 export interface ChangeImpact {
@@ -406,7 +433,7 @@ export function computeImpact(changes: readonly FactChange[], copies: readonly C
     if (!change) continue;
     if (copy.status === 'unsure') impact.unsure++;
     else if (copy.status === 'historical') impact.historical++;
-    else if (copy.status === 'in_sync' || copy.status === 'drifted') {
+    else if (copy.status === 'in_sync' || copy.status === 'drifted' || copy.status === 'updated') {
       if (copy.statedValue === null) {
         impact.needsCheck++;
         continue;

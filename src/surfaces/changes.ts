@@ -12,6 +12,7 @@ import { Queue } from '@forge/events';
 import { dismissalKey, sha256, sqlChangeRepo, valueHash, type ChangeRepo, type ChangeRouting, type ChangeRow } from '../adapters/changeRepo';
 import { canEditPage, ConfluenceRetryableError, getSourcePage, pageSpaceIdAsApp, PageNotFoundError, visiblePageIds, type SourcePage } from '../adapters/confluence';
 import { displayNames } from '../adapters/confluenceUsers';
+import { sqlProposalRepo } from '../adapters/proposalRepo';
 import { sqlRepo, type FactRepo, type PageVersionInfo } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
 import { asUserGraph, fetchPageMeta, ownersFromPage, readSpaceTeams, scrubErrorText, type GraphRequest, type PageMeta } from '../adapters/teamworkGraph';
@@ -27,6 +28,7 @@ import type {
   ConfirmChangePayload,
   ErrorReply,
   FactChangeView,
+  LatestChangeReply,
   OwnerView,
   PendingChangeFlag,
   PendingChangeReply,
@@ -150,11 +152,18 @@ async function revertWordingOnly(pageId: string, deps: DiffDeps): Promise<void> 
   let facts = 0;
   let copies = 0;
   for (const r of reverts) {
-    const done = await deps.changes.revertFactChange(pageId, r.change, r.copyIds);
+    const done = await deps.changes.revertFactChange(pageId, r.change, r.copyIds, r.changeId);
     if (!done.reverted) continue;
     facts++;
     copies += done.copies;
-    await deps.facts.audit('change.fact_reverted', null, 'change', r.changeId, { pageId, factId: r.change.factId, version: r.change.version, copies: done.copies, reason: 'wording only' });
+    await deps.facts.audit('change.fact_reverted', null, 'change', r.changeId, {
+      pageId,
+      factId: r.change.factId,
+      version: r.change.version,
+      copies: done.copies,
+      proposalsRejected: done.proposals ?? 0,
+      reason: 'wording only',
+    });
   }
   if (facts > 0) console.info('ripple diff: wording-only confirmations undone', { pageId, facts, copies });
 }
@@ -184,7 +193,8 @@ export async function runDiffJob(pageId: string, retryCount: number, deps: DiffD
   if (!source) return { status: 'skipped', reason: 'not a source' };
   try {
     const page = await deps.page(pageId);
-    if (isRippleVersion(page.versionMessage)) return { status: 'skipped', reason: 'ripple edit' };
+    // No skip on the latest version's message: a human edit (v5) followed by a Ripple edit (v6) before this job ran
+    // would be lost. The trigger already drops Ripple's own events; a text identical to the last read is skipped below.
     if (source.pageVersion !== null && page.version <= source.pageVersion) return { status: 'skipped', reason: 'version already read' };
     // A failed undo never blocks change detection; it is tried again on the next version.
     try {
@@ -239,7 +249,7 @@ export async function runDiffJob(pageId: string, retryCount: number, deps: DiffD
       pageId,
       changes.map((c) => c.factId),
     );
-    const affectedPages = [...new Set(copies.filter((c) => c.status === 'in_sync' || c.status === 'drifted').map((c) => c.pageId))];
+    const affectedPages = [...new Set(copies.filter((c) => c.status === 'in_sync' || c.status === 'drifted' || c.status === 'updated').map((c) => c.pageId))];
     const spaces = await mapLimit(affectedPages, LOOKUP_CONCURRENCY, deps.spaceOf);
     const impact = computeImpact(changes, copies, new Map(affectedPages.map((id, i) => [id, spaces[i] ?? null])));
     const { id: changeId, replaced } = await deps.changes.savePending(pageId, page.version, changes, diff.missing, impact);
@@ -288,6 +298,8 @@ export interface ChangeDeps {
   now: () => Date;
   /** M4: queues the edit proposals of a confirmed change (`extract` queue, `kind: 'propose'`). */
   enqueuePropose?: (sourcePageId: string, changeId: string) => Promise<string>;
+  /** M4: open proposals of older changes of these facts are rejected (`superseded`) once a newer change is confirmed. */
+  supersedeProposals?: (sourcePageId: string, changeId: string, factIds: readonly string[]) => Promise<number>;
 }
 
 const defaultDeps: ChangeDeps = {
@@ -304,6 +316,7 @@ const defaultDeps: ChangeDeps = {
     const { jobId } = await extractQueue.push({ body: { pageId: sourcePageId, kind: 'propose', changeId }, concurrency: { key: `extract-page-${sourcePageId}`, limit: 1 } });
     return jobId;
   },
+  supersedeProposals: (sourcePageId, changeId, factIds) => sqlProposalRepo.supersedeOlder(sourcePageId, changeId, factIds),
 };
 
 export type ChangeContext = SourceContext & { cloudId?: string };
@@ -313,7 +326,7 @@ function pageIdOf(ctx: ChangeContext): string | undefined {
   return id === undefined || String(id) === '' ? undefined : String(id);
 }
 
-async function guarded<T>(ctx: ChangeContext, deps: ChangeDeps, what: string, body: (pageId: string) => Promise<T | ErrorReply>): Promise<T | ErrorReply> {
+async function guarded<T>(ctx: ChangeContext, deps: Pick<ChangeDeps, 'ensure'>, what: string, body: (pageId: string) => Promise<T | ErrorReply>): Promise<T | ErrorReply> {
   const pageId = pageIdOf(ctx);
   if (!pageId) return { error: 'Open a Confluence page to use Ripple.' };
   try {
@@ -463,6 +476,17 @@ export async function getPendingChange(ctx: ChangeContext, deps: ChangeDeps = de
   });
 }
 
+/**
+ * The most recently confirmed change of the viewed source (the Rollout tab), or null. Anyone who can open the page
+ * may read it; ids and version only.
+ */
+export async function getLatestChange(ctx: ChangeContext, deps: Pick<ChangeDeps, 'changes' | 'ensure'> = defaultDeps): Promise<LatestChangeReply | ErrorReply> {
+  return guarded(ctx, deps, 'load the latest change', async (pageId) => {
+    const latest = (await deps.changes.confirmedChanges(pageId))[0];
+    return { pageId, change: latest ? { changeId: latest.id, version: latest.pageVersion } : null };
+  });
+}
+
 /** Checks the payload and edit permission and loads the change of the viewed page (any status). */
 async function decidable(
   ctx: ChangeContext,
@@ -521,7 +545,7 @@ export async function confirmChange(ctx: ChangeContext, payload: Partial<Confirm
     const current = new Map((await deps.facts.listFacts(pageId)).map((f) => [f.id, f]));
     const applied = new Set(change.factChanges.filter((c) => current.get(c.factId)?.status === 'confirmed' && current.get(c.factId)?.value === c.newValue).map((c) => c.factId));
     const impact = change.impact;
-    const toDrift = (impact?.copies ?? []).filter((c) => c.status === 'in_sync' && applied.has(c.factId)).map((c) => c.copyId);
+    const toDrift = (impact?.copies ?? []).filter((c) => (c.status === 'in_sync' || c.status === 'updated') && applied.has(c.factId)).map((c) => c.copyId);
     const copiesDrifted = await deps.changes.restatusCopies(toDrift, impact?.syncCopyIds ?? []);
     const pages = routing?.pages ?? [];
     const spaces = routing?.spaces ?? [];
@@ -539,6 +563,10 @@ export async function confirmChange(ctx: ChangeContext, payload: Partial<Confirm
         repeat: !transitioned,
       });
     }
+    // M4: proposals of older changes of these facts would write a replaced value.
+    let proposalsSuperseded = 0;
+    if (deps.supersedeProposals && applied.size > 0) proposalsSuperseded = await deps.supersedeProposals(pageId, change.id, [...applied]);
+    if (proposalsSuperseded > 0) await deps.facts.audit('proposal.superseded', actor, 'change', change.id, { pageId, proposals: proposalsSuperseded });
     // M4: edit proposals per copy (idempotent per change and copy, so a repeated confirm queues a no-op).
     let proposeJob: string | null = null;
     if ((impact?.copies.length ?? 0) > 0 && deps.enqueuePropose) {

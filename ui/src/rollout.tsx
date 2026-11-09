@@ -6,35 +6,6 @@ import { Alert, LoadingRows, errorOf } from './components';
 import { PROPOSAL_STATUS_LABEL, proposalProblem } from './proposalText';
 
 const POLL_MS = 5000;
-const KEY = (pageId: string) => `ripple.rollout.${pageId}`;
-
-/**
- * The contract has no "latest confirmed change" lookup, so the UI remembers the change id it confirmed (per source
- * page, in localStorage; best effort, storage may be blocked in the iframe).
- */
-export function rememberChange(pageId: string, changeId: string): void {
-  try {
-    window.localStorage.setItem(KEY(pageId), changeId);
-  } catch {
-    /* storage unavailable: the Rollout tab shows for this session only */
-  }
-}
-
-export function recallChange(pageId: string): string | null {
-  try {
-    return window.localStorage.getItem(KEY(pageId));
-  } catch {
-    return null;
-  }
-}
-
-export function forgetChange(pageId: string): void {
-  try {
-    window.localStorage.removeItem(KEY(pageId));
-  } catch {
-    /* ignore */
-  }
-}
 
 /** Display order: what still needs someone first, finished last. */
 const ORDER: readonly ProposalState[] = ['needs_manual', 'failed', 'proposed', 'approved', 'stale', 'applied', 'rejected'];
@@ -142,6 +113,7 @@ function RolloutRow({ item }: { item: RolloutItem }) {
         {item.pageTitle ?? `Page ${item.pageId}`}
         <span className="sr-only"> (opens in a new tab)</span>
       </a>
+      <span className="muted rollout__owner">Owner: {item.owner.displayName ?? (item.owner.accountId ? 'Unknown user' : 'none')}</span>
       <span className={`badge badge--proposal-${item.status}`}>{PROPOSAL_STATUS_LABEL[item.status]}</span>
       {problem ? <span className="muted rollout__problem">{problem}</span> : null}
     </li>

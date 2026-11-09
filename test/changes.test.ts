@@ -22,7 +22,7 @@ import { identityKey, type ExtractedFact, type MergePlan, type StoredFact } from
 import type { ChangeDecision, CopyStatus, ErrorReply, FactView, PendingChangeReply, SourceView } from '../src/core/views';
 import type { ChatToolFn } from '../src/llm/extract';
 import type { ToolSpec } from '../src/llm/index';
-import { confirmChange, dismissChange, getPendingChange, handlePageUpdate, runDiffJob, type ChangeDeps, type DiffDeps, type TriggerDeps } from '../src/surfaces/changes';
+import { confirmChange, dismissChange, getLatestChange, getPendingChange, handlePageUpdate, runDiffJob, type ChangeDeps, type DiffDeps, type TriggerDeps } from '../src/surfaces/changes';
 import { COPY_PAGES, SOURCE_PAGE_ID, type FactKey } from './fixtures/copies';
 import { TRAVEL_POLICY_FACTS, TRAVEL_POLICY_STORAGE } from './fixtures/travelPolicy';
 
@@ -351,9 +351,18 @@ describe('diff consumer', () => {
     expect(store.facts.filter((f) => f.status === 'confirmed')).toHaveLength(4);
   });
 
-  it('skips a version saved by Ripple and a version already read, without calling the LLM', async () => {
-    const ripple = await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(4, '$75', { page: async () => page(4, '$75', 'Updated by Ripple: 1 fact') }));
-    expect(ripple).toEqual({ status: 'skipped', reason: 'ripple edit' });
+  it('a human edit (v5) followed by a Ripple edit (v6) before the job ran is still diffed', async () => {
+    // The trigger queued the job for the human v5; the latest version is Ripple's v6 with the human change in it.
+    const r = await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(6, '$75', { page: async () => page(6, '$75', 'Updated by Ripple from Other Source') }));
+    expect(r).toMatchObject({ status: 'done', changed: 1 });
+    expect(llmCalls).toBe(1);
+    // A Ripple-only version with the text already read is skipped without the model.
+    const again = await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(7, '$75', { page: async () => page(7, '$75', 'Updated by Ripple') }));
+    expect(again).toEqual({ status: 'skipped', reason: 'text unchanged' });
+    expect(llmCalls).toBe(1);
+  });
+
+  it('skips a version already read, without calling the LLM', async () => {
     const old = await runDiffJob(SOURCE_PAGE_ID, 0, diffDeps(3, '$75'));
     expect(old).toEqual({ status: 'skipped', reason: 'version already read' });
     expect(llmCalls).toBe(0);
@@ -628,6 +637,20 @@ describe('planDiff / computeImpact / addWorkingDays', () => {
     expect(impact.copies.map((c) => c.copyId)).toEqual(['old', 'other']);
   });
 
+  it('a copy Ripple already updated is compared with the next change like an in-sync copy', () => {
+    const next: FactChange = { factId: 'a', oldValue: '$75', oldUnit: null, newValue: '$80', newUnit: null, newQuote: 'q', version: 3, versionAt: null };
+    const impact = computeImpact(
+      [next],
+      [
+        { id: 'upd-old', factId: 'a', pageId: '1', status: 'updated', statedValue: '$75', statedUnit: null },
+        { id: 'upd-new', factId: 'a', pageId: '1', status: 'updated', statedValue: '$80', statedUnit: null },
+      ],
+      new Map(),
+    );
+    expect(impact.copies.map((c) => [c.copyId, c.status])).toEqual([['upd-old', 'updated']]);
+    expect(impact.alreadyNew).toBe(1);
+  });
+
   it('a change of value shape is a change: range, extra numbers, other unit; formatting alone is not', () => {
     const changed = (from: string, to: string, fromUnit: string | null = null, toUnit: string | null = null) =>
       planDiff([stored({ value: from, unit: fromUnit })], [ex(to, toUnit)], 2).changes.length === 1;
@@ -696,6 +719,17 @@ describe('planDiff / computeImpact / addWorkingDays', () => {
     expect(c('15 January', null, '15 February', null, 'Claims close on 15 February.')).toBe(false);
     expect(c('60', 'USD', '75', 'USD', 'The per diem is $75 per day.')).toBe(false);
     expect(c('economy class', null, 'business class', null, 'Book business class.')).toBe(false);
+    // A qualifier or a rate period added to the value is a real change.
+    expect(c('30 days', null, '30 business days', null, 'Refunds are paid within 30 business days.')).toBe(false);
+    expect(c('60', 'USD per day', '60', 'USD per week', 'The allowance is $60 per week.')).toBe(false);
+  });
+
+  it('the rate period is part of the unit: per day → per week (and per hari → per minggu) is a change', () => {
+    const day = { value: '$60', unit: 'per day', quote: 'The allowance is $60 per day.' };
+    expect(factChanged(day, { value: '$60', unit: 'per week', quote: 'The allowance is $60 per week.' })).toBe(true);
+    expect(factChanged(day, { value: '$60', unit: '/day', quote: 'The allowance is $60/day.' })).toBe(false);
+    const hari = { value: 'Rp100.000', unit: 'per hari', quote: 'Uang makan Rp100.000 per hari.' };
+    expect(factChanged(hari, { value: 'Rp100.000', unit: 'per minggu', quote: 'Uang makan Rp100.000 per minggu.' })).toBe(true);
   });
 
   it('counts working days (Mon–Fri)', () => {
@@ -825,6 +859,23 @@ describe('change resolvers', () => {
     expect(await confirmChange(ctx, { changeId: id, version: 4 }, changeDeps())).toEqual({ changeId: id, status: 'confirmed', factsUpdated: 0, copiesDrifted: 0, deadline: '2026-11-12' });
     expect(store.audits).toHaveLength(audits);
     expect(await dismissChange(ctx, { changeId: id, version: 4 }, changeDeps())).toEqual({ error: expect.stringContaining('already decided') });
+  });
+
+  it('confirm rejects open proposals of older changes as superseded; getLatestChange returns the confirmed change', async () => {
+    const id = await pendingId();
+    expect(await getLatestChange(ctx, changeDeps())).toEqual({ pageId: SOURCE_PAGE_ID, change: null });
+    const superseded: { changeId: string; factIds: readonly string[] }[] = [];
+    const deps = changeDeps({
+      supersedeProposals: async (_s, changeId, factIds) => {
+        superseded.push({ changeId, factIds });
+        return 2;
+      },
+    });
+    await confirmChange(ctx, { changeId: id, version: 4 }, deps);
+    expect(superseded).toEqual([{ changeId: id, factIds: [FACT_IDS.domestic] }]);
+    expect(store.audits.find((a) => a.action === 'proposal.superseded')?.detail).toMatchObject({ proposals: 2 });
+    expect(await getLatestChange(ctx, changeDeps())).toEqual({ pageId: SOURCE_PAGE_ID, change: { changeId: id, version: 4 } });
+    expect(await getLatestChange({ ...ctx, extension: {} }, changeDeps())).toEqual({ error: expect.any(String) });
   });
 
   it('confirm of a change replaced by a newer version meanwhile: "review it again", nothing applied', async () => {

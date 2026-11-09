@@ -254,7 +254,9 @@ function ProposalCard({ p, canEdit, busy, running, notSame, onAction }: CardProp
     <li className={`proposal proposal--${p.status}`}>
       <div className="fact__top">
         <span className="fact__type">
-          {p.sourceTitle ? (
+          {p.sourceHidden || !p.sourcePageId ? (
+            'An update from a source you can’t view'
+          ) : (
             <>
               From{' '}
               <a
@@ -262,16 +264,15 @@ function ProposalCard({ p, canEdit, busy, running, notSame, onAction }: CardProp
                 href="#"
                 onClick={(e) => {
                   e.preventDefault();
-                  void router.open({ target: 'contentView', contentId: p.sourcePageId });
+                  if (p.sourcePageId) void router.open({ target: 'contentView', contentId: p.sourcePageId });
                 }}
               >
-                {p.sourceTitle}
+                {p.sourceTitle ?? 'the source of truth'}
                 <span className="sr-only"> (source of truth, opens in a new tab)</span>
               </a>
             </>
-          ) : (
-            'From a source of truth you can’t view'
           )}
+          {p.factLabel ? <span className="muted proposal__fact"> · {p.factLabel}</span> : null}
         </span>
         <span className={`badge badge--proposal-${p.status}`}>{notSame ? 'Not the same fact' : PROPOSAL_STATUS_LABEL[p.status]}</span>
       </div>
@@ -378,6 +379,7 @@ function ProposalCard({ p, canEdit, busy, running, notSame, onAction }: CardProp
       ) : null}
 
       {error ? <Alert message={error} /> : null}
+      {open && p.errorCode ? <p className="muted proposal__retry">The last attempt was not applied. {proposalProblem(p.status, p.errorCode)}</p> : null}
 
       <div ref={result} tabIndex={-1} className="proposal__result">
         <Outcome p={p} notSame={notSame} />
@@ -408,6 +410,7 @@ function Outcome({ p, notSame }: { p: ProposalView; notSame: boolean }) {
     case 'approved':
       return <p className="muted">Applying the edit…</p>;
     case 'rejected':
+      if (p.errorCode === 'superseded' || p.errorCode === 'reverted') return <p className="muted">{proposalProblem(p.status, p.errorCode)} Nothing to do here.</p>;
       return <p className="muted">{notSame ? 'Marked as not the same fact. Ripple will leave this sentence alone.' : 'Declined. The page stays as it is.'}</p>;
     case 'stale':
       return (

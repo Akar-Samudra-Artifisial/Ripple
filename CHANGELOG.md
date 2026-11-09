@@ -50,6 +50,16 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Halaman arsip/draft tidak lagi menjadi kandidat salinan. Pengecualian space lewat pengaturan belum ada.
 
 ### Fixed
+- Usulan suntingan M4 diperketat setelah review:
+  - Approve memeriksa ulang bahwa perubahan masih `confirmed` dan nilai fakta sekarang = nilai baru perubahan; bila tidak, usulan `rejected` dengan kode `superseded`. Konfirmasi perubahan baru menandai usulan terbuka dari perubahan lama sebagai `superseded`; salinan `updated` ikut dibandingkan lagi dengan nilai baru.
+  - Membatalkan konfirmasi wording-only menolak usulan terbuka perubahan itu (`reverted`).
+  - Kalimat editan user yang gagal diterapkan (mis. `crosses_markup`) kembali ke `proposed` dengan kode error; usulan Ripple tidak berubah jadi `needs_manual`.
+  - Exception saat membaca/menyimpan halaman melepas kunci `approved` kembali ke `proposed` (approve satu dan approve all).
+  - Validasi kalimat dari model: angka lain, satuan, dan periode laju harus tetap sama; karakter kontrol yang tidak valid di XML dan kalimat >2.000 karakter ditolak (juga sebelum regex di approve).
+  - Diff sumber tidak lagi dilewati berdasarkan pesan versi terbaru (edit manusia v5 lalu edit Ripple v6 tetap terbaca); versi dengan teks sama tetap dilewati lewat hash teks.
+  - Periode laju (per day/week/month/year, /day, per hari/minggu) dihitung sebagai bagian satuan; kualifier baru ("30 days" → "30 business days") tidak dianggap wording-only.
+  - Usulan basi diantrekan ulang satu job per (perubahan, halaman), maks. sekali per 2 menit plus satu job tertunda (tabel `propose_requeues`, migrasi v025).
+- Tab Rollout memakai resolver baru `getLatestChange` (perubahan terkonfirmasi terakhir sumber) dan tidak lagi bergantung pada localStorage; tiap baris menampilkan owner halaman (nama via `users-bulk`). Kartu usulan menampilkan label fakta (subjek · atribut).
 - Aturan perubahan M3 diperketat setelah review:
   - Angka dibandingkan sesuai urutan dan posisinya di kalimat.
   - Kata lain di sekitar angka ("15 January" → "15 February"), negasi yang ditambah atau dihapus ("required" → "not required"), dan satuan yang hanya ada di satu sisi ("60" → "60 days") dihitung sebagai perubahan.
@@ -115,6 +125,8 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Mengedit subjek/atribut/kondisi tidak lagi memunculkan duplikat saat ekstraksi ulang (kolom `origin_key`, migrasi v005).
 
 ### Security
+- Pesan versi suntingan Ripple hanya menyebut judul sumber bila halaman sumber dan leluhurnya tanpa read restriction dan space-nya terbaca app; selain itu (atau approve all dengan >1 sumber) "Updated by Ripple".
+- Usulan dari sumber yang tidak bisa dibuka viewer tampil sebagai kartu generik "An update from a source you can't view" tanpa id/judul sumber dan label fakta; kalimat/nilai baru hanya untuk yang bisa melihat sumber atau editor halaman salinan.
 - Log menyamarkan account id berprefiks 5–7 digit (sebelumnya hanya 6 digit).
 - Prompt ekstraksi: judul halaman dijadikan satu baris dan penanda `<<<PAGE`/`PAGE>>>` di judul/isi dinetralkan.
 

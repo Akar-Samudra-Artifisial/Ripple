@@ -341,9 +341,14 @@ export interface ProposalView {
   method: 'token' | 'llm' | null;
   /** Enum code when `needs_manual`/`failed`/`stale` (e.g. `crosses_markup`, `version_changed`, `forbidden`). */
   errorCode: string | null;
-  sourcePageId: string;
+  /** Null when the viewer cannot open the source page (the card shows "An update from a source you can't view"). */
+  sourcePageId: string | null;
   /** Null when the viewer cannot open the source page. */
   sourceTitle: string | null;
+  /** True when the viewer cannot open the source page. */
+  sourceHidden: boolean;
+  /** "Subject · attribute" of the source fact; null when the source is hidden or the fact is gone. */
+  factLabel: string | null;
   appliedVersion: number | null;
 }
 
@@ -392,6 +397,14 @@ export interface RolloutItem {
   pageUrl: string | null;
   status: ProposalState;
   errorCode: string | null;
+  /** Owner (or author) of the copy page as the viewer can read it; display name null when unknown. */
+  owner: { accountId: string | null; displayName: string | null };
+}
+
+/** Reply of `getLatestChange`: the most recently confirmed change of the viewed source, or null. */
+export interface LatestChangeReply {
+  pageId: string;
+  change: { changeId: string; version: number } | null;
 }
 
 /** Progress of a confirmed change over its copies (source page); pages the viewer cannot open are only counted. */
@@ -415,6 +428,8 @@ export interface ResolverContract {
   approveAll: { payload: undefined; reply: ApproveAllResult };
   /** On the source page: proposals of one of its changes. */
   listRollout: { payload: ChangeIdOnlyPayload; reply: Rollout };
+  /** On the source page: the latest confirmed change (for the Rollout tab). */
+  getLatestChange: { payload: undefined; reply: LatestChangeReply };
   getPendingChange: { payload: undefined; reply: PendingChangeReply };
   /** Edit permission on the source; sets the facts to their new values and records the deadline (M4 proposes edits). */
   confirmChange: { payload: ConfirmChangePayload; reply: ChangeDecision };

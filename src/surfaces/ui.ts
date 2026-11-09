@@ -4,7 +4,7 @@ import { displayNames } from '../adapters/confluenceUsers';
 import { asUserGraph, fetchPageMeta, ownersFromPage, readSpaceTeams, scrubErrorText, type GraphRequest, type PageMeta } from '../adapters/teamworkGraph';
 import { LATEST_MIGRATION, MIGRATIONS } from '../core/migrations';
 import { SchemaSettingUpError } from '../core/schema';
-import { confirmChange, dismissChange, getPendingChange, pendingChangeFlag, type ChangeContext } from './changes';
+import { confirmChange, dismissChange, getLatestChange, getPendingChange, pendingChangeFlag, type ChangeContext } from './changes';
 import { getScanStatus, listCopies, startScan } from './copies';
 import { approveAll, approveProposal, listProposalsForPage, listRollout, markNotSameFact, pendingProposalCount, rejectProposal } from './proposals';
 import type { ApproveProposalPayload, ChangeIdOnlyPayload, ProposalIdPayload } from '../core/views';
@@ -132,6 +132,7 @@ resolver.define('startScan', ({ context }) => startScan(context as SourceContext
 resolver.define('listCopies', ({ context, payload }) => listCopies(context as SourceContext, payload as Partial<CopyListPayload>));
 // M3 (FR-7).
 resolver.define('getPendingChange', ({ context }) => getPendingChange(context as ChangeContext));
+resolver.define('getLatestChange', ({ context }) => getLatestChange(context as ChangeContext));
 resolver.define('confirmChange', ({ context, payload }) => confirmChange(context as ChangeContext, payload as Partial<ConfirmChangePayload>));
 resolver.define('dismissChange', ({ context, payload }) => dismissChange(context as ChangeContext, payload as Partial<ChangeIdPayload>));
 // M4 (FR-8): copy-page proposals; `listRollout` on the source page.

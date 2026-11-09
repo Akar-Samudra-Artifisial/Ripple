@@ -22,6 +22,9 @@ import { replaceValueToken, validateRewrite, type ProposalStatus } from '../src/
 import type { ApproveAllResult, ErrorReply, ProposalDecision, ProposalList, Rollout, SourceView } from '../src/core/views';
 import type { ChatToolFn } from '../src/llm/extract';
 import type { ToolSpec } from '../src/llm/index';
+import type { FactRepo } from '../src/adapters/repo';
+
+type FactWithSource = NonNullable<Awaited<ReturnType<FactRepo['getFact']>>>;
 import { handlePageUpdate } from '../src/surfaces/changes';
 import {
   approveAll,
@@ -97,7 +100,11 @@ class Store {
     createdAt: null,
   };
   puts: { pageId: string; title: string; body: string; version: number; message: string }[] = [];
-  enqueued: { changeId: string; copyId?: string }[] = [];
+  enqueued: { changeId: string; copyPageId?: string; delaySeconds?: number }[] = [];
+  /** Current official value of FACT (a newer confirmed change moves it on). */
+  fact = { value: '$75', unit: 'per day' as string | null, status: 'confirmed' as 'confirmed' | 'rejected' };
+  sourceOpen = true;
+  requeues = new Map<string, { delayed: boolean; recent: boolean }>();
   putStatus: number | null = null;
   private n = 0;
 
@@ -160,6 +167,28 @@ class Store {
         c.status = 'ignored';
         return true;
       },
+      supersedeOlder: async (sourcePageId, changeId, factIds) => {
+        let k = 0;
+        for (const p of this.proposals)
+          if (p.sourcePageId === sourcePageId && p.changeId !== changeId && factIds.includes(p.factId) && ['proposed', 'stale', 'needs_manual'].includes(p.status)) {
+            Object.assign(p, { status: 'rejected', errorCode: 'superseded' });
+            k++;
+          }
+        return k;
+      },
+      claimRequeue: async (changeId, pageId) => {
+        const key = `${changeId}:${pageId}`;
+        const row = this.requeues.get(key);
+        if (!row || !row.recent) {
+          this.requeues.set(key, { delayed: false, recent: true });
+          return 'now';
+        }
+        if (!row.delayed) {
+          row.delayed = true;
+          return 'delayed';
+        }
+        return 'skip';
+      },
     };
   }
 
@@ -170,6 +199,8 @@ class Store {
       },
       getSource: async (id: string): Promise<SourceView | undefined> =>
         id === SOURCE ? { pageId: SOURCE, title: 'Travel Policy', state: 'ready', pageVersion: 5, markedAt: 'now', extractedAt: 'now', error: null } : undefined,
+      getFact: async (id: string) =>
+        id === FACT ? ({ id, subject: 'Domestic per diem', attribute: 'amount', ...this.fact, sourcePageId: SOURCE, identityKey: 'k' } as unknown as FactWithSource) : undefined,
     };
   }
 
@@ -232,10 +263,12 @@ function deps(over: Partial<ProposalDeps> = {}): ProposalDeps {
       if (p) Object.assign(p, { body: page.body, version: page.version });
       return { ok: true, value: page.version };
     },
-    enqueuePropose: async (_s, changeId, copyId) => {
-      store.enqueued.push({ changeId, copyId });
+    enqueuePropose: async (_s, changeId, target) => {
+      store.enqueued.push({ changeId, ...target });
       return 'job';
     },
+    sourceIsOpen: async () => store.sourceOpen,
+    names: async (ids) => new Map(ids.map((id) => [id, `Name of ${id}`])),
     ensure: async () => undefined,
     ...over,
   };
@@ -341,10 +374,10 @@ describe('proposal resolvers', () => {
     const r = (await approveProposal(ctx(PAGE_A), { proposalId: byCopy(1).id }, deps())) as ProposalDecision;
     expect(r).toMatchObject({ status: 'stale', errorCode: 'version_changed' });
     expect(store.puts).toHaveLength(0);
-    expect(store.enqueued).toEqual([{ changeId: CHANGE_ID, copyId: cid(1) }]);
+    expect(store.enqueued).toEqual([{ changeId: CHANGE_ID, copyPageId: PAGE_A }]);
     expect(store.audits.at(-1)?.action).toBe('proposal.stale');
     // Re-proposed from the new version: the stale row is refreshed.
-    await runProposeJob(CHANGE_ID, cid(1), 0, proposeDeps());
+    await runProposeJob(CHANGE_ID, { copyPageId: PAGE_A }, 0, proposeDeps());
     expect(byCopy(1)).toMatchObject({ status: 'proposed', pageVersion: 9 });
 
     store.putStatus = 409;
@@ -413,6 +446,121 @@ describe('proposal resolvers', () => {
     expect(rollout.hiddenCount).toBe(2);
     expect(rollout.counts).toEqual({ proposed: 2 });
     expect(await listRollout(ctx(PAGE_A), { changeId: CHANGE_ID }, deps())).toEqual({ error: expect.stringContaining('does not belong') });
+  });
+});
+
+describe('M4 review fixes', () => {
+  beforeEach(async () => {
+    await runProposeJob(CHANGE_ID, undefined, 0, proposeDeps());
+  });
+
+  it('rejects an approval as superseded when a newer change moved the value or the change is no longer confirmed', async () => {
+    store.fact.value = '$80';
+    const r = (await approveProposal(ctx(PAGE_A), { proposalId: byCopy(1).id }, deps())) as ProposalDecision;
+    expect(r).toMatchObject({ status: 'rejected', errorCode: 'superseded' });
+    expect(store.puts).toHaveLength(0);
+    expect(store.copies[0]?.status).toBe('drifted');
+    expect(store.audits.at(-1)?.action).toBe('proposal.superseded');
+
+    store.fact.value = '$75';
+    store.change.status = 'superseded';
+    expect(await approveProposal(ctx(PAGE_A), { proposalId: byCopy(2).id }, deps())).toMatchObject({ status: 'rejected', errorCode: 'superseded' });
+    store.change.status = 'confirmed';
+    store.fact.value = '$80';
+    const all = (await approveAll(ctx(PAGE_B), deps())) as ApproveAllResult;
+    expect(all).toMatchObject({ applied: 0, version: null });
+    expect(store.puts).toHaveLength(0);
+  });
+
+  it('a failed edit of the user goes back to proposed with the error code', async () => {
+    store.pages.set(PAGE_A, { title: 'Onboarding', version: 7, body: `<p>Domestic trips get a per diem of $<em>6</em>0 per day.</p><p>${S2}</p>` });
+    const own = 'Domestic trips get a per diem of USD 75 per calendar day.';
+    const r = (await approveProposal(ctx(PAGE_A), { proposalId: byCopy(1).id, editedSentence: own }, deps())) as ProposalDecision;
+    expect(r).toMatchObject({ status: 'proposed', errorCode: 'crosses_markup' });
+    expect(byCopy(1)).toMatchObject({ status: 'proposed', errorCode: 'crosses_markup', newSentence: 'Domestic trips get a per diem of $75 per day.' });
+    expect(store.puts).toHaveLength(0);
+  });
+
+  it('an exception while reading or saving releases the lock', async () => {
+    const boom = deps({
+      getPage: async () => {
+        throw new Error('socket hang up');
+      },
+    });
+    expect(isError(await approveProposal(ctx(PAGE_A), { proposalId: byCopy(1).id }, boom))).toBe(true);
+    expect(byCopy(1).status).toBe('proposed');
+    const saveBoom = deps({
+      updatePage: async () => {
+        throw new Error('socket hang up');
+      },
+    });
+    expect(isError(await approveAll(ctx(PAGE_A), saveBoom))).toBe(true);
+    expect([byCopy(1).status, byCopy(2).status]).toEqual(['proposed', 'proposed']);
+    // Approvable again afterwards.
+    expect(await approveProposal(ctx(PAGE_A), { proposalId: byCopy(1).id }, deps())).toMatchObject({ status: 'applied' });
+  });
+
+  it('caps the edited sentence before any parsing', async () => {
+    const long = `Domestic trips get $75 per day. ${'x'.repeat(5000)}`;
+    expect(await approveProposal(ctx(PAGE_A), { proposalId: byCopy(1).id, editedSentence: long }, deps())).toEqual({ error: expect.stringContaining('new value') });
+    expect(byCopy(1).status).toBe('proposed');
+  });
+
+  it('names the source in the version message only when it is unrestricted; approveAll with several sources is generic', async () => {
+    store.sourceOpen = false;
+    await approveProposal(ctx(PAGE_A), { proposalId: byCopy(1).id }, deps());
+    expect(store.puts[0]?.message).toBe('Updated by Ripple');
+    store.sourceOpen = true;
+    await approveAll(ctx(PAGE_B), deps());
+    expect(store.puts[1]?.message).toBe('Updated by Ripple from Travel Policy');
+    expect(versionMessage(null)).toBe('Updated by Ripple');
+  });
+
+  it('shows a generic card for a source the viewer cannot open; editors still see the new sentence', async () => {
+    const hidden = (await listProposalsForPage(ctx(PAGE_A), deps({ visible: async () => new Set() }))) as ProposalList;
+    expect(hidden.proposals[0]).toMatchObject({ sourceHidden: true, sourcePageId: null, sourceTitle: null, factLabel: null, newSentence: 'Domestic trips get a per diem of $75 per day.' });
+    const reader = (await listProposalsForPage(ctx(PAGE_A), deps({ visible: async () => new Set(), canEdit: async () => false }))) as ProposalList;
+    expect(reader.proposals[0]).toMatchObject({ sourceHidden: true, newSentence: null, newValue: null });
+    const shown = (await listProposalsForPage(ctx(PAGE_A), deps())) as ProposalList;
+    expect(shown.proposals[0]).toMatchObject({ sourceHidden: false, sourcePageId: SOURCE, sourceTitle: 'Travel Policy', factLabel: 'Domestic per diem · amount' });
+  });
+
+  it('rollout items carry the page owner', async () => {
+    store.change.routing = { deadline: '2026-11-16', pages: [{ pageId: PAGE_A, spaceId: 'S', ownerAccountId: 'acc-owner', ownerRole: 'owner', copies: 2 }] } as never;
+    const rollout = (await listRollout(ctx(SOURCE), { changeId: CHANGE_ID }, deps())) as Rollout;
+    expect(rollout.items.find((i) => i.pageId === PAGE_A)?.owner).toEqual({ accountId: 'acc-owner', displayName: 'Name of acc-owner' });
+    expect(rollout.items.find((i) => i.pageId === PAGE_B)?.owner).toEqual({ accountId: null, displayName: null });
+  });
+
+  it('goStale queues one job per (change, page), then one delayed follow-up, then nothing within the window', async () => {
+    const page = store.pages.get(PAGE_A);
+    if (page) page.version = 9;
+    await approveAll(ctx(PAGE_A), deps());
+    expect(store.enqueued).toEqual([{ changeId: CHANGE_ID, copyPageId: PAGE_A }]);
+    await runProposeJob(CHANGE_ID, { copyPageId: PAGE_A }, 0, proposeDeps());
+    if (page) page.version = 10;
+    await approveAll(ctx(PAGE_A), deps());
+    expect(store.enqueued[1]).toEqual({ changeId: CHANGE_ID, copyPageId: PAGE_A, delaySeconds: 120 });
+    await runProposeJob(CHANGE_ID, { copyPageId: PAGE_A }, 0, proposeDeps());
+    if (page) page.version = 11;
+    await approveAll(ctx(PAGE_A), deps());
+    expect(store.enqueued).toHaveLength(2);
+  });
+});
+
+describe('validateRewrite (review fixes)', () => {
+  const o = { value: '$60', unit: 'per day' };
+  const n = { value: '$75', unit: 'per day' };
+  const s = 'Pay $60 per day for up to 3 days.';
+  it('rejects a rewrite that changes another number, a unit or the rate period', () => {
+    expect(validateRewrite(s, 'Pay $75 per day for up to 3 days.', o, n, true)).toBe(true);
+    expect(validateRewrite(s, 'Pay $75 per day for up to 5 days.', o, n, true)).toBe(false);
+    expect(validateRewrite(s, 'Pay $75 per day for up to 3 weeks.', o, n, true)).toBe(false);
+    expect(validateRewrite(s, 'Pay $75 per week for up to 3 days.', o, n, true)).toBe(false);
+  });
+  it('rejects XML-invalid control characters and over-long sentences', () => {
+    expect(validateRewrite(s, 'Pay $75 per day\u0007 for up to 3 days.', o, n, false)).toBe(false);
+    expect(validateRewrite(s, `Pay $75 per day. ${'x'.repeat(2000)}`, o, n, false)).toBe(false);
   });
 });
 

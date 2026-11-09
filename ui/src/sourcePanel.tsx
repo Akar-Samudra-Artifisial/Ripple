@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
-import type { FactActionResult, FactEditPayload, FactList, FactStatus, FactType, FactView, SourceStatus } from '../../src/core/views';
+import type { FactActionResult, FactEditPayload, FactList, FactStatus, FactType, FactView, LatestChangeReply, SourceStatus } from '../../src/core/views';
 import { call } from './bridge';
 import { Alert, LoadingRows, TabPanel, Tabs, errorOf } from './components';
 import { CopiesTab } from './copiesTab';
-import { RolloutTab, forgetChange, recallChange } from './rollout';
+import { RolloutTab } from './rollout';
 
 const POLL_MS = 3000;
 
@@ -36,17 +36,27 @@ export function SourcePanel() {
   const [pending, setPending] = useState<SourceCall>();
   const [tab, setTab] = useState<'facts' | 'copies' | 'rollout'>('facts');
   const tabsId = useId();
-  /** Last change confirmed from this browser (the contract has no lookup for it); enables the Rollout tab. */
+  /** Latest confirmed change of this source (`getLatestChange`); enables the Rollout tab. */
   const [rolloutId, setRolloutId] = useState<string | null>(null);
-  const pageId = status?.pageId;
+  const ready = status?.source?.state === 'ready';
   useEffect(() => {
-    setRolloutId(pageId ? recallChange(pageId) : null);
-  }, [pageId]);
+    if (!ready) return;
+    let live = true;
+    call<LatestChangeReply>('getLatestChange')
+      .then((r) => {
+        if (live) setRolloutId(r.change?.changeId ?? null);
+      })
+      .catch(() => {
+        /* no Rollout tab when the lookup fails; facts and copies still work */
+      });
+    return () => {
+      live = false;
+    };
+  }, [ready]);
   const dropRollout = useCallback(() => {
-    if (pageId) forgetChange(pageId);
     setRolloutId(null);
     setTab('facts');
-  }, [pageId]);
+  }, []);
 
   const load = useCallback(async () => {
     const s = await call<SourceStatus>('getSourceStatus');

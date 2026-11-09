@@ -2,7 +2,7 @@
  * M4: the new sentence of a copy (FR-8). A deterministic number swap first; the model rewrites the sentence only when
  * that is not possible, and every rewrite (model or user) is validated before it can reach a page.
  */
-import { sameNegation } from './changes';
+import { ratePeriod, sameNegation } from './changes';
 import { normaliseValue, numbersIn } from './copies';
 import { normaliseKeyPart } from './facts';
 
@@ -22,6 +22,9 @@ export const PROPOSAL_ERROR_CODES = [
   'conflict',
   'version_changed',
   'http_error',
+  // Rejected without a user decision: a newer confirmed change replaced the value, or the confirmation was undone.
+  'superseded',
+  'reverted',
 ] as const;
 export type ProposalErrorCode = (typeof PROPOSAL_ERROR_CODES)[number];
 
@@ -81,9 +84,9 @@ const plainWords = (s: string): string[] =>
 
 const valueWordList = (v: ValueText): string[] => plainWords(v.value);
 
-/** Removes each word of `remove` once from `words`. */
-function without(words: readonly string[], remove: readonly string[]): string[] {
-  const out = [...words];
+/** Removes each item of `remove` once from `items`. */
+function without<T>(items: readonly T[], remove: readonly T[]): T[] {
+  const out = [...items];
   for (const w of remove) {
     const i = out.indexOf(w);
     if (i >= 0) out.splice(i, 1);
@@ -91,14 +94,33 @@ function without(words: readonly string[], remove: readonly string[]): string[] 
   return out;
 }
 
+const sameMultiset = <T>(a: readonly T[], b: readonly T[]): boolean => a.length === b.length && without(a, b).length === 0;
+
+/** Canonical units written in a text, in order ("$60 per day" → [USD, days]; "sixty dollars" → [USD]). */
+const unitTokens = (s: string): string[] =>
+  normaliseKeyPart(s.replace(/\$/g, ' usd ').replace(/€/g, ' eur ').replace(/£/g, ' gbp ').replace(/%/g, ' percent '))
+    .split(' ')
+    .filter((w) => w !== '')
+    .flatMap((w) => {
+      const unit = normaliseValue(w).unit;
+      return unit === null ? [] : [unit];
+    });
+
+/** XML 1.0 forbids these in a page body (C0 controls other than tab/CR/LF, U+FFFE/U+FFFF, lone surrogates). */
+const XML_INVALID = /[\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+/** Longest sentence accepted from the model or the user. */
+export const MAX_SENTENCE_CHARS = 2000;
+
 /**
  * A new sentence is acceptable when the new value is in it and the old one is gone. `strict` (any generated
  * sentence) also requires the same negations and the same words apart from numbers, units and the value words, so a
  * rewrite cannot change anything else. A sentence the user typed only needs the value check.
  */
 export function validateRewrite(oldSentence: string, newSentence: string, oldValue: ValueText, newValue: ValueText, strict: boolean): boolean {
+  if (newSentence.length > MAX_SENTENCE_CHARS) return false;
   const s = newSentence.trim();
-  if (s === '' || s.length > 2000 || /[<>]/.test(s) || /[\r\n]/.test(s)) return false;
+  if (s === '' || /[<>]/.test(s) || /[\r\n]/.test(s) || XML_INVALID.test(s)) return false;
   if (normaliseKeyPart(s) === normaliseKeyPart(oldSentence)) return false;
   const oldNums = normaliseValue(oldValue.value, oldValue.unit).numbers;
   const newNums = normaliseValue(newValue.value, newValue.unit).numbers;
@@ -121,6 +143,13 @@ export function validateRewrite(oldSentence: string, newSentence: string, oldVal
   }
   if (!strict) return true;
   if (!sameNegation(oldSentence, s)) return false;
+  // Every other number stays: the numbers besides the value are the same multiset before and after.
+  if (!sameMultiset(without(after, newNums), without(before, oldNums))) return false;
+  // Units and rate periods besides the value's own stay ("per day" never becomes "per week" in passing).
+  const valueUnits = [...unitTokens(`${oldValue.value} ${oldValue.unit ?? ''}`), ...unitTokens(`${newValue.value} ${newValue.unit ?? ''}`)];
+  if (!sameMultiset(without(unitTokens(s), valueUnits), without(unitTokens(oldSentence), valueUnits))) return false;
+  const valuePeriodChanged = ratePeriod(`${oldValue.value} ${oldValue.unit ?? ''}`) !== ratePeriod(`${newValue.value} ${newValue.unit ?? ''}`);
+  if (!valuePeriodChanged && ratePeriod(s) !== ratePeriod(oldSentence)) return false;
   const a = without(plainWords(oldSentence), valueWordList(oldValue));
   const b = without(plainWords(s), valueWordList(newValue));
   return a.length === b.length && a.every((w, i) => w === b[i]);

@@ -181,6 +181,48 @@ export async function updatePageAsUser(pageId: string, page: { title: string; bo
   return { ok: true, value: saved.version?.number ?? page.version };
 }
 
+/** Ancestors checked for inherited read restrictions; a deeper page is treated as restricted. */
+const MAX_RESTRICTION_ANCESTORS = 20;
+
+interface RawRestrictions {
+  restrictions?: { user?: { size?: number; results?: unknown[] }; group?: { size?: number; results?: unknown[] } };
+}
+
+const restrictedBy = (r: RawRestrictions): boolean => {
+  const n = (x: { size?: number; results?: unknown[] } | undefined): number => Math.max(x?.size ?? 0, x?.results?.length ?? 0);
+  return n(r.restrictions?.user) + n(r.restrictions?.group) > 0;
+};
+
+/**
+ * True when the page's title may be named to anyone (version messages): the app reads its space, and neither the
+ * page nor any ancestor has a read restriction (REST v1 `restriction/byOperation/read`, as the app). Any failure
+ * counts as restricted. Space permissions themselves cannot be read with the app's scopes.
+ */
+export async function pageIsOpen(pageId: string): Promise<boolean> {
+  try {
+    const app = api.asApp();
+    const json = { headers: { Accept: 'application/json' } };
+    const pageRes = await app.requestConfluence(route`/wiki/api/v2/pages/${pageId}`, json);
+    if (!pageRes.ok) return false;
+    const page = (await pageRes.json()) as RawPage;
+    if (page.spaceId === undefined) return false;
+    const spaceRes = await app.requestConfluence(route`/wiki/api/v2/spaces/${String(page.spaceId)}`, json);
+    if (!spaceRes.ok) return false;
+    const ancRes = await app.requestConfluence(route`/wiki/api/v2/pages/${pageId}/ancestors?limit=${String(MAX_RESTRICTION_ANCESTORS + 1)}`, json);
+    if (!ancRes.ok) return false;
+    const ancestors = ((await ancRes.json()) as { results?: { id?: string | number }[] }).results ?? [];
+    if (ancestors.length > MAX_RESTRICTION_ANCESTORS) return false;
+    for (const id of [pageId, ...ancestors.map((a) => String(a.id ?? ''))]) {
+      if (!/^\d{1,32}$/.test(id)) return false;
+      const res = await app.requestConfluence(route`/wiki/rest/api/content/${id}/restriction/byOperation/read?expand=restrictions.user,restrictions.group`, json);
+      if (!res.ok || restrictedBy((await res.json()) as RawRestrictions)) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * True when the current user may edit the page (`update` among its permitted operations). Runs as the user, so only
  * call it from resolvers. 401/403/404 mean "no"; other failures throw.

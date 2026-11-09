@@ -61,7 +61,7 @@ export async function onPageEvent(event: PageEvent): Promise<void> {
 }
 
 interface ExtractEvent {
-  body?: { pageId?: unknown; kind?: unknown; changeId?: unknown; copyId?: unknown };
+  body?: { pageId?: unknown; kind?: unknown; changeId?: unknown; copyId?: unknown; copyPageId?: unknown };
   retryContext?: { retryCount?: number };
 }
 
@@ -76,12 +76,19 @@ export async function extractFacts(event: ExtractEvent): Promise<InvocationError
     return;
   }
   if (event.body?.kind === 'propose') {
-    const { changeId, copyId } = event.body;
-    if (typeof changeId !== 'string' || !UUID.test(changeId) || (copyId !== undefined && (typeof copyId !== 'string' || !UUID.test(copyId)))) {
+    const { changeId, copyId, copyPageId } = event.body;
+    if (
+      typeof changeId !== 'string' ||
+      !UUID.test(changeId) ||
+      (copyId !== undefined && (typeof copyId !== 'string' || !UUID.test(copyId))) ||
+      (copyPageId !== undefined && (typeof copyPageId !== 'string' || !/^\d{1,32}$/.test(copyPageId)))
+    ) {
       console.warn('ripple propose: ignoring event without a valid change id');
       return;
     }
-    const proposed = await runProposeJob(changeId, copyId, event.retryContext?.retryCount ?? 0);
+    // `copyPageId`: stale proposals of one copy page queued again; `copyId`: jobs queued before that existed.
+    const scope = typeof copyPageId === 'string' ? { copyPageId } : typeof copyId === 'string' ? copyId : undefined;
+    const proposed = await runProposeJob(changeId, scope, event.retryContext?.retryCount ?? 0);
     if (proposed.status === 'retry') return retryLater(proposed.seconds, proposed.reason);
     if (proposed.status === 'skipped') console.info('ripple propose skipped', { pageId, changeId, reason: proposed.reason });
     return;
