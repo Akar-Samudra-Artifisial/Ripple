@@ -1,7 +1,8 @@
 import Resolver from '@forge/resolver';
 import { ensureSchema } from '../adapters/sql';
 import { displayNames } from '../adapters/confluenceUsers';
-import { asUserGraph, fetchPageMeta, ownersFromPage, readSpaceTeams, scrubErrorText, type GraphRequest, type PageMeta } from '../adapters/teamworkGraph';
+import { noSpaceTeamCache, spaceTeamsLookup, sqlSpaceTeamCache, type SpaceTeamCache } from '../adapters/spaceTeams';
+import { asUserGraph, fetchPageMeta, ownersFromPage, scrubErrorText, siteOf, type GraphRequest, type PageMeta } from '../adapters/teamworkGraph';
 import { LATEST_MIGRATION, MIGRATIONS } from '../core/migrations';
 import { SchemaMigrationFailedError, SchemaSettingUpError } from '../core/schema';
 import { confirmChange, dismissChange, getLatestChange, getPendingChange, healSource, pendingChangeFlag, type ChangeContext } from './changes';
@@ -15,6 +16,8 @@ import { notImplemented } from './stub';
 export type ResolverContext = {
   accountId?: string;
   cloudId?: string;
+  /** `ari:cloud:<product>::site/<cloudId>`; the site id when `cloudId` is missing. */
+  installContext?: string;
   moduleKey?: string;
   extension?: { content?: { id?: string | number }; space?: { id?: string | number } };
 };
@@ -45,6 +48,8 @@ export interface BylineDeps {
   pendingProposals?: (pageId: string) => Promise<number>;
   /** Re-queues lost jobs of a source page (see `healSource`); must not throw. Absent = no heal. */
   heal?: (pageId: string, currentVersion: number | null) => Promise<unknown>;
+  /** Last good space-teams answers (Forge SQL). Absent = no cache. */
+  teamCache?: SpaceTeamCache;
   ensure: () => Promise<void>;
 }
 
@@ -55,6 +60,7 @@ const defaultDeps: BylineDeps = {
   pendingChange: (id) => pendingChangeFlag(id),
   pendingProposals: (id) => pendingProposalCount(id),
   heal: (id, version) => healSource(id, version),
+  teamCache: sqlSpaceTeamCache,
   ensure: ensureSchema,
 };
 
@@ -102,13 +108,16 @@ export async function bylineStatus(ctx: ResolverContext, deps: BylineDeps = defa
     (pagePromise ??= pageId === undefined || String(pageId) === '' ? Promise.reject(new Error('no page id in context')) : deps.pageMeta(String(pageId)));
   const owner = await ownerOf(page, deps);
   let spaceTeams: SpaceTeamsView;
-  if (!ctx.cloudId) {
+  const site = siteOf(ctx);
+  if (!site) {
     spaceTeams = { spaceId: null, teams: [], dataPresent: false, errors: ['no cloud id in context'] };
   } else {
     try {
+      // Only the space of the viewed page (from its context or the page read as the viewer).
       const spaceId = await spaceIdOf(ctx, page);
-      const read = await readSpaceTeams(deps.graph(ctx.cloudId), ctx.cloudId, spaceId);
-      spaceTeams = { spaceId, teams: read.teams, dataPresent: read.dataPresent, errors: read.errors };
+      const lookup = spaceTeamsLookup({ request: deps.graph(site.cloudId), cache: deps.teamCache ?? noSpaceTeamCache, cloudId: site.cloudId, cloudIdSource: site.source });
+      const r = await lookup(spaceId);
+      spaceTeams = { spaceId, teams: r.teams, dataPresent: r.dataPresent, errors: r.errors, ...(r.origin === 'stale' ? { stale: true } : {}) };
     } catch (err) {
       spaceTeams = { spaceId: null, teams: [], dataPresent: false, errors: [errorText(err)] };
     }

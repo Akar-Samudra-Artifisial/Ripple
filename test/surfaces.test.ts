@@ -90,14 +90,15 @@ describe('migrations', () => {
       'v023_create_proposals',
       'v024_proposals_change_copy_unique',
       'v025_create_propose_requeues',
+      'v026_create_space_team_cache',
     ]);
-    expect(LATEST_MIGRATION).toBe('v025_create_propose_requeues');
+    expect(LATEST_MIGRATION).toBe('v026_create_space_team_cache');
   });
 });
 
 describe('schemaView', () => {
   it('reports ready, setting up and errors', async () => {
-    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 25, total: 25, latest: LATEST_MIGRATION });
+    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 26, total: 26, latest: LATEST_MIGRATION });
     expect(
       await schemaView(async () => {
         throw new SchemaSettingUpError(1, 4);
@@ -168,6 +169,17 @@ describe('bylineStatus', () => {
     expect(failing.owner).toEqual({ accountId: 'owner-1', role: 'owner', displayName: null, errors: ['Confluence users-bulk failed: HTTP 403'] });
     const hidden = await bylineStatus({ cloudId: 'c1', extension: { content: { id: 5 } } }, deps({ names: async () => new Map() }));
     expect(hidden.owner.displayName).toBeNull();
+  });
+
+  it('uses the install context site id and shows a stale cached team (no error) when the graph keeps failing', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const request = vi.fn(async () => ({ failure: 'HTTP 503: busy', status: 503, retryAfterMs: 0 }));
+    const graph = vi.fn(() => request);
+    const teamCache = { get: async () => ({ teams: [{ id: 't1', name: 'Platform Team' }], ageSeconds: 7200 }), put: vi.fn(async () => undefined) };
+    const r = await bylineStatus({ installContext: 'ari:cloud:confluence::site/11111111-2222', extension: { content: { id: 5 }, space: { id: 7 } } }, deps({ graph, teamCache }));
+    expect(graph).toHaveBeenCalledWith('11111111-2222');
+    expect(r.spaceTeams).toEqual({ spaceId: '7', teams: [{ id: 't1', name: 'Platform Team' }], dataPresent: true, errors: [], stale: true });
+    expect(teamCache.put).not.toHaveBeenCalled();
   });
 
   it('falls back to the REST v2 page for the space id', async () => {

@@ -50,6 +50,10 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Halaman arsip/draft tidak lagi menjadi kandidat salinan. Pengecualian space lewat pengaturan belum ada.
 
 ### Fixed
+- "Team unavailable, try again" lebih jarang muncul. Bacaan tim space dari Teamwork Graph kini dicoba sampai 3 kali dengan backoff 300/800 ms ditambah jitter. `Retry-After` dihormati, dibatasi 1,5 dtk, dan total waktu maksimal ±4 dtk. Hasil per space dipakai bersama dalam satu panggilan resolver.
+- Jawaban sukses (termasuk "tidak ada tim") disimpan per space di tabel baru `space_team_cache` (migrasi `v026_create_space_team_cache`) dan dipakai selama 10 menit. Bila Teamwork Graph gagal, cache berumur ≤24 jam tetap ditampilkan seperti biasa tanpa label error. Error tidak pernah disimpan.
+- `cloudId` diambil dari `installContext` bila konteks resolver tidak memuatnya.
+- Log `ripple twg` untuk `ripple_spaceTeams` kini hanya mencatat kelas error (`http_401`/`http_403`/`http_429`/`http_5xx`/`gql_not_permitted`/`gql_rate_limited`/`gql_other`/`network`), `attempt`, `cloudIdSource`, dan ada/tidaknya `Retry-After`, tanpa teks error.
 - Job propose dan diff berikutnya dari satu sumber tidak pernah dijalankan (tanpa log/ERROR): ketiga jenis job memakai satu concurrency key per halaman sumber (limit 1), dan Forge menunda event yang menunggu slot dengan backoff hingga 15 menit. Job propose kini memakai key per perubahan (`ripple-propose-<change>`), extract/diff key baru per halaman (`ripple-page-<page>`).
 - Pemulihan otomatis saat byline halaman sumber dibuka (maks. sekali per 2 menit per halaman): diff diantrekan ulang bila versi halaman lebih baru dari versi terakhir yang dibaca, dan job propose diantrekan ulang untuk perubahan terkonfirmasi (≤7 hari) yang memengaruhi salinan tetapi belum punya usulan. Kedua job idempoten.
 - Setiap consumer menulis log pertama `ripple job start` (`queue`, `kind`, `jobId`, `retryCount`).

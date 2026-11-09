@@ -15,7 +15,8 @@ import { displayNames } from '../adapters/confluenceUsers';
 import { sqlProposalRepo } from '../adapters/proposalRepo';
 import { sqlRepo, type FactRepo, type PageVersionInfo } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
-import { asUserGraph, fetchPageMeta, ownersFromPage, readSpaceTeams, scrubErrorText, type GraphRequest, type PageMeta } from '../adapters/teamworkGraph';
+import { noSpaceTeamCache, spaceTeamsLookup, sqlSpaceTeamCache, type SpaceTeamCache } from '../adapters/spaceTeams';
+import { asUserGraph, fetchPageMeta, ownersFromPage, scrubErrorText, siteOf, type GraphRequest, type PageMeta } from '../adapters/teamworkGraph';
 import { addWorkingDays, computeImpact, DEFAULT_DEADLINE_DAYS, isRippleVersion, matchFacts, MAX_DEADLINE_DAYS, offeredFacts, planDiff, wordingOnlyReverts, type KnownFact } from '../core/changes';
 import { parseExtraction } from '../core/facts';
 import { storageToText, TRUNCATED_MARK } from '../core/pageText';
@@ -312,6 +313,8 @@ export interface ChangeDeps {
   pageMeta: (pageId: string) => Promise<PageMeta>;
   names: (accountIds: readonly string[]) => Promise<Map<string, string>>;
   graph: (cloudId: string) => GraphRequest;
+  /** Last good space-teams answers (Forge SQL). Absent = no cache. */
+  teamCache?: SpaceTeamCache;
   ensure: () => Promise<void>;
   now: () => Date;
   /** M4: queues the edit proposals of a confirmed change (`extract` queue, `kind: 'propose'`). */
@@ -328,13 +331,14 @@ const defaultDeps: ChangeDeps = {
   pageMeta: fetchPageMeta,
   names: (ids) => displayNames(ids),
   graph: asUserGraph,
+  teamCache: sqlSpaceTeamCache,
   ensure: ensureSchema,
   now: () => new Date(),
   enqueuePropose: (sourcePageId, changeId) => enqueuePropose(sourcePageId, changeId),
   supersedeProposals: (sourcePageId, changeId, factIds) => sqlProposalRepo.supersedeOlder(sourcePageId, changeId, factIds),
 };
 
-export type ChangeContext = SourceContext & { cloudId?: string };
+export type ChangeContext = SourceContext & { cloudId?: string; installContext?: string };
 
 function pageIdOf(ctx: ChangeContext): string | undefined {
   const id = ctx.extension?.content?.id;
@@ -507,22 +511,16 @@ async function summarise(ctx: ChangeContext, pageId: string, change: ChangeRow, 
     return { pageId: id, pageTitle: titles.get(id)?.title ?? null, pageUrl: titles.get(id)?.url ?? null, spaceId, copies: visibleCopies.filter((c) => c.pageId === id).length, owner };
   });
   const spaceIds = [...new Set(pages.map((p) => p.spaceId).filter((s): s is string => s !== null))].sort();
-  // A failed read (request error or GraphQL errors without teams) is `unknown`, never "no team linked". At confirm
-  // (`allPages`) such a space is read once more; still failing, the routing records it as unknown without team ids.
-  const teamsOf = async (cloudId: string, spaceId: string): Promise<ChangeSpaceView> => {
-    try {
-      const read = await readSpaceTeams(deps.graph(cloudId), cloudId, spaceId);
-      if (read.teams.length > 0) return { spaceId, teams: read.teams, teamSource: 'teamwork_graph' };
-      return { spaceId, teams: [], teamSource: read.errors.length > 0 || !read.dataPresent ? 'unknown' : 'none' };
-    } catch (err) {
-      console.warn('ripple change: space teams failed', { pageId, error: errorText(err) });
-      return { spaceId, teams: [], teamSource: 'unknown' };
-    }
-  };
-  const spaces: ChangeSpaceView[] = await mapLimit(spaceIds, LOOKUP_CONCURRENCY, async (spaceId) => {
-    if (!ctx.cloudId) return { spaceId, teams: [], teamSource: 'unknown' };
-    const first = await teamsOf(ctx.cloudId, spaceId);
-    return first.teamSource === 'unknown' && allPages ? teamsOf(ctx.cloudId, spaceId) : first;
+  // A failed read without a cached answer (≤24 h) is `unknown`, never "no team linked"; the routing then records it
+  // as unknown without team ids. The spaces are those of visible pages only (the view), or all affected pages at
+  // confirm, whose view is not returned to the user. Each space is read once per invocation (retries inside).
+  const site = siteOf(ctx);
+  const lookup = site ? spaceTeamsLookup({ request: deps.graph(site.cloudId), cache: deps.teamCache ?? noSpaceTeamCache, cloudId: site.cloudId, cloudIdSource: site.source }) : undefined;
+  const spaces: ChangeSpaceView[] = await mapLimit(spaceIds, LOOKUP_CONCURRENCY, async (spaceId): Promise<ChangeSpaceView> => {
+    if (!lookup) return { spaceId, teams: [], teamSource: 'unknown' };
+    const r = await lookup(spaceId);
+    if (r.origin === 'unknown') return { spaceId, teams: [], teamSource: 'unknown' };
+    return { spaceId, teams: r.teams, teamSource: r.teams.length > 0 ? 'teamwork_graph' : 'none', ...(r.origin === 'stale' ? { stale: true } : {}) };
   });
   const now = deps.now();
   const view: PendingChangeView = {

@@ -29,6 +29,7 @@ import { MIGRATIONS } from '../src/core/migrations';
 import { sqlProposalRepo } from '../src/adapters/proposalRepo';
 import { sqlRepo } from '../src/adapters/repo';
 import { sqlScanRepo } from '../src/adapters/scanRepo';
+import { sqlSpaceTeamCache } from '../src/adapters/spaceTeams';
 import { sqlErrorInfo, sqlInt, sqlOp } from '../src/core/schema';
 
 beforeEach(() => {
@@ -167,6 +168,20 @@ describe('migration identifiers (TiDB rejects unquoted reserved words with ER_PA
     expect(definedIdentifiers(bad)).toEqual(['t', 'id', 'delayed', 'idx_t']);
     expect(definedIdentifiers(bad).filter((n) => RESERVED.has(n))).toEqual(['delayed']);
     for (const m of MIGRATIONS.filter((x) => /^CREATE TABLE/i.test(x.statement.trim()))) expect(definedIdentifiers(m.statement).length, m.name).toBeGreaterThan(2);
+  });
+});
+
+describe('space_team_cache', () => {
+  it('reads and upserts one row per space with bound values only (age computed in SQL, no LIMIT)', async () => {
+    await sqlSpaceTeamCache.get('7');
+    await sqlSpaceTeamCache.put('7', [{ id: 't1', name: "O'Brien Team" }]);
+    expect(calls.map((c) => c.statement)).toEqual([
+      'SELECT teams_json, TIMESTAMPDIFF(SECOND, fetched_at, CURRENT_TIMESTAMP) AS age_seconds FROM space_team_cache WHERE space_id = ?',
+      'INSERT INTO space_team_cache (space_id, teams_json, fetched_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON DUPLICATE KEY UPDATE teams_json = VALUES(teams_json), fetched_at = CURRENT_TIMESTAMP',
+    ]);
+    expect(calls[0]?.params).toEqual(['7']);
+    expect(calls[1]?.params).toEqual(['7', JSON.stringify([{ id: 't1', name: "O'Brien Team" }])]);
+    expect(calls.some((c) => /LIMIT/i.test(c.statement))).toBe(false);
   });
 });
 

@@ -158,8 +158,28 @@ export function parseSpaceTeams(raw: unknown): { teams: Team[] } & GraphMeta {
 /** Diagnostics used when the request itself failed (no body to parse). */
 const failedMeta = (message: string): GraphMeta => ({ rawCount: 0, nullNodes: 0, types: [], dataPresent: false, hasNextPage: false, errors: [message] });
 
+/**
+ * A failed graph request: the scrubbed reason plus what the retry needs. `status` is set for a non-2xx answer,
+ * `network` when the call threw, `retryAfterMs` when the answer carried a usable `Retry-After` header.
+ */
+export interface GraphFailure {
+  failure: string;
+  status?: number;
+  network?: boolean;
+  retryAfterMs?: number;
+}
+
 /** One graph request: the parsed JSON body, or the exact failure reason. Never throws. */
-export type GraphRequest = (query: string, variables: Record<string, unknown>, operation: string) => Promise<{ body: unknown } | { failure: string }>;
+export type GraphRequest = (query: string, variables: Record<string, unknown>, operation: string) => Promise<{ body: unknown } | GraphFailure>;
+
+/** `Retry-After` (seconds or HTTP date) in milliseconds; undefined when absent or unreadable. */
+export function parseRetryAfter(value: string | null | undefined, now: number = Date.now()): number | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+(\.\d+)?$/.test(trimmed)) return Math.round(Number(trimmed) * 1000);
+  const at = Date.parse(trimmed);
+  return Number.isFinite(at) ? Math.max(0, at - now) : undefined;
+}
 
 /** `requestTeamworkGraph` as the current user with the site query context. Resolver only. */
 export function asUserGraph(cloudId: string): GraphRequest {
@@ -167,16 +187,60 @@ export function asUserGraph(cloudId: string): GraphRequest {
     try {
       const res = await api.asUser().requestTeamworkGraph(query, variables, operation, undefined, { 'X-Query-Context': queryContext(cloudId) });
       const text = await res.text();
-      if (!res.ok) return { failure: `HTTP ${res.status}: ${scrubErrorText(text)}` };
+      if (!res.ok) {
+        const retryAfterMs = parseRetryAfter(res.headers.get('Retry-After'));
+        return { failure: `HTTP ${res.status}: ${scrubErrorText(text)}`, status: res.status, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) };
+      }
       try {
         return { body: JSON.parse(text) as unknown };
       } catch {
         return { failure: `non-JSON response: ${scrubErrorText(text)}` };
       }
     } catch (err) {
-      return { failure: `threw: ${errorText(err)}` };
+      return { failure: `threw: ${errorText(err)}`, network: true };
     }
   };
+}
+
+/** Where the site id of a resolver call came from (logged with every space-teams read). */
+export type CloudIdSource = 'context' | 'install';
+
+/** Site id from `installContext` (`ari:cloud:<product>::site/<cloudId>`), as in Tripwire. */
+export function cloudIdFromInstallContext(installContext: string | undefined): string | undefined {
+  const m = /^ari:cloud:[a-z-]+::site\/([0-9a-f-]{8,64})$/i.exec(installContext ?? '');
+  return m?.[1];
+}
+
+/** Site id of a resolver call: `cloudId`, else parsed from `installContext`. */
+export function siteOf(ctx: { cloudId?: string; installContext?: string }): { cloudId: string; source: CloudIdSource } | undefined {
+  if (ctx.cloudId) return { cloudId: ctx.cloudId, source: 'context' };
+  const fromInstall = cloudIdFromInstallContext(ctx.installContext);
+  return fromInstall ? { cloudId: fromInstall, source: 'install' } : undefined;
+}
+
+/** Class of a failed graph read; the only error detail that is logged for space-teams reads. */
+export type GraphErrorClass = 'http_401' | 'http_403' | 'http_429' | 'http_5xx' | 'http_other' | 'gql_not_permitted' | 'gql_rate_limited' | 'gql_other' | 'network';
+
+/**
+ * Class of a read that brought no data: HTTP status first, then the GraphQL error messages (already scrubbed).
+ * Null when the read has data (a usable answer, also "no teams").
+ */
+export function classifyGraphError(r: { body: unknown } | GraphFailure, read: { dataPresent: boolean; errors: readonly string[] }): GraphErrorClass | null {
+  if (!('failure' in r)) {
+    if (read.dataPresent) return null;
+    const text = read.errors.join(' ').toLowerCase();
+    if (text.includes('not permitted')) return 'gql_not_permitted';
+    if (/rate.?limit|too many requests|throttl/.test(text)) return 'gql_rate_limited';
+    return 'gql_other';
+  }
+  if (r.network) return 'network';
+  const s = r.status;
+  if (s === 401) return 'http_401';
+  if (s === 403) return 'http_403';
+  if (s === 429) return 'http_429';
+  if (s !== undefined && s >= 500) return 'http_5xx';
+  if (s !== undefined) return 'http_other';
+  return 'gql_other';
 }
 
 /** One structured line per read; counts, page/space ids and scrubbed errors only (no names, account ids or content). */
@@ -214,27 +278,66 @@ export async function readContributors(request: GraphRequest, cloudId: string, p
   return read;
 }
 
-/** Wait before the one retry of a failed space-teams read. */
-export const SPACE_TEAMS_RETRY_MS = 600;
+/** Space-teams attempts per read (the first plus two retries). */
+export const SPACE_TEAMS_ATTEMPTS = 3;
+/** Base wait before retry 1 and 2; up to `SPACE_TEAMS_JITTER_MS` is added at random. */
+export const SPACE_TEAMS_BACKOFF_MS = [300, 800] as const;
+export const SPACE_TEAMS_JITTER_MS = 200;
+/** A `Retry-After` longer than this is cut to it (the resolver must answer in time). */
+export const SPACE_TEAMS_RETRY_AFTER_CAP_MS = 1500;
+/** No retry starts when its wait would end later than this after the first attempt began. */
+export const SPACE_TEAMS_BUDGET_MS = 4000;
+
+export interface SpaceTeamsRead extends GraphMeta {
+  teams: Team[];
+  /** Null when the read brought data (also "no teams"). */
+  errorClass: GraphErrorClass | null;
+  attempts: number;
+}
+
+export interface ReadSpaceTeamsOptions {
+  cloudIdSource?: CloudIdSource;
+  sleep?: (ms: number) => Promise<void>;
+  /** In [0, 1); scales the jitter. */
+  random?: () => number;
+  now?: () => number;
+}
+
+const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Teams of a space. The graph intermittently answers the same user and space with "User is not permitted to query
- * this organization" and no data (seconds after a good answer), so a read without data and with errors is retried
- * once after a short wait. Each attempt is logged (`attempt`).
+ * this organization" and no data (seconds after a good answer), so a read without data is retried up to
+ * `SPACE_TEAMS_ATTEMPTS` times: 300 / 800 ms plus jitter, or the answer's `Retry-After` (capped), within
+ * `SPACE_TEAMS_BUDGET_MS`. Each attempt logs one line with the error class only (no error text, ARI or cloud id).
  */
-export async function readSpaceTeams(
-  request: GraphRequest,
-  cloudId: string,
-  spaceId: string,
-  sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-): Promise<{ teams: Team[] } & GraphMeta> {
-  let read: { teams: Team[] } & GraphMeta = { teams: [], ...failedMeta('not read') };
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    if (attempt > 1) await sleep(SPACE_TEAMS_RETRY_MS);
+export async function readSpaceTeams(request: GraphRequest, cloudId: string, spaceId: string, opts: ReadSpaceTeamsOptions = {}): Promise<SpaceTeamsRead> {
+  const sleep = opts.sleep ?? realSleep;
+  const random = opts.random ?? Math.random;
+  const now = opts.now ?? Date.now;
+  const started = now();
+  let read: SpaceTeamsRead = { teams: [], ...failedMeta('not read'), errorClass: 'gql_other', attempts: 0 };
+  for (let attempt = 1; attempt <= SPACE_TEAMS_ATTEMPTS; attempt++) {
     const r = await request(SPACE_TEAMS_QUERY, { spaceAri: spaceAri(cloudId, spaceId) }, 'ripple_spaceTeams');
-    read = 'failure' in r ? { teams: [], ...failedMeta(r.failure) } : parseSpaceTeams(r.body);
-    logRead('ripple_spaceTeams', { spaceId, attempt }, read, read.teams.length);
-    if (read.dataPresent || read.errors.length === 0) break;
+    const parsed = 'failure' in r ? { teams: [], ...failedMeta(r.failure) } : parseSpaceTeams(r.body);
+    const errorClass = classifyGraphError(r, parsed);
+    const retryAfterMs = 'failure' in r ? r.retryAfterMs : undefined;
+    read = { ...parsed, errorClass, attempts: attempt };
+    console.info('ripple twg', {
+      op: 'ripple_spaceTeams',
+      spaceId,
+      attempt,
+      count: read.teams.length,
+      dataPresent: read.dataPresent,
+      errorClass,
+      cloudIdSource: opts.cloudIdSource ?? 'context',
+      retryAfter: retryAfterMs !== undefined,
+    });
+    if (errorClass === null || attempt === SPACE_TEAMS_ATTEMPTS) break;
+    const base = SPACE_TEAMS_BACKOFF_MS[attempt - 1] ?? SPACE_TEAMS_BACKOFF_MS[1];
+    const wait = retryAfterMs !== undefined ? Math.min(retryAfterMs, SPACE_TEAMS_RETRY_AFTER_CAP_MS) : base + Math.floor(random() * SPACE_TEAMS_JITTER_MS);
+    if (now() - started + wait > SPACE_TEAMS_BUDGET_MS) break;
+    await sleep(wait);
   }
   return read;
 }

@@ -254,6 +254,17 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
       KEY idx_propose_requeues_source (source_page_id)
     )`,
   },
+  // Last good Teamwork Graph answer per space (team ids and names, also "no teams"): fresh for 10 minutes, and used
+  // for up to 24 hours when the graph fails. Errors are never stored.
+  {
+    name: 'v026_create_space_team_cache',
+    statement: `CREATE TABLE IF NOT EXISTS space_team_cache (
+      space_id VARCHAR(32) NOT NULL,
+      teams_json JSON NOT NULL,
+      fetched_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (space_id)
+    )`,
+  },
 ];
 
 /** Name of the newest migration; the byline reports it so admins can confirm the schema is current. */

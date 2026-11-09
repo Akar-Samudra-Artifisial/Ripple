@@ -29,6 +29,8 @@ export interface SpaceTeamsView {
   /** False when the graph answered `data: null` (missing scope / query context) or the call failed. */
   dataPresent: boolean;
   errors: string[];
+  /** True when the graph failed and the last good answer (≤24 h old) is shown instead; displayed like any answer. */
+  stale?: boolean;
 }
 
 /** Page owner from Confluence REST v2 (`ownerId`, else `authorId`), named via users-bulk. */
@@ -265,6 +267,8 @@ export interface ChangeSpaceView {
    * (an error such as a missing permission), so whether a team is linked is not known.
    */
   teamSource: TeamSource;
+  /** True when the graph failed and the last good answer (≤24 h old) stands in; `teamSource` is then not `unknown`. */
+  stale?: boolean;
 }
 
 export interface PendingChangeView {

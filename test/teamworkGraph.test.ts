@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@forge/api', () => ({ default: {}, route: (s: TemplateStringsArray) => s.join('') }));
+vi.mock('@forge/events', () => ({ Queue: class {} }));
+vi.mock('@forge/sql', () => ({ sql: {}, migrationRunner: {} }));
 
 import {
   OWNER_VARIANTS,
@@ -14,12 +16,19 @@ import {
   queryContext,
   readPageOwners,
   readSpaceTeams,
+  classifyGraphError,
+  parseRetryAfter,
   scrubErrorText,
-  SPACE_TEAMS_RETRY_MS,
+  siteOf,
+  SPACE_TEAMS_ATTEMPTS,
+  SPACE_TEAMS_JITTER_MS,
+  SPACE_TEAMS_RETRY_AFTER_CAP_MS,
   spaceAri,
   type GraphRequest,
+  type SpaceTeamsRead,
   type GraphUser,
 } from '../src/adapters/teamworkGraph';
+import { SPACE_TEAMS_FRESH_SECONDS, SPACE_TEAMS_STALE_SECONDS, spaceTeamsLookup, type CachedTeams, type SpaceTeamCache } from '../src/adapters/spaceTeams';
 
 const ACCOUNT = '5b10ac8d82e05b22cc7d4ef5';
 
@@ -153,23 +162,158 @@ describe('reads', () => {
     expect(r.teams).toEqual([{ id: 't1', name: 'Platform Team' }]);
   });
 
-  it('retries a space-teams read once when the graph answers "not permitted" without data (intermittent)', async () => {
-    const denied = { body: { data: null, errors: [{ message: 'User is not permitted to query this organization' }] } };
-    const ok = { body: { data: { atlassianTeamsBySpace: { edges: [{ node: { id: 't1', displayName: 'Platform Team' } }] } } } };
-    const request = vi.fn<GraphRequest>().mockResolvedValueOnce(denied).mockResolvedValueOnce(ok);
-    const sleep = vi.fn(async () => undefined);
-    const r = await readSpaceTeams(request, 'c1', '7', sleep);
-    expect(request).toHaveBeenCalledTimes(2);
-    expect(sleep).toHaveBeenCalledWith(SPACE_TEAMS_RETRY_MS);
-    expect(r.teams).toHaveLength(1);
+  const denied = { body: { data: null, errors: [{ message: 'User is not permitted to query this organization' }] } };
+  const ok = { body: { data: { atlassianTeamsBySpace: { edges: [{ node: { id: 't1', displayName: 'Platform Team' } }] } } } };
 
+  it('retries a space-teams read without data with 300/800 ms plus jitter and stops at attempt 3', async () => {
+    const sleep = vi.fn(async (_ms: number) => undefined);
+    const opts = { sleep, random: () => 0.5, now: () => 0 };
+    const request = vi.fn<GraphRequest>().mockResolvedValueOnce(denied).mockResolvedValueOnce(ok);
+    const r = await readSpaceTeams(request, 'c1', '7', opts);
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(sleep.mock.calls.map((c) => c[0])).toEqual([300 + 0.5 * SPACE_TEAMS_JITTER_MS]);
+    expect(r).toMatchObject({ teams: [{ id: 't1', name: 'Platform Team' }], errorClass: null, attempts: 2 });
+
+    sleep.mockClear();
     const always = vi.fn<GraphRequest>(async () => denied);
-    const failed = await readSpaceTeams(always, 'c1', '7', sleep);
-    expect(always).toHaveBeenCalledTimes(2); // one retry only
-    expect(failed.errors).toContain('User is not permitted to query this organization');
+    const failed = await readSpaceTeams(always, 'c1', '7', opts);
+    expect(always).toHaveBeenCalledTimes(SPACE_TEAMS_ATTEMPTS);
+    expect(SPACE_TEAMS_ATTEMPTS).toBe(3);
+    expect(sleep.mock.calls.map((c) => c[0])).toEqual([400, 900]); // no wait after the last attempt
+    expect(failed).toMatchObject({ errorClass: 'gql_not_permitted', attempts: 3, dataPresent: false });
 
     const empty = vi.fn<GraphRequest>(async () => ({ body: { data: { atlassianTeamsBySpace: { edges: [] } } } }));
-    await readSpaceTeams(empty, 'c1', '7', sleep);
+    expect(await readSpaceTeams(empty, 'c1', '7', opts)).toMatchObject({ teams: [], errorClass: null });
     expect(empty).toHaveBeenCalledTimes(1); // "no teams" is an answer, not a failure
+  });
+
+  it('honours Retry-After (capped) and stops when the next wait would pass the time budget', async () => {
+    const sleep = vi.fn(async (_ms: number) => undefined);
+    const throttled = vi.fn<GraphRequest>(async () => ({ failure: 'HTTP 429: slow down', status: 429, retryAfterMs: 1000 }));
+    await readSpaceTeams(throttled, 'c1', '7', { sleep, now: () => 0 });
+    expect(sleep.mock.calls.map((c) => c[0])).toEqual([1000, 1000]);
+
+    sleep.mockClear();
+    const long = vi.fn<GraphRequest>(async () => ({ failure: 'HTTP 503: busy', status: 503, retryAfterMs: 60_000 }));
+    const r = await readSpaceTeams(long, 'c1', '7', { sleep, now: () => 0 });
+    expect(sleep.mock.calls.map((c) => c[0])).toEqual([SPACE_TEAMS_RETRY_AFTER_CAP_MS, SPACE_TEAMS_RETRY_AFTER_CAP_MS]);
+    expect(r.errorClass).toBe('http_5xx');
+
+    sleep.mockClear();
+    let clock = 0;
+    const slow = vi.fn<GraphRequest>(async () => {
+      clock += 3500; // each request takes 3.5 s
+      return denied;
+    });
+    await readSpaceTeams(slow, 'c1', '7', { sleep, now: () => clock, random: () => 0 });
+    // 3.5 s + 300 ms fits the 4 s budget; after the second attempt (7 s) no third one starts.
+    expect(slow).toHaveBeenCalledTimes(2);
+    expect(sleep.mock.calls.map((c) => c[0])).toEqual([300]);
+  });
+
+  it('logs the error class, attempt, cloud id source and Retry-After presence only (no error text, ARI or cloud id)', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const request = vi.fn<GraphRequest>().mockResolvedValueOnce({ failure: 'HTTP 429: ari:cloud:confluence:c1:space/7', status: 429, retryAfterMs: 10 }).mockResolvedValueOnce(ok);
+    await readSpaceTeams(request, 'cloud-123', '7', { sleep: async () => undefined, cloudIdSource: 'install' });
+    expect(info.mock.calls.map((c) => c[1])).toEqual([
+      { op: 'ripple_spaceTeams', spaceId: '7', attempt: 1, count: 0, dataPresent: false, errorClass: 'http_429', cloudIdSource: 'install', retryAfter: true },
+      { op: 'ripple_spaceTeams', spaceId: '7', attempt: 2, count: 1, dataPresent: true, errorClass: null, cloudIdSource: 'install', retryAfter: false },
+    ]);
+    expect(JSON.stringify(info.mock.calls)).not.toMatch(/ari:cloud|cloud-123|not permitted|HTTP 429/);
+  });
+
+  it('classifies failed reads', () => {
+    const meta = (errors: string[], dataPresent = false) => ({ errors, dataPresent });
+    const f = (status?: number, network?: boolean) => ({ failure: 'x', ...(status !== undefined ? { status } : {}), ...(network ? { network } : {}) });
+    expect(classifyGraphError(f(401), meta(['x']))).toBe('http_401');
+    expect(classifyGraphError(f(403), meta(['x']))).toBe('http_403');
+    expect(classifyGraphError(f(429), meta(['x']))).toBe('http_429');
+    expect(classifyGraphError(f(502), meta(['x']))).toBe('http_5xx');
+    expect(classifyGraphError(f(400), meta(['x']))).toBe('http_other');
+    expect(classifyGraphError(f(undefined, true), meta(['x']))).toBe('network');
+    expect(classifyGraphError({ body: {} }, meta(['User is not permitted to query this organization']))).toBe('gql_not_permitted');
+    expect(classifyGraphError({ body: {} }, meta(['Rate limit exceeded']))).toBe('gql_rate_limited');
+    expect(classifyGraphError({ body: {} }, meta(['Something else']))).toBe('gql_other');
+    expect(classifyGraphError({ body: {} }, meta([]))).toBe('gql_other'); // data: null without errors
+    expect(classifyGraphError({ body: {} }, meta(['partial'], true))).toBeNull();
+  });
+
+  it('parses Retry-After and the site id of the install context', () => {
+    expect(parseRetryAfter('2')).toBe(2000);
+    expect(parseRetryAfter(null)).toBeUndefined();
+    expect(parseRetryAfter('Mon, 09 Nov 2026 10:00:03 GMT', Date.parse('2026-11-09T10:00:00Z'))).toBe(3000);
+    expect(siteOf({ cloudId: 'c1', installContext: 'ari:cloud:confluence::site/11111111-2222' })).toEqual({ cloudId: 'c1', source: 'context' });
+    expect(siteOf({ installContext: 'ari:cloud:confluence::site/11111111-2222' })).toEqual({ cloudId: '11111111-2222', source: 'install' });
+    expect(siteOf({ installContext: 'nonsense' })).toBeUndefined();
+  });
+});
+
+describe('spaceTeamsLookup (cache and dedup)', () => {
+  const T = [{ id: 't1', name: 'Platform Team' }];
+  const read = (r: Partial<SpaceTeamsRead>) => vi.fn(async (): Promise<SpaceTeamsRead> => ({ teams: [], rawCount: 0, nullNodes: 0, types: [], dataPresent: true, hasNextPage: false, errors: [], errorClass: null, attempts: 1, ...r }));
+  const memCache = (entry?: CachedTeams) => {
+    const puts: [string, readonly { id: string; name: string }[]][] = [];
+    const cache: SpaceTeamCache = { get: vi.fn(async () => entry), put: vi.fn(async (s, t) => void puts.push([s, t])) };
+    return { cache, puts };
+  };
+  const lookupWith = (cache: SpaceTeamCache, r: ReturnType<typeof read>) => spaceTeamsLookup({ request: vi.fn(), cache, cloudId: 'c1', cloudIdSource: 'context', read: r });
+
+  it('fresh cache hit: no graph read', async () => {
+    const { cache } = memCache({ teams: T, ageSeconds: SPACE_TEAMS_FRESH_SECONDS - 1 });
+    const r = read({ teams: [] });
+    expect(await lookupWith(cache, r)('7')).toEqual({ teams: T, origin: 'cached', dataPresent: true, errors: [] });
+    expect(r).not.toHaveBeenCalled();
+  });
+
+  it('miss: reads the graph and stores the answer, also "no teams"', async () => {
+    const { cache, puts } = memCache();
+    expect(await lookupWith(cache, read({ teams: T }))('7')).toMatchObject({ teams: T, origin: 'live' });
+    expect(await lookupWith(cache, read({ teams: [] }))('8')).toMatchObject({ teams: [], origin: 'live', dataPresent: true });
+    expect(puts).toEqual([
+      ['7', T],
+      ['8', []],
+    ]);
+  });
+
+  it('expired entry and a failing graph: the stale entry (≤24 h) is shown without errors; errors are never stored', async () => {
+    const failing = read({ dataPresent: false, errors: ['User is not permitted to query this organization'], errorClass: 'gql_not_permitted', attempts: 3 });
+    const old = memCache({ teams: T, ageSeconds: 3600 });
+    expect(await lookupWith(old.cache, failing)('7')).toEqual({ teams: T, origin: 'stale', dataPresent: true, errors: [] });
+    expect(old.puts).toEqual([]);
+
+    const tooOld = memCache({ teams: T, ageSeconds: SPACE_TEAMS_STALE_SECONDS + 1 });
+    expect(await lookupWith(tooOld.cache, failing)('7')).toMatchObject({ teams: [], origin: 'unknown', dataPresent: false });
+    const none = memCache();
+    expect(await lookupWith(none.cache, failing)('7')).toMatchObject({ origin: 'unknown', errors: ['User is not permitted to query this organization'] });
+    expect(tooOld.puts).toEqual([]);
+    expect(none.puts).toEqual([]);
+  });
+
+  it('a broken cache only skips the cache', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const cache: SpaceTeamCache = {
+      get: async () => {
+        throw new Error('no table');
+      },
+      put: async () => {
+        throw new Error('no table');
+      },
+    };
+    expect(await lookupWith(cache, read({ teams: T }))('7')).toMatchObject({ teams: T, origin: 'live' });
+  });
+
+  it('dedups: one read per space per invocation, also for concurrent calls', async () => {
+    const { cache } = memCache();
+    const r = read({ teams: T });
+    const lookup = lookupWith(cache, r);
+    const [a, b] = await Promise.all([lookup('7'), lookup('7')]);
+    await lookup('7');
+    await lookup('8');
+    expect(a).toBe(b);
+    expect(r).toHaveBeenCalledTimes(2);
+    expect(cache.get).toHaveBeenCalledTimes(2);
+    // A new invocation reads again (the memo lives per request).
+    await lookupWith(cache, r)('7');
+    expect(r).toHaveBeenCalledTimes(3);
   });
 });
