@@ -25,6 +25,8 @@ export interface JudgeMention {
   stated_unit: string | null;
   stated_condition: string | null;
   quote: string;
+  /** Judge reason code; omitted = a judge without the field (parsed as "other"). */
+  reason_code?: string;
 }
 
 export interface CopyPageFixture {

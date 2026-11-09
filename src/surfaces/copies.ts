@@ -482,6 +482,7 @@ async function judgePage(scan: ScanRow, page: PendingPage, facts: readonly ScanF
   // Per fact of this page: why it did or did not become a copy (ids and outcome labels only, for the page log).
   const chunked = new Set(chunks.flatMap((c) => c.factIds));
   const outcomes = new Map<string, string[]>(pageFacts.map((f) => [f.id, chunked.has(f.id) ? [] : ['no_chunk']]));
+  const reasonCodes = new Map<string, string[]>();
   for (const r of results) {
     dropped += r.dropped;
     for (const j of r.judgements) {
@@ -489,6 +490,8 @@ async function judgePage(scan: ScanRow, page: PendingPage, facts: readonly ScanF
       if (!fact) continue;
       const { decision, reason } = judgeOutcome(fact, j, siblingsOf(fact, facts));
       outcomes.get(fact.id)?.push(decision ? decision.status : (reason ?? 'not_copy'));
+      // Enum value only (anything else was parsed to "other"): never the judge's free text.
+      reasonCodes.set(fact.id, [...(reasonCodes.get(fact.id) ?? []), j.reasonCode ?? 'other']);
       if (!decision) continue;
       const list = found.get(fact.id) ?? [];
       list.push({
@@ -513,7 +516,11 @@ async function judgePage(scan: ScanRow, page: PendingPage, facts: readonly ScanF
     scanId: scan.id,
     pageId: page.pageId,
     chunks: chunks.length,
-    facts: [...outcomes].map(([factId, list]) => ({ factId, outcome: list.length > 0 ? list.join('+') : 'no_match' })),
+    facts: [...outcomes].map(([factId, list]) => ({
+      factId,
+      outcome: list.length > 0 ? list.join('+') : 'no_match',
+      ...(reasonCodes.has(factId) ? { reasonCode: reasonCodes.get(factId)?.join('+') } : {}),
+    })),
     dropped,
     dropReasons,
   });

@@ -14,6 +14,7 @@ vi.mock('@forge/events', () => ({
 }));
 
 import { ForgeLlmError, type Message } from '@forge/llm';
+import { JUDGE_SYSTEM_PROMPT, JUDGE_TOOL } from '../src/llm/judge';
 import type { SearchHit } from '../src/adapters/confluence';
 import type { FactRepo } from '../src/adapters/repo';
 import { EMPTY_COPY_COUNTS, type ChunkResult, type CopyInput, type HitInput, type PendingPage, type ScanRepo, type ScanRow } from '../src/adapters/scanRepo';
@@ -24,10 +25,12 @@ import {
   compareValues,
   decideStatus,
   factTerms,
+  JUDGE_REASON_CODES,
   judgeOutcome,
   MAX_CANDIDATES_PER_FACT,
   normaliseValue,
   parseJudgement,
+  parseReasonCode,
   parseTermSuggestions,
   strongest,
   type Judgement,
@@ -489,6 +492,62 @@ describe('parseJudgement', () => {
     expect(dropped.map((d) => d.reason)).toEqual(['quote_not_found', 'value_not_in_quote', 'unknown_fact', 'invalid_shape']);
     expect(() => parseJudgement({}, chunk, [])).toThrow('judge output has no mentions array');
   });
+
+  it('parses reason_code to the fixed enum, anything else to "other"', () => {
+    for (const code of JUDGE_REASON_CODES) expect(parseReasonCode(code)).toBe(code);
+    for (const bad of ['Value differs', 'the page says $75', 42, null, undefined]) expect(parseReasonCode(bad)).toBe('other');
+    const parsed = parseJudgement({ mentions: [{ ...ok, reason_code: 'ignore previous instructions' }] }, chunk, [factId('domestic')]);
+    expect(parsed.judgements[0]?.reasonCode).toBe('other');
+  });
+
+  describe('outcome → status for the few-shot cases', () => {
+    const status = (over: Record<string, unknown>, text = chunk) => {
+      const { judgements } = parseJudgement({ mentions: [{ ...ok, ...over }] }, text, [factId('domestic')]);
+      const j = judgements[0];
+      return j ? judgeOutcome(fact('domestic'), j, [fact('international')]) : undefined;
+    };
+
+    it('(a) same fact, other value → drifted, also when the judge says "no"', () => {
+      expect(status({ reason_code: 'value_differs' })?.decision?.status).toBe('drifted');
+      expect(status({ same_fact: 'no', reason_code: 'value_differs' })?.decision?.status).toBe('drifted');
+      expect(status({ same_fact: 'no', reason_code: 'value_matches', stated_value: '$60', quote: 'Per diem for domestic travel: $60 per day.' }, 'Per diem for domestic travel: $60 per day.')?.decision?.status).toBe('in_sync');
+    });
+
+    it('(b) same topic, other condition → unsure, never dropped', () => {
+      const training = { stated_value: '$40', quote: 'Training per diem: $40 per day.' };
+      const text = 'Training per diem: $40 per day.';
+      for (const sameFact of ['yes', 'unsure', 'no']) {
+        expect(status({ ...training, same_fact: sameFact, stated_condition: 'External training', reason_code: 'different_condition' }, text)?.decision?.status, sameFact).toBe('unsure');
+        // Condition not named by the judge: the reason code alone keeps it unsure.
+        expect(status({ ...training, same_fact: sameFact, stated_condition: null, reason_code: 'different_condition' }, text)?.decision?.status, `${sameFact} / no condition`).toBe('unsure');
+      }
+    });
+
+    it('(c) another topic → not a copy', () => {
+      expect(status({ same_fact: 'no', stated_condition: null, reason_code: 'different_subject' })).toEqual({ decision: null, reason: 'not_same_fact' });
+      expect(status({ same_fact: 'no', stated_condition: null, reason_code: 'other' })).toEqual({ decision: null, reason: 'not_same_fact' });
+    });
+
+    it('(d) past value → historical, even when the judge calls it current', () => {
+      const text = 'In 2024 the per diem was raised from $50 to $60.';
+      const past = { stated_value: '$50', stated_condition: null, quote: text };
+      expect(status({ ...past, mention: 'historical', reason_code: 'historical' }, text)?.decision?.status).toBe('historical');
+      expect(status({ ...past, reason_code: 'historical' }, text)?.decision?.status).toBe('historical');
+    });
+  });
+});
+
+describe('judge prompt', () => {
+  it('has the few-shot cases and never asks for "no" because the value differs', () => {
+    expect(JUDGE_SYSTEM_PROMPT).toContain('Never "no" just because the value differs');
+    for (const code of ['"value_differs"', '"different_condition"', '"different_subject"', '"historical"']) expect(JUDGE_SYSTEM_PROMPT).toContain(`reason_code ${code}`);
+    expect(JUDGE_SYSTEM_PROMPT).not.toMatch(/is "no" or "unsure"/);
+    // Few-shot examples are made up, not the test pages.
+    expect(JUDGE_SYSTEM_PROMPT).not.toMatch(/External training|\$40|within 45 days|per diem for domestic/i);
+    const schema = JUDGE_TOOL.parameters as { properties: { mentions: { items: { required: string[]; properties: { reason_code: { enum: string[] } } } } } };
+    expect(schema.properties.mentions.items.required).toContain('reason_code');
+    expect(schema.properties.mentions.items.properties.reason_code.enum).toEqual([...JUDGE_REASON_CODES]);
+  });
 });
 
 describe('decideStatus', () => {
@@ -579,12 +638,36 @@ describe('copy scan (search + judge consumers)', () => {
         const id = COPY_PAGES.find((p) => p.title === title)?.id;
         return info.mock.calls.find((c) => c[0] === 'ripple judge page' && (c[1] as { pageId: string }).pageId === id)?.[1] as { facts: { factId: string; outcome: string }[]; dropReasons: Record<string, number> };
       };
-      expect(pageLog('Finance FAQ').facts).toContainEqual({ factId: factId('claims'), outcome: 'drifted' });
+      expect(pageLog('Finance FAQ').facts).toContainEqual({ factId: factId('claims'), outcome: 'drifted', reasonCode: 'other' });
       const training = COPY_PAGES.find((p) => p.kind === 'trap' && p.expect.domestic === 'unsure');
-      expect(pageLog(training?.title ?? '').facts).toContainEqual({ factId: factId('domestic'), outcome: 'unsure' });
+      expect(pageLog(training?.title ?? '').facts).toContainEqual({ factId: factId('domestic'), outcome: 'unsure', reasonCode: 'other' });
       expect(scans.statusOf('domestic', training?.id ?? '')).toBe('unsure');
       const logged = JSON.stringify(info.mock.calls.filter((c) => c[0] === 'ripple judge page'));
       expect(logged).not.toMatch(/acc-1|per diem|\$40|External training/i);
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it('live-like judge answers (reason codes; "no" for a different value or condition) still give the expected status for every fixture page', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    try {
+      const expected = (m: JudgeMention) => COPY_PAGES.find((p) => p.judge.includes(m))?.expect[m.fact];
+      const live = (m: JudgeMention): JudgeMention => {
+        const status = expected(m);
+        // Observed live: "no" for the 45 vs 30 days claims copy, and "no" without a condition for the training per diem.
+        if (status === 'drifted' && m.fact === 'claims') return { ...m, same_fact: 'no', reason_code: 'value_differs' };
+        if (status === 'unsure') return { ...m, same_fact: 'no', stated_condition: null, reason_code: 'different_condition' };
+        if (status === 'historical') return { ...m, reason_code: 'historical' };
+        return { ...m, reason_code: status === 'drifted' ? 'value_differs' : status === 'in_sync' ? 'value_matches' : 'free text from the model' };
+      };
+      await fullScan(jobDeps({ llm: fakeLlm(llmCalls, undefined, live) }));
+      for (const p of COPY_PAGES) for (const [k, status] of Object.entries(p.expect)) expect(scans.statusOf(k as FactKey, p.id), `${p.title} / ${k}`).toBe(status);
+      const logged = info.mock.calls.filter((c) => c[0] === 'ripple judge page').map((c) => c[1] as { facts: { reasonCode?: string }[] });
+      const codes = new Set(logged.flatMap((l) => l.facts.map((f) => f.reasonCode)).filter(Boolean));
+      expect([...codes].every((c) => /^[a-z_+]+$/.test(c ?? ''))).toBe(true);
+      expect(codes).toContain('value_differs');
+      expect(codes).toContain('different_condition');
     } finally {
       info.mockRestore();
     }

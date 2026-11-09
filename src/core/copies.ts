@@ -416,7 +416,15 @@ export interface Judgement {
   statedCondition: string | null;
   /** Verified to appear verbatim in the chunk (and so in the copy page). */
   quote: string;
+  /** The judge's fixed reason code (`other` when outside the enum); absent in results saved before it existed. */
+  reasonCode?: ReasonCode;
 }
+
+/** Fixed reason codes of the judge's `reason_code` field; the only judge wording ever logged. */
+export const JUDGE_REASON_CODES = ['value_differs', 'value_matches', 'different_condition', 'different_subject', 'historical', 'no_mention', 'ambiguous'] as const;
+export type ReasonCode = (typeof JUDGE_REASON_CODES)[number] | 'other';
+
+export const parseReasonCode = (v: unknown): ReasonCode => JUDGE_REASON_CODES.find((x) => x === v) ?? 'other';
 
 export type JudgeDropReason = 'invalid_shape' | 'unknown_fact' | 'quote_not_found' | 'value_not_in_quote' | 'duplicate_fact';
 
@@ -468,9 +476,27 @@ export function parseJudgement(args: unknown, chunkText: string, factIds: readon
       return;
     }
     seen.add(factId);
-    judgements.push(groundJudgement({ factId, sameFact, mention, statedValue, statedUnit, statedCondition, quote }, chunkText));
+    const reasonCode = parseReasonCode(m.reason_code);
+    judgements.push(groundJudgement(reconcileReason({ factId, sameFact, mention, statedValue, statedUnit, statedCondition, quote, reasonCode }), chunkText));
   });
   return { judgements, dropped };
+}
+
+/**
+ * Makes `same_fact`/`mention` agree with the more specific reason code (models often answer "no" because the value
+ * differs, which is exactly drift):
+ * - `value_differs` / `value_matches` with "no" → "yes" (same fact; the value is compared by Ripple, and the
+ *   condition is still checked by `groundJudgement` / `sameCondition`);
+ * - `different_condition` with "yes" → "unsure" (never in sync or drift); with "no" it stays "no" and
+ *   `judgeOutcome` keeps it as unsure;
+ * - `historical` → mention "historical" (a past value is never drift).
+ */
+function reconcileReason(j: Judgement): Judgement {
+  const out = { ...j };
+  if (out.sameFact === 'no' && out.mention === 'current' && (j.reasonCode === 'value_differs' || j.reasonCode === 'value_matches')) out.sameFact = 'yes';
+  if (out.sameFact === 'yes' && j.reasonCode === 'different_condition') out.sameFact = 'unsure';
+  if (j.reasonCode === 'historical' && out.mention === 'current') out.mention = 'historical';
+  return out;
 }
 
 /** "from $50 to $60", "dari $50 menjadi $60": the number after "from" is the old value. */
@@ -569,10 +595,12 @@ export type NotCopyReason = 'not_same_fact' | 'example' | 'value_not_comparable'
 export function judgeOutcome(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[] = []): { decision: CopyDecision | null; reason?: NotCopyReason } {
   if (j.mention === 'example') return { decision: null, reason: 'example' };
   if (j.sameFact === 'no') {
-    const otherCondition = j.mention === 'current' && j.statedCondition !== null && !sameCondition(fact, j.statedCondition);
+    const otherCondition = j.mention === 'current' && (j.reasonCode === 'different_condition' || (j.statedCondition !== null && !sameCondition(fact, j.statedCondition)));
     if (!otherCondition || compareValues({ value: fact.value, unit: fact.unit }, { value: j.statedValue, unit: j.statedUnit }) === 'unknown') {
       return { decision: null, reason: 'not_same_fact' };
     }
+    // Same topic, another condition: unsure, also when the judge named no condition.
+    if (sameCondition(fact, j.statedCondition)) return { decision: { status: 'unsure', reason: 'Same topic under a different condition; please check.' } };
   }
   const decision = statusOf(fact, j, siblings);
   return decision ? { decision } : { decision: null, reason: 'value_not_comparable' };
