@@ -47,6 +47,13 @@ async function spaceIdOf(ctx: ResolverContext, deps: BylineDeps): Promise<string
   return spaceId;
 }
 
+/** Headline of the byline popup; "ready" only when the database schema is complete. */
+export function bylineMessage(schema: SchemaView): string {
+  if (schema.status === 'ready') return 'Ripple is ready';
+  if (schema.status === 'setting_up') return 'Ripple is setting up';
+  return 'Ripple is unavailable: database check failed';
+}
+
 /** M0 byline: readiness, schema progress and the space's owning teams via Teamwork Graph. Never throws. */
 export async function bylineStatus(ctx: ResolverContext, deps: BylineDeps = defaultDeps): Promise<BylineStatus> {
   const schema = await schemaView(deps.ensure);
@@ -62,7 +69,7 @@ export async function bylineStatus(ctx: ResolverContext, deps: BylineDeps = defa
       spaceTeams = { spaceId: null, teams: [], dataPresent: false, errors: [errorText(err)] };
     }
   }
-  return { message: 'Ripple is ready', schema, spaceTeams };
+  return { message: bylineMessage(schema), schema, spaceTeams };
 }
 
 const resolver = new Resolver();

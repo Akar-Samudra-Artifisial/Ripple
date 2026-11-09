@@ -8,6 +8,11 @@ Graph, Rovo).
 Status: **M0** — foundation only. The byline shows "Ripple is ready", the database setup progress and the space's
 owning team via Teamwork Graph; every other module is declared and answers "not implemented".
 
+## Permissions
+
+See `docs/PRIVACY.md`. `write:confluence-space` is used only by the "Load demo data" button (creates the demo
+spaces HR/ONB/FIN/SALES/HELP); no other code path creates or changes spaces.
+
 ## Layout
 
 - `src/index.ts` — function handlers referenced by `manifest.yml`

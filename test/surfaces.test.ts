@@ -41,6 +41,9 @@ describe('migrations', () => {
     for (const m of MIGRATIONS) {
       expect(m.name).toMatch(/^v\d{3}[a-z]?_/);
       expect(m.statement).toMatch(/IF NOT EXISTS/);
+      // One ADD per ALTER: multi-clause ALTER TABLE is not guaranteed on Forge SQL.
+      if (/^\s*ALTER\s+TABLE/i.test(m.statement)) expect(m.statement.match(/\bADD\b/gi) ?? []).toHaveLength(1);
+      expect(m.statement.trim()).not.toMatch(/;\s*\S/); // one statement per migration
     }
     expect(names).toEqual(['v001_create_settings', 'v002_create_audit']);
     expect(LATEST_MIGRATION).toBe('v002_create_audit');
@@ -97,6 +100,28 @@ describe('bylineStatus', () => {
     });
     const r = await bylineStatus({ cloudId: 'c1', extension: { content: { id: 5 } } }, failing);
     expect(r.spaceTeams).toMatchObject({ spaceId: null, teams: [], errors: ['Confluence REST v2 page 5 failed: HTTP 404'] });
+  });
+
+  it('does not claim "ready" while the schema is setting up or the check failed', async () => {
+    const setting = await bylineStatus(
+      { cloudId: 'c1', extension: { space: { id: 7 } } },
+      deps({
+        ensure: async () => {
+          throw new SchemaSettingUpError(1, 2);
+        },
+      }),
+    );
+    expect(setting.message).toBe('Ripple is setting up');
+    const failed = await bylineStatus(
+      { cloudId: 'c1', extension: { space: { id: 7 } } },
+      deps({
+        ensure: async () => {
+          throw new Error('db down');
+        },
+      }),
+    );
+    expect(failed.message).toBe('Ripple is unavailable: database check failed');
+    expect(failed.schema).toMatchObject({ status: 'error', error: 'db down' });
   });
 
   it('flags data: null from the graph', async () => {

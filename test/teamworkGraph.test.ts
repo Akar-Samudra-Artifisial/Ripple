@@ -126,6 +126,11 @@ describe('scrubErrorText', () => {
     expect(text).toContain('<accountId> and <accountId> at <ari>');
     expect(text.length).toBeLessThanOrEqual(200);
   });
+
+  it('removes prefixed account ids with a 5 to 7 digit prefix', () => {
+    const uuid = '12345678-1234-1234-1234-123456789abc';
+    expect(scrubErrorText(`a 12345:${uuid} b 1234567:${uuid}`)).toBe('a <accountId> b <accountId>');
+  });
 });
 
 describe('reads', () => {

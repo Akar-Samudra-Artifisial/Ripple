@@ -200,16 +200,17 @@ permissions:
   scopes:
     - read:confluence-content.summary # page updated events
     - read:confluence-content.all     # page bodies for extraction and judging
-    - search:confluence               # CQL candidate search
+    - search:confluence               # CQL candidate search (GET /wiki/rest/api/search)
     - read:page:confluence            # REST v2 page, body, ownerId/authorId, version history
-    - write:page:confluence           # apply approved edits (as the approving user) and demo pages
-    - write:confluence-content        # version message "Updated by Ripple from <source>"
+    - write:page:confluence           # PUT /wiki/api/v2/pages/{id} as the approving user (incl. version.message), demo pages
     - read:space:confluence           # spaces in scope (v2)
     - read:label:confluence           # ripple-ignore label (v2)
-    - write:confluence-space          # demo data: Nimbus Labs spaces
-    - read:confluence-user            # owner display names in task text and panels
+    # ONLY used by the "Load demo data" button (admin, settings page): creates the Nimbus Labs demo spaces
+    # HR/ONB/FIN/SALES/HELP (POST /wiki/rest/api/space). No other code path creates or changes spaces.
+    - write:confluence-space
     - read:jira-work                  # update tasks and approval panel
-    - write:jira-work                 # create one update task per owner per change
+    - write:jira-work                 # POST /rest/api/3/issue incl. assignee, one update task per owner per change
+    # Owner display names come from Teamwork Graph (AtlassianUser.name) and Jira ADF mentions: no user-read scope.
     # Teamwork Graph (Preview, read-only; a missing scope returns empty data, not an error)
     - read:graph:page:confluence
     - read:graph:space:confluence

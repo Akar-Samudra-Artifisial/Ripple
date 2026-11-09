@@ -1,6 +1,6 @@
 /**
- * Schema migration with Forge SQL's DDL rate limit in mind (25 DDL requests per minute per installation). A new
- * install has ~30 migrations, so it cannot finish in one go: only the `schema-migrate` queue consumer runs DDL, and
+ * Schema migration with Forge SQL's DDL rate limit in mind (25 DDL requests per minute per installation). The schema
+ * grows append-only and a new install can exceed that limit in one go, so only the `schema-migrate` queue consumer runs DDL, and
  * it waits a minute whenever the limit is hit. Resolvers and other callers only *check* the schema (plain SELECT,
  * no DDL) and report "setting up" until the consumer is done.
  */

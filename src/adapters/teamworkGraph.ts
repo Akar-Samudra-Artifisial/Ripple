@@ -64,7 +64,7 @@ const MAX_LOGGED_ERRORS = 3;
 export function scrubErrorText(text: string): string {
   return text
     .replace(/ari:cloud:[^\s'"`,)\]}]+/gi, '<ari>')
-    .replace(/\b\d{6}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '<accountId>')
+    .replace(/\b\d{5,7}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '<accountId>')
     .replace(/\b[0-9a-f]{24}\b/gi, '<accountId>')
     .slice(0, ERROR_TEXT_LIMIT);
 }

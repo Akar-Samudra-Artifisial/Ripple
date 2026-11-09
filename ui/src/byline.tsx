@@ -10,7 +10,7 @@ function Byline() {
   const { schema, spaceTeams } = data;
   return (
     <>
-      <h1 className="shell__title">{data.message}</h1>
+      <h1 className={schema.status === 'error' ? 'shell__title error' : 'shell__title'}>{data.message}</h1>
       <p>
         Database:{' '}
         {schema.status === 'ready' ? (
