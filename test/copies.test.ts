@@ -31,6 +31,7 @@ import {
   normaliseValue,
   parseJudgement,
   parseReasonCode,
+  sameCondition,
   settleSiblings,
   siblingsOf,
   parseTermSuggestions,
@@ -1260,6 +1261,40 @@ describe('M6 Nimbus Labs demo data through the scan rules (simulated judge)', ()
     }
     const trap = pageResults(NIMBUS_PAGES.find((p) => p.slug === TRAP_SLUG) as (typeof NIMBUS_PAGES)[number]);
     expect(trap.map((i) => [i.fact.id, i.decision?.status])).toEqual([[factId('domestic'), 'unsure']]);
+  });
+
+  it('live shape of 8.34.0 (Sales Team Travel Guide): approval $2,500 judged unsure / value_differs is drifted only when the quote proves it', () => {
+    const sales = NIMBUS_PAGES.find((p) => p.slug === 'sales-travel-guide');
+    const a13 = sales?.mentions.find((m) => m.fact === 'approval') as NimbusMention;
+    expect(a13.quote).toBe('Trips over $2,500 need manager approval before booking.');
+    const approval = fact('approval');
+    const status = (over: Partial<Judgement>, f: ScanFact = approval) =>
+      judgeOutcome(f, judgement('approval', { sameFact: 'unsure', reasonCode: 'value_differs', statedValue: a13.statedValue, statedUnit: a13.statedUnit, statedCondition: a13.statedCondition, quote: a13.quote, ...over }), siblingsOf(f, FACTS)).decision?.status;
+    // The simulated judge always answered "yes" for drifted sentences, so the Nimbus test never saw this answer.
+    expect(status({})).toBe('drifted');
+    expect(status({ statedCondition: null })).toBe('drifted');
+    // The live fact may keep its threshold as the condition: "$2,000" is the fact's own value, not a narrowing.
+    const threshold = { ...approval, condition: 'Trips over $2,000' };
+    expect(sameCondition(threshold, 'trips over $2,500')).toBe(true);
+    expect(status({ statedCondition: 'trips over $2,500' }, threshold)).toBe('drifted');
+    expect(sameCondition({ ...approval, condition: 'Flights over $2,000 for contractors' }, 'trips over $2,500')).toBe(false);
+    // Negative: another condition, another unit, a past value, no subject word, other answers.
+    expect(status({ statedCondition: 'external contractors', quote: 'External contractors over $2,500 need manager approval.' })).toBe('unsure');
+    expect(status({ statedCondition: 'trips over $2,500 for external contractors' }, threshold)).toBe('unsure');
+    expect(status({ statedValue: '€2,500', statedUnit: 'EUR', quote: 'Trips over €2,500 need manager approval before booking.' })).not.toBe('drifted');
+    expect(status({ statedValue: '2,500', statedUnit: null, quote: 'Trips over 2,500 need manager approval before booking.' })).toBe('unsure');
+    expect(status({ statedUnit: null, statedValue: '2,500', quote: 'Trips over 2,500 need manager approval before booking.' }, { ...approval, unit: null })).not.toBe('drifted');
+    expect(status({ quote: 'Manager approval for trips was $2,500.', statedCondition: null })).toBe('unsure');
+    expect(status({ quote: 'Anything over $2,500 needs a second signature.', statedCondition: null })).toBe('unsure');
+    expect(status({ statedCondition: 'before boarding' })).toBe('unsure');
+    expect(status({ reasonCode: 'ambiguous' })).toBe('unsure');
+    expect(status({ mention: 'historical' })).toBe('historical');
+    // Every drifted demo sentence stays drifted when the judge hedges with unsure / value_differs.
+    for (const m of NIMBUS_PAGES.flatMap((p) => p.mentions).filter((x) => x.status === 'drifted')) {
+      const f = fact(m.fact);
+      const j = judgement(m.fact, { sameFact: 'unsure', reasonCode: 'value_differs', statedValue: m.statedValue, statedUnit: m.statedUnit, statedCondition: m.statedCondition, quote: m.quote });
+      expect(judgeOutcome(f, j, siblingsOf(f, FACTS)).decision?.status, m.quote).toBe('drifted');
+    }
   });
 
   it('byline counts: "23 copies, 4 out of date"; the historical mention is not a copy', () => {

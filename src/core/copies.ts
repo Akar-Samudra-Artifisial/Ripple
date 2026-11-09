@@ -538,10 +538,26 @@ function groundJudgement(j: Judgement, chunkText: string): Judgement {
 const HISTORICAL_CUE =
   /\b(?:previously|formerly|used to be|was (?:raised|increased|reduced|lowered|changed|updated)|(?:increased|raised|reduced|lowered|changed|went up|went down) from|until (?:19|20)\d\d|before (?:19|20)\d\d|in (?:19|20)\d\d (?:it|the)|last year|old (?:rate|value|policy|limit)|sebelumnya|dulu|naik dari|turun dari)\b/i;
 
-/** Words of a condition that tell it apart (not words of the subject/attribute or filler). */
+/** A written number with its currency and grouping ("$2,000", "2.000", "1.5k"). */
+const NUMBER_TOKEN = /[$€£]?\d[\d.,]*(?:\s*k\b)?/giu;
+
+/**
+ * The condition without the fact's own value: "Trips over $2,000" for a $2,000 limit is the threshold, not a
+ * narrowing, so a copy stating "over $2,500" is not under another condition. Other numbers ("under 6 hours") stay.
+ */
+function withoutOwnValue(condition: string, fact: ScanFact): string {
+  const own = new Set(normaliseValue(fact.value, fact.unit).numbers);
+  if (own.size === 0) return condition;
+  return condition.replace(NUMBER_TOKEN, (t) => {
+    const n = normaliseValue(t).numbers;
+    return n.length > 0 && n.every((x) => own.has(x)) ? ' ' : t;
+  });
+}
+
+/** Words of a condition that tell it apart (not words of the subject/attribute, filler or the fact's own value). */
 function distinctiveWords(condition: string, fact: ScanFact): string[] {
   const common = new Set([...normaliseKeyPart(`${fact.subject} ${fact.attribute}`).split(' '), 'travel', 'trip', 'trips', 'all', 'any']);
-  const words = normaliseKeyPart(condition)
+  const words = normaliseKeyPart(withoutOwnValue(condition, fact))
     .split(' ')
     .filter((w) => w.length >= 3 && !STOPWORDS.has(w));
   const distinct = words.filter((w) => !common.has(w));
@@ -560,15 +576,17 @@ const stems = (w: string): string[] => [w, w.replace(/s$/, ''), `${w}s`];
  */
 export function sameCondition(fact: ScanFact, statedCondition: string | null): boolean {
   if (!statedCondition) return true;
-  if (!fact.condition) {
-    const known = new Set(normaliseKeyPart(`${fact.subject} ${fact.attribute} ${fact.value} ${fact.unit ?? ''}`).split(' '));
+  const distinctive = fact.condition ? distinctiveWords(fact.condition, fact) : [];
+  // No condition, or one that is only the fact's own value ("Trips over $2,000"): the copy may not add new words.
+  if (distinctive.length === 0) {
+    const known = new Set(normaliseKeyPart(`${fact.subject} ${fact.attribute} ${fact.value} ${fact.unit ?? ''} ${fact.condition ?? ''}`).split(' '));
     const extra = normaliseKeyPart(statedCondition)
       .split(' ')
       .filter((w) => w.length >= 3 && !STOPWORDS.has(w) && !CONDITION_FILLER.has(w) && !/^\d/.test(w) && !stems(w).some((x) => known.has(x)));
     return extra.length === 0;
   }
   const stated = new Set(normaliseKeyPart(statedCondition).split(' '));
-  return distinctiveWords(fact.condition, fact).some((w) => stated.has(w) || stated.has(w.replace(/s$/, '')) || stated.has(`${w}s`));
+  return distinctive.some((w) => stated.has(w) || stated.has(w.replace(/s$/, '')) || stated.has(`${w}s`));
 }
 
 export interface CopyDecision {
@@ -625,6 +643,35 @@ export function judgeOutcome(fact: ScanFact, judged: Judgement, siblings: readon
   return decision ? { decision } : { decision: null, reason: 'value_not_comparable' };
 }
 
+/**
+ * The judge's own "value_differs" with same_fact "unsure" is drift only when the quote proves it (live: "Trips over
+ * $2,500 need manager approval before booking." for a $2,000 limit): a current mention, one number each in the same
+ * written unit, the sentence names the fact's subject/attribute, the stated condition (if any) is in the sentence
+ * (the condition itself was checked by `sameCondition`), and the stated number is not a past value ("was", "from X
+ * to Y"). Past-value wording and sibling values are checked afterwards like any drift.
+ */
+function safeValueDiffers(fact: ScanFact, j: Judgement): boolean {
+  if (j.reasonCode !== 'value_differs' || j.mention !== 'current') return false;
+  const o = normaliseValue(fact.value, fact.unit);
+  const s = normaliseValue(j.statedValue, j.statedUnit);
+  if (o.numbers.length !== 1 || s.numbers.length !== 1 || !o.unit || o.unit !== s.unit) return false;
+  const quote = new Set(normaliseKeyPart(j.quote).split(' '));
+  const has = (w: string) => stems(w).some((x) => quote.has(x));
+  const subject = normaliseKeyPart(`${fact.subject} ${fact.attribute}`)
+    .split(' ')
+    .filter((w) => w.length >= 3 && !STOPWORDS.has(w));
+  if (!subject.some(has)) return false;
+  if (j.statedCondition) {
+    const words = normaliseKeyPart(j.statedCondition)
+      .split(' ')
+      .filter((w) => w.length >= 3 && !STOPWORDS.has(w) && !/^\d/.test(w));
+    if (!words.every(has)) return false;
+  }
+  const stated = new Set(s.numbers);
+  const isStated = (text: string | undefined) => numbersIn(text ?? '').some((n) => stated.has(n));
+  return ![...j.quote.matchAll(FROM_TO)].some((m) => isStated(m[1])) && ![...j.quote.matchAll(PAST_VALUE)].some((m) => isStated(m[1]));
+}
+
 function statusOf(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[]): CopyDecision | null {
   if (j.mention === 'historical') return { status: 'historical', reason: 'Past value (historical mention); not checked.' };
   if (!sameCondition(fact, j.statedCondition)) {
@@ -635,7 +682,7 @@ function statusOf(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[]): 
   // The judge's own "value_matches" with an equal value and no other condition is in sync, also when it (or the
   // quote check) left same_fact at "unsure": an equal value cannot be drift.
   const matches = cmp === 'same' && j.reasonCode === 'value_matches' && j.mention === 'current';
-  if (j.sameFact === 'unsure' && !matches) return { status: 'unsure', reason: 'Ripple is not sure this is the same fact.' };
+  if (j.sameFact === 'unsure' && !matches && !(cmp === 'different' && safeValueDiffers(fact, j))) return { status: 'unsure', reason: 'Ripple is not sure this is the same fact.' };
   if (cmp === 'same') return { status: 'in_sync', reason: 'Same value as the source.' };
   const stated = valueLabel(j.statedValue, j.statedUnit);
   const official = valueLabel(fact.value, fact.unit);
