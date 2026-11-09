@@ -559,9 +559,14 @@ describe('parseJudgement', () => {
       expect(settled([m('domestic', 'drifted', '$75'), m('international', 'unsure', '$75')])).toEqual(['drifted', 'sibling_fact']);
       // Both unsure (training $40): the preferred fact wins (no condition first, then source order: domestic before international).
       expect(settled([m('international', 'unsure', '$40'), m('domestic', 'unsure', '$40')])).toEqual(['sibling_fact', 'unsure']);
-      // Source order comes from `order` when set, not from the position in the list.
+      // Source order (last resort, for values that cannot be compared) comes from `order` when set, not from the list.
       const reordered = FACTS.map((f) => ({ ...f, order: f.id === factId('international') ? 0 : 1 }));
-      expect(settleSiblings([m('international', 'unsure', '$40'), m('domestic', 'unsure', '$40')], reordered).map((i) => i.decision?.status ?? i.reason)).toEqual(['unsure', 'sibling_fact']);
+      expect(settleSiblings([m('international', 'unsure', 'varies'), m('domestic', 'unsure', 'varies')], reordered).map((i) => i.decision?.status ?? i.reason)).toEqual(['unsure', 'sibling_fact']);
+      // A comparable value goes to the nearest fact before source order ($40: $60 domestic, not $90 international).
+      expect(settleSiblings([m('international', 'unsure', '$40'), m('domestic', 'unsure', '$40')], reordered).map((i) => i.decision?.status ?? i.reason)).toEqual(['sibling_fact', 'unsure']);
+      expect(settleSiblings([m('international', 'unsure', '$85'), m('domestic', 'unsure', '$85')], FACTS).map((i) => i.decision?.status ?? i.reason)).toEqual(['unsure', 'sibling_fact']);
+      // A sentence naming a fact's condition prefers that fact over the nearest value.
+      expect(settled([m('domestic', 'unsure', '$85', 'International trainees: $85 per day.'), m('international', 'unsure', '$85', 'International trainees: $85 per day.')])).toEqual(['sibling_fact', 'unsure']);
       // A sibling without a condition (general rule) is preferred over source order.
       const general = FACTS.map((f) => (f.id === factId('international') ? { ...f, condition: null } : f));
       expect(settleSiblings([m('domestic', 'unsure', '$40'), m('international', 'unsure', '$40')], general).map((i) => i.decision?.status ?? i.reason)).toEqual(['sibling_fact', 'unsure']);
@@ -591,6 +596,27 @@ describe('parseJudgement', () => {
       // A card from the fact's own condition (judge unsure which fact) is never moved to a sibling.
       const own = judgement('international', { sameFact: 'unsure', statedValue: '$40', statedCondition: 'International travel', quote: text, reasonCode: 'ambiguous' });
       expect(settleSiblings([{ fact: fact('international'), judgement: own, ...judgeOutcome(fact('international'), own, [fact('domestic')]) }], FACTS).map((i) => [i.fact.id, i.decision?.status])).toEqual([[factId('international'), 'unsure']]);
+    });
+
+    it('settleSiblings, live shape of 0fa94e9 (Nimbus trap): "$40 on training course days" goes to the $60 domestic fact even when the source order puts international first', () => {
+      const text = 'On training course days the per diem is $40 per day.';
+      // Facts of one extraction share created_at: the order by id is random, so international may come first.
+      const facts = FACTS.map((f, i) => ({ ...f, order: f.id === factId('international') ? 0 : f.id === factId('domestic') ? 1 : i }));
+      const mention = (k: FactKey, j: Judgement) => ({ fact: fact(k), judgement: j, ...judgeOutcome(fact(k), j, siblingsOf(fact(k), facts)) });
+      const judged = (k: FactKey, over: Partial<Judgement> = {}) =>
+        judgement(k, { sameFact: 'unsure', statedValue: '$40', statedUnit: 'per day', statedCondition: 'Training course days', quote: text, reasonCode: 'different_condition', ...over });
+      const cards = (items: ReturnType<typeof mention>[]) => settleSiblings(items, facts).filter((i) => i.decision).map((i) => [i.fact.id, i.decision?.status]);
+      const domesticCard = [[factId('domestic'), 'unsure']];
+      // The judge answers unsure / different_condition for both facts.
+      expect(cards([mention('international', judged('international')), mention('domestic', judged('domestic'))])).toEqual(domesticCard);
+      expect(cards([mention('domestic', judged('domestic')), mention('international', judged('international'))])).toEqual(domesticCard);
+      // Only for international ("no", different_condition, with or without a condition).
+      expect(cards([mention('international', judged('international', { sameFact: 'no' }))])).toEqual(domesticCard);
+      expect(cards([mention('international', judged('international', { sameFact: 'no', statedCondition: null }))])).toEqual(domesticCard);
+      // International unsure, domestic answered as "the sibling's" (dropped): the card still moves to domestic.
+      const dropped = mention('domestic', judged('domestic', { sameFact: 'no', statedCondition: null, reasonCode: 'sibling_fact' }));
+      expect(dropped.reason).toBe('sibling_fact');
+      expect(cards([mention('international', judged('international')), dropped])).toEqual(domesticCard);
     });
 
     it('sibling_fact counts only when the source has a sibling; otherwise the mention stays (unsure, never lost)', () => {

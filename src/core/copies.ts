@@ -660,6 +660,27 @@ function sameSentence(a: string, b: string): boolean {
   return x.length > 0 && y.length > 0 && (x === y || x.includes(y) || y.includes(x));
 }
 
+/** The sentence names a distinctive word of the fact's condition ("abroad" → no; "international" → yes). */
+function namesCondition(fact: ScanFact, quote: string): boolean {
+  if (!fact.condition) return false;
+  const words = new Set(normaliseKeyPart(quote).split(' '));
+  return distinctiveWords(fact.condition, fact).some((w) => stems(w).some((x) => words.has(x)));
+}
+
+/**
+ * How far the stated value is from the fact's (|ln(stated / official)|, so $40 is nearer to $60 than to $90);
+ * Infinity when they cannot be compared as one positive number each in the same unit.
+ */
+function valueDistance(fact: ScanFact, j: Judgement): number {
+  const o = normaliseValue(fact.value, fact.unit);
+  const s = normaliseValue(j.statedValue, j.statedUnit);
+  const [a] = o.numbers;
+  const [b] = s.numbers;
+  if (o.numbers.length !== 1 || s.numbers.length !== 1 || a === undefined || b === undefined || a <= 0 || b <= 0) return Number.POSITIVE_INFINITY;
+  if (o.unit && s.unit && o.unit !== s.unit) return Number.POSITIVE_INFINITY;
+  return Math.abs(Math.log(b / a));
+}
+
 /** True when the unsure card comes from a condition other than the fact's own. */
 const otherConditionCard = (i: PageMention): boolean =>
   i.judgement.reasonCode === 'different_condition' || (i.judgement.statedCondition !== null && !sameCondition(i.fact, i.judgement.statedCondition));
@@ -670,9 +691,12 @@ const otherConditionCard = (i: PageMention): boolean =>
  * - an `unsure` whose sibling got in sync / drifted / historical from the same sentence is dropped (the sentence is
  *   about the sibling: "$75 for domestic trips" is no unsure international copy);
  * - the remaining `unsure` cards of a family for one sentence become one card, on the preferred fact of the family:
- *   the fact without a condition (general rule) first, then the fact's order in the source. A card for a condition
+ *   the fact without a condition (general rule) first, then a fact whose condition the sentence names, then the
+ *   fact whose value is numerically nearest to the stated one ("$40 on training days" → $60 domestic, not $90
+ *   international), then the fact's order in the source (by extraction time, so only a last resort). A card for a condition
  *   the source lacks ("$40 for external training") moves to that fact even when the judge named only a sibling, if
- *   the preferred fact has no mention of that sentence and the card stays unsure for it; otherwise the preferred fact
+ *   the preferred fact has no mention of that sentence (or one dropped only as the sibling's) and the card stays
+ *   unsure for it; otherwise the preferred fact
  *   among the mentioned ones keeps it.
  * Dropped mentions get reason `sibling_fact`; a moved card is appended. Mentions of unrelated facts are untouched.
  */
@@ -682,14 +706,16 @@ export function settleSiblings(items: readonly PageMention[], facts: readonly Sc
     i.decision = null;
     i.reason = 'sibling_fact';
   };
-  const rank = (f: ScanFact): [number, number] => {
+  const rank = (f: ScanFact, j: Judgement): number[] => {
     const at = facts.findIndex((x) => x.id === f.id);
     const known = facts[at] ?? f;
-    return [known.condition === null ? 0 : 1, known.order ?? at];
+    return [known.condition === null ? 0 : 1, namesCondition(known, j.quote) ? 0 : 1, valueDistance(known, j), known.order ?? at];
   };
-  const before = (a: ScanFact, b: ScanFact) => {
-    const [ra, rb] = [rank(a), rank(b)];
-    return ra[0] !== rb[0] ? ra[0] < rb[0] : ra[1] !== rb[1] ? ra[1] < rb[1] : a.id < b.id;
+  /** True when `a` (for the card `ja`) is preferred over `b` (for `jb`). */
+  const before = (a: ScanFact, ja: Judgement, b: ScanFact, jb: Judgement) => {
+    const [ra, rb] = [rank(a, ja), rank(b, jb)];
+    const i = ra.findIndex((x, k) => x !== rb[k]);
+    return i === -1 ? a.id < b.id : (ra[i] ?? 0) < (rb[i] ?? 0);
   };
   const family = (f: ScanFact) => new Set([f.id, ...siblingsOf(f, facts).map((s) => s.id)]);
   const moved: PageMention[] = [];
@@ -703,10 +729,13 @@ export function settleSiblings(items: readonly PageMention[], facts: readonly Sc
       continue;
     }
     const unsure = group.filter((o) => o.decision?.status === 'unsure');
-    const keep = unsure.reduce((b, o) => (before(o.fact, b.fact) ? o : b));
+    const keep = unsure.reduce((b, o) => (before(o.fact, o.judgement, b.fact, b.judgement) ? o : b));
     for (const o of unsure) if (o !== keep) drop(o);
-    const target = facts.filter((f) => ids.has(f.id)).reduce((b, f) => (before(f, b) ? f : b));
-    if (target.id === keep.fact.id || !otherConditionCard(keep) || group.some((o) => o.fact.id === target.id)) continue;
+    const kj = keep.judgement;
+    const target = facts.filter((f) => ids.has(f.id)).reduce((b, f) => (before(f, kj, b, kj) ? f : b));
+    // The preferred fact's own reading of the sentence wins, unless it was only dropped as "the sibling's".
+    const targetJudged = group.some((o) => o.fact.id === target.id && !(o.decision === null && o.reason === 'sibling_fact'));
+    if (target.id === keep.fact.id || !otherConditionCard(keep) || targetJudged) continue;
     const judgement = { ...keep.judgement, factId: target.id };
     const outcome = judgeOutcome(target, judgement, siblingsOf(target, facts));
     if (outcome.decision?.status !== 'unsure') continue;
