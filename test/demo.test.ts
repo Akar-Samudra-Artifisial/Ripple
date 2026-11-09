@@ -245,6 +245,24 @@ describe('Nimbus Labs demo content', () => {
     for (const word of ['international', 'International', 'external', 'internal', 'overseas', 'abroad']) expect(TRAP_FORBIDDEN.test(word)).toBe(true);
   });
 
+  it('in-sync per diem sentences name the fact condition and never reframe it (only the trap does)', () => {
+    const reframing = /conference|relocat|training|course|qbr|buddy|attendee|office|customer|first week|countr/i;
+    for (const p of NIMBUS_PAGES) {
+      for (const m of p.mentions.filter((x) => x.status === 'in_sync' && (x.fact === 'domestic' || x.fact === 'international'))) {
+        expect(m.quote.toLowerCase()).toContain(m.fact);
+        expect(m.quote).not.toMatch(reframing);
+      }
+    }
+    // The 4 drifts stay as agreed.
+    const drifts = NIMBUS_PAGES.flatMap((p) => p.mentions.filter((m) => m.status === 'drifted').map((m) => m.quote));
+    expect(drifts).toEqual([
+      'Expense claims must be filed within 45 days after the trip ends.',
+      'International travel: the per diem is $100 per day.',
+      'For domestic customer visits the per diem is $65 per day.',
+      'Trips over $2,500 need manager approval before booking.',
+    ]);
+  });
+
   it('the historical sentence is the agreed one', () => {
     const hist = NIMBUS_PAGES.find((p) => p.kind === 'historical');
     expect(hist?.mentions[0]?.quote).toBe('Last year the domestic per diem went up from $50 to $60 per day.');

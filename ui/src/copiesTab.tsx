@@ -1,6 +1,7 @@
 import { router, view } from '@forge/bridge';
 import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
 import type { CopyCounts, CopyList, CopyStatus, CopyView, ScanStatus, ScanView } from '../../src/core/views';
+import { valueLabel } from '../../src/core/valueLabel';
 import { call } from './bridge';
 import { Alert, LoadingRows, errorOf } from './components';
 
@@ -31,7 +32,7 @@ const ALL_STATUSES: readonly CopyStatus[] = [...COPY_STATUSES_COUNTED, 'historic
 const totalOf = (c: CopyCounts): number => COPY_STATUSES_COUNTED.reduce((n, s) => n + c[s], 0);
 /** Card label; a historical mention is shown but never compared. */
 const cardLabel = (s: CopyStatus): string => (s === 'historical' ? 'Historical mention — not checked' : COPY_LABEL[s]);
-const withUnit = (value: string | null, unit: string | null): string => (value ? (unit && !value.includes(unit) ? `${value} ${unit}` : value) : '—');
+const withUnit = (value: string | null, unit: string | null): string => (value ? valueLabel(value, unit) : '—');
 const spaceOf = (url: string | null): string | null => (url ? (/\/spaces\/([^/]+)\//.exec(url)?.[1] ?? null) : null);
 const formatDateTime = (iso: string | null): string | null => {
   if (!iso) return null;

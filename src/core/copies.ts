@@ -4,6 +4,7 @@
  * normalisation, validation of the untrusted judge output (verbatim quote) and the status of each copy.
  */
 import { FIELD_LIMITS, MIN_QUOTE_CHARS, normaliseKeyPart, quoteInText, valueInQuote } from './facts';
+import { valueLabel } from './valueLabel';
 import type { CopyStatus, FactType } from './views';
 
 /** PRD: at most 200 candidate pages per fact, by relevance. */
@@ -401,8 +402,8 @@ export function compareValues(official: { value: string; unit: string | null }, 
   return [...sw].every((w) => ow.has(w)) || [...ow].every((w) => sw.has(w)) ? 'same' : 'different';
 }
 
-/** Display form of a value with its unit ("45 days", "$60"). */
-export const valueLabel = (value: string, unit: string | null): string => (unit && !value.toLowerCase().includes(unit.toLowerCase()) ? `${value} ${unit}` : value);
+/** Display form of a value with its unit (re-exported for existing callers). */
+export { valueLabel };
 
 // ---------------------------------------------------------------------------------------------------------------
 // Judge output

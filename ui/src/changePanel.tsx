@@ -1,6 +1,7 @@
 import { Modal, router, view } from '@forge/bridge';
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { ChangeDecision, ChangePageView, ChangeSpaceView, PendingChangeReply, PendingChangeView } from '../../src/core/views';
+import { valueLabel } from '../../src/core/valueLabel';
 import { call } from './bridge';
 import { Alert, LoadingRows, errorOf } from './components';
 
@@ -9,7 +10,6 @@ export const CHANGE_MODAL_VIEW = 'ripple-change-review';
 
 const DEADLINE_CHOICES = [2, 3, 5, 7, 10, 15, 20, 30] as const;
 
-const withUnit = (value: string, unit: string | null): string => (unit && !value.includes(unit) ? `${value} ${unit}` : value);
 const plural = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`;
 const spaceKeyOf = (url: string | null): string | null => (url ? (/\/spaces\/([^/]+)\//.exec(url)?.[1] ?? null) : null);
 const ownerName = (p: ChangePageView): string => p.owner.displayName ?? (p.owner.accountId ? 'Unknown user' : 'No owner');
@@ -226,14 +226,14 @@ function ChangeReview({ mode, onDecided }: ChangeReviewProps) {
             <p className="change__values">
               <del className="change__old">
                 <span className="sr-only">Old value: </span>
-                {withUnit(f.oldValue, f.oldUnit)}
+                {valueLabel(f.oldValue, f.oldUnit)}
               </del>
               <span aria-hidden="true" className="change__arrow">
                 →
               </span>
               <ins className="change__new">
                 <span className="sr-only">New value: </span>
-                {withUnit(f.newValue, f.newUnit)}
+                {valueLabel(f.newValue, f.newUnit)}
               </ins>
             </p>
             <blockquote className="quote__text change__quote">{f.newQuote}</blockquote>

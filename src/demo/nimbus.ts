@@ -6,7 +6,10 @@
  * Copy facts: 14 domestic per diem copies (13 in sync, 1 drifted $65) and 8 copies of the other facts (5 in sync,
  * 3 drifted: claims 45 days, approval $2,500, international $100), one trap (training per diem $40, unsure) and one
  * historical mention. The trap page never uses a word like "international" / "external" (see `TRAP_FORBIDDEN`) so the
- * judge maps its card to the domestic per diem.
+ * judge maps its card to the domestic per diem. Every in-sync per diem sentence names the fact's condition
+ * ("domestic", "international") and nothing that narrows it (conferences, relocation, …); page context stays in the
+ * sentences around it, so a live judge has no reason to answer "different condition". The loader finds pages by
+ * title, so changed content reaches Confluence only after "Remove demo data" and a new load.
  */
 
 export type NimbusFactKey = 'domestic' | 'international' | 'approval' | 'claims' | 'flight';
@@ -101,11 +104,11 @@ const page = (slug: string, space: NimbusSpaceKey, title: string, kind: 'copy' |
 const D1 = 'On domestic trips you receive a per diem of $60 per day.';
 const C1 = 'Expense claims are due within 30 days after the trip ends.';
 const TRAP = 'On training course days the per diem is $40 per day.';
-const D3 = 'Relocation trips count as domestic travel, so the per diem is $60 per day.';
+const D3 = 'For domestic travel, People Ops pays a per diem of $60 per day.';
 const HIST = 'Last year the domestic per diem went up from $50 to $60 per day.';
-const D5 = 'If your first week includes a domestic trip to another office, the per diem is $60 per day.';
+const D5 = 'Every domestic trip comes with a per diem of $60 per day.';
 const D6 = 'Yes. For domestic travel the per diem is $60 per day.';
-const D7 = 'When you visit your buddy in another city on a domestic trip, you get the per diem of $60 per day.';
+const D7 = 'On domestic trips you get the per diem of $60 per day.';
 const D8 = 'Explain that domestic trips come with a per diem of $60 per day.';
 const A8 = 'Remind new hires that trips over $2,000 need manager approval before booking.';
 const C9 = 'Expense claims must be filed within 45 days after the trip ends.';
@@ -116,9 +119,9 @@ const D11 = 'Meals on domestic travel are paid from the per diem of $60 per day,
 const C12 = 'Remind your team that expense claims are due within 30 days after the trip ends.';
 const D13 = 'For domestic customer visits the per diem is $65 per day.';
 const A13 = 'Trips over $2,500 need manager approval before booking.';
-const D14 = 'When you budget a QBR on a domestic trip, plan for the per diem of $60 per day per attendee.';
-const I15 = 'At conferences in other countries, the international per diem is $90 per day.';
-const D15 = 'For conferences on domestic trips, the per diem of $60 per day applies.';
+const D14 = 'On domestic trips, plan for the per diem of $60 per day.';
+const I15 = 'For international travel, the per diem is $90 per day.';
+const D15 = 'Domestic travel has a per diem of $60 per day.';
 const D16 = 'For domestic travel the per diem is $60 per day, paid with your next salary.';
 const D17 = 'Domestic trips come with a per diem of $60 per day, so you do not need to book meals.';
 const F18 = 'Flights under 6 hours are booked in economy class.';
@@ -140,20 +143,20 @@ export const NIMBUS_PAGES: readonly NimbusPage[] = [
     p(TRAP),
     p('Course fees are paid directly by People Ops.'),
   ], [m('domestic', 'unsure', TRAP, '$40', 'per day', 'training course days')]),
-  page('hr-relocation', 'NLHR', 'Relocation Guide', 'copy', [p('Moving to a new office is a big step, and People Ops is here to help.'), p(D3), p('Ask People Ops for the moving checklist.')], [
+  page('hr-relocation', 'NLHR', 'Relocation Guide', 'copy', [p('Moving to a new office is a big step, and People Ops is here to help. Your trip to the new office is booked as domestic travel.'), p(D3), p('Ask People Ops for the moving checklist.')], [
     m('domestic', 'in_sync', D3, '$60', 'per day', 'domestic travel'),
   ]),
   page('hr-policy-history', 'NLHR', 'Travel Policy History', 'historical', [p('This page records how the travel policy has changed over time.'), p(HIST), p('Questions about older rules go to People Ops.')], [
     m('domestic', 'historical', HIST, '$50', 'per day', 'domestic'),
   ]),
-  page('onb-first-week', 'NLONB', 'Your First Week at Nimbus Labs', 'copy', [p('Welcome to Nimbus Labs! Here is what your first week looks like.'), p(D5), p('Your laptop is ready at the front desk on day one.')], [
+  page('onb-first-week', 'NLONB', 'Your First Week at Nimbus Labs', 'copy', [p('Welcome to Nimbus Labs! Here is what your first week looks like. You may visit another office.'), p(D5), p('Your laptop is ready at the front desk on day one.')], [
     m('domestic', 'in_sync', D5, '$60', 'per day', 'domestic trip'),
   ]),
   page('onb-new-joiner-faq', 'NLONB', 'New Joiner FAQ', 'copy', [faq('Do I get money for meals when I travel?', D6), faq('Where do I find the holiday calendar?', 'It is pinned in the #general channel.')], [
     m('domestic', 'in_sync', D6, '$60', 'per day', 'domestic travel'),
   ]),
-  page('onb-buddy-guide', 'NLONB', 'Onboarding Buddy Guide', 'copy', [p('Buddies help new hires find their way during the first month.'), p(D7), p('Meet your buddy at least once a week.')], [
-    m('domestic', 'in_sync', D7, '$60', 'per day', 'domestic trip'),
+  page('onb-buddy-guide', 'NLONB', 'Onboarding Buddy Guide', 'copy', [p('Buddies help new hires find their way during the first month. You may visit your buddy in another city.'), p(D7), p('Meet your buddy at least once a week.')], [
+    m('domestic', 'in_sync', D7, '$60', 'per day', 'domestic trips'),
   ]),
   page('onb-manager-checklist', 'NLONB', 'Manager Onboarding Checklist', 'copy', [p('Use this checklist in the first two weeks of a new hire.'), `<ul><li>${p(D8)}</li><li>${p(A8)}</li></ul>`], [
     m('domestic', 'in_sync', D8, '$60', 'per day', 'domestic trips'),
@@ -175,12 +178,12 @@ export const NIMBUS_PAGES: readonly NimbusPage[] = [
     m('domestic', 'drifted', D13, '$65', 'per day', 'domestic customer visits'),
     m('approval', 'drifted', A13, '$2,500', 'USD', 'before booking'),
   ]),
-  page('sales-qbr-prep', 'NLSALES', 'Quarterly Business Review Prep', 'copy', [p('A QBR is our chance to show customers the value they get from Nimbus Labs.'), p(D14)], [
-    m('domestic', 'in_sync', D14, '$60', 'per day', 'domestic trip'),
+  page('sales-qbr-prep', 'NLSALES', 'Quarterly Business Review Prep', 'copy', [p('A QBR is our chance to show customers the value they get from Nimbus Labs. Budget the travel of each attendee.'), p(D14)], [
+    m('domestic', 'in_sync', D14, '$60', 'per day', 'domestic trips'),
   ]),
   page('sales-conference-playbook', 'NLSALES', 'Conference Playbook', 'copy', [p('Conferences help us meet many prospects in a few days.'), p(I15), p(D15)], [
-    m('international', 'in_sync', I15, '$90', 'per day', 'international'),
-    m('domestic', 'in_sync', D15, '$60', 'per day', 'domestic trips'),
+    m('international', 'in_sync', I15, '$90', 'per day', 'international travel'),
+    m('domestic', 'in_sync', D15, '$60', 'per day', 'domestic travel'),
   ]),
   page('help-per-diem', 'NLHELP', 'FAQ: How much is the per diem?', 'copy', [faq('How much is the per diem?', D16), p('This article is maintained by the IT and HR Help Center.')], [
     m('domestic', 'in_sync', D16, '$60', 'per day', 'domestic travel'),

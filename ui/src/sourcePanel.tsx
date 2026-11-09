@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import type { FactActionResult, FactEditPayload, FactList, FactStatus, FactType, FactView, LatestChangeReply, SourceStatus } from '../../src/core/views';
+import { valueLabel } from '../../src/core/valueLabel';
 import { call } from './bridge';
 import { Alert, LoadingRows, TabPanel, Tabs, errorOf } from './components';
 import { CopiesTab } from './copiesTab';
@@ -408,8 +409,7 @@ function FactCard({ fact, canEdit, onAction }: FactCardProps) {
       <dl className="fact__grid">
         <dt>Value</dt>
         <dd className="fact__value">
-          {fact.value}
-          {fact.unit ? ` ${fact.unit}` : ''}
+          {valueLabel(fact.value, fact.unit)}
         </dd>
         {fact.condition ? (
           <>
