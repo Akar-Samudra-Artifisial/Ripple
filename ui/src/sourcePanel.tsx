@@ -3,6 +3,7 @@ import type { FactActionResult, FactEditPayload, FactList, FactStatus, FactType,
 import { call } from './bridge';
 import { Alert, LoadingRows, TabPanel, Tabs, errorOf } from './components';
 import { CopiesTab } from './copiesTab';
+import { RolloutTab, forgetChange, recallChange } from './rollout';
 
 const POLL_MS = 3000;
 
@@ -33,8 +34,19 @@ export function SourcePanel() {
   const [facts, setFacts] = useState<FactView[]>();
   const [error, setError] = useState<string>();
   const [pending, setPending] = useState<SourceCall>();
-  const [tab, setTab] = useState<'facts' | 'copies'>('facts');
+  const [tab, setTab] = useState<'facts' | 'copies' | 'rollout'>('facts');
   const tabsId = useId();
+  /** Last change confirmed from this browser (the contract has no lookup for it); enables the Rollout tab. */
+  const [rolloutId, setRolloutId] = useState<string | null>(null);
+  const pageId = status?.pageId;
+  useEffect(() => {
+    setRolloutId(pageId ? recallChange(pageId) : null);
+  }, [pageId]);
+  const dropRollout = useCallback(() => {
+    if (pageId) forgetChange(pageId);
+    setRolloutId(null);
+    setTab('facts');
+  }, [pageId]);
 
   const load = useCallback(async () => {
     const s = await call<SourceStatus>('getSourceStatus');
@@ -173,6 +185,7 @@ export function SourcePanel() {
           tabs={[
             { id: 'facts', label: `Facts (${total})` },
             { id: 'copies', label: 'Copies' },
+            ...(rolloutId ? [{ id: 'rollout' as const, label: 'Rollout' }] : []),
           ]}
         />
       ) : null}
@@ -180,6 +193,10 @@ export function SourcePanel() {
       {source.state === 'ready' && tab === 'copies' ? (
         <TabPanel idPrefix={tabsId} id="copies">
           <CopiesTab canEdit={canEdit} confirmed={counts.confirmed} onShowFacts={() => setTab('facts')} />
+        </TabPanel>
+      ) : source.state === 'ready' && tab === 'rollout' && rolloutId ? (
+        <TabPanel idPrefix={tabsId} id="rollout">
+          <RolloutTab changeId={rolloutId} onGone={dropRollout} />
         </TabPanel>
       ) : (
         <FactsList facts={facts} ready={source.state === 'ready'} error={error} canEdit={canEdit} onRetry={reload} onAction={runFact} tabsId={tabsId} />

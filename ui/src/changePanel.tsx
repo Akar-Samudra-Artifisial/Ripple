@@ -3,6 +3,7 @@ import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { ChangeDecision, ChangePageView, ChangeSpaceView, PendingChangeReply, PendingChangeView } from '../../src/core/views';
 import { call } from './bridge';
 import { Alert, LoadingRows, errorOf } from './components';
+import { rememberChange } from './rollout';
 
 /** Value sent in the modal context so the byline resource renders the change review instead of the byline. */
 export const CHANGE_MODAL_VIEW = 'ripple-change-review';
@@ -87,6 +88,7 @@ function ChangeReview({ mode, onDecided }: ChangeReviewProps) {
   const [pending, setPending] = useState<'confirmChange' | 'dismissChange'>();
   const [confirmDismiss, setConfirmDismiss] = useState(false);
   const [done, setDone] = useState<ChangeDecision>();
+  const [pageId, setPageId] = useState<string>();
   const headingId = useId();
   const heading = useRef<HTMLHeadingElement>(null);
   const result = useRef<HTMLDivElement>(null);
@@ -95,6 +97,7 @@ function ChangeReview({ mode, onDecided }: ChangeReviewProps) {
     setLoadError(undefined);
     call<PendingChangeReply>('getPendingChange')
       .then((r) => {
+        setPageId(r.pageId);
         setChange(r.change);
         if (r.change) setDays(r.change.defaultDeadlineDays);
       })
@@ -115,7 +118,9 @@ function ChangeReview({ mode, onDecided }: ChangeReviewProps) {
     setError(undefined);
     try {
       const payload = action === 'confirmChange' ? { changeId: change.id, deadlineDays: days, version: change.version } : { changeId: change.id, version: change.version };
-      setDone(await call<ChangeDecision>(action, payload));
+      const decision = await call<ChangeDecision>(action, payload);
+      if (decision.status === 'confirmed' && pageId) rememberChange(pageId, decision.changeId);
+      setDone(decision);
       onDecided?.();
     } catch (e) {
       const message = errorOf(e);
