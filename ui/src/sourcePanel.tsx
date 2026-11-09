@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import type { FactActionResult, FactEditPayload, FactList, FactStatus, FactType, FactView, SourceStatus } from '../../src/core/views';
 import { call } from './bridge';
+import { Alert, LoadingRows, TabPanel, Tabs, errorOf } from './components';
 import { CopiesTab } from './copiesTab';
 
 const POLL_MS = 3000;
-const errorOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 const STATUS_LABEL: Record<FactStatus, string> = { proposed: 'To review', confirmed: 'Confirmed', rejected: 'Rejected' };
 const TYPE_LABEL: Record<FactType, string> = { number: 'Number', date: 'Date', list: 'List', name: 'Name', rule: 'Rule' };
@@ -34,6 +34,7 @@ export function SourcePanel() {
   const [error, setError] = useState<string>();
   const [pending, setPending] = useState<SourceCall>();
   const [tab, setTab] = useState<'facts' | 'copies'>('facts');
+  const tabsId = useId();
 
   const load = useCallback(async () => {
     const s = await call<SourceStatus>('getSourceStatus');
@@ -164,35 +165,24 @@ export function SourcePanel() {
       ) : null}
 
       {source.state === 'ready' ? (
-        <div className="actions" role="tablist" aria-label="Source views">
-          {(['facts', 'copies'] as const).map((t) => (
-            <button key={t} type="button" role="tab" aria-selected={tab === t} className={`button ${tab === t ? 'button--primary' : 'button--subtle'}`} onClick={() => setTab(t)}>
-              {t === 'facts' ? 'Facts' : 'Copies'}
-            </button>
-          ))}
-        </div>
+        <Tabs
+          idPrefix={tabsId}
+          label="Source of truth views"
+          selected={tab}
+          onSelect={setTab}
+          tabs={[
+            { id: 'facts', label: `Facts (${total})` },
+            { id: 'copies', label: 'Copies' },
+          ]}
+        />
       ) : null}
 
-      {source.state === 'ready' && tab === 'copies' ? <CopiesTab canEdit={canEdit} confirmed={counts.confirmed} /> : null}
-
-      {tab === 'copies' && source.state === 'ready' ? null : (
-        <>
-      {source.state === 'ready' && facts === undefined ? (
-        error ? <Alert message={`Could not load the facts: ${error}`} onRetry={reload} /> : <FactsLoading />
-      ) : null}
-
-      {source.state === 'ready' && facts?.length === 0 ? (
-        <p className="empty">No facts were found on this page. Facts are numbers, dates, lists, names and yes/no rules stated in the text.</p>
-      ) : null}
-
-      {facts && facts.length > 0 ? (
-        <ul className="facts" aria-label="Facts on this page">
-          {facts.map((f) => (
-            <FactCard key={f.id} fact={f} canEdit={canEdit} onAction={runFact} />
-          ))}
-        </ul>
-      ) : null}
-        </>
+      {source.state === 'ready' && tab === 'copies' ? (
+        <TabPanel idPrefix={tabsId} id="copies">
+          <CopiesTab canEdit={canEdit} confirmed={counts.confirmed} onShowFacts={() => setTab('facts')} />
+        </TabPanel>
+      ) : (
+        <FactsList facts={facts} ready={source.state === 'ready'} error={error} canEdit={canEdit} onRetry={reload} onAction={runFact} tabsId={tabsId} />
       )}
 
       {canEdit ? <SourceActions extracting={extracting} pending={pending} onRun={runSource} /> : null}
@@ -200,28 +190,39 @@ export function SourcePanel() {
   );
 }
 
-function Alert({ message, onRetry, retryLabel = 'Try again', retryDisabled }: { message: string; onRetry?: () => void; retryLabel?: string; retryDisabled?: boolean }) {
-  return (
-    <div className="alert" role="alert">
-      <p className="alert__text">{message}</p>
-      {onRetry ? (
-        <button type="button" className="button" disabled={retryDisabled} onClick={onRetry}>
-          {retryLabel}
-        </button>
-      ) : null}
-    </div>
-  );
+interface FactsListProps {
+  facts: FactView[] | undefined;
+  ready: boolean;
+  error: string | undefined;
+  canEdit: boolean;
+  tabsId: string;
+  onRetry: () => void;
+  onAction: FactCardProps['onAction'];
 }
 
-function FactsLoading() {
-  return (
-    <div className="facts-loading" aria-busy="true">
-      <p className="muted" role="status">
-        Loading facts…
-      </p>
-      <div className="skeleton" aria-hidden="true" />
-      <div className="skeleton" aria-hidden="true" />
-    </div>
+/** Facts tab body; wrapped in its tab panel only when the tabs are shown (source ready). */
+function FactsList({ facts, ready, error, canEdit, tabsId, onRetry, onAction }: FactsListProps) {
+  const body = (
+    <>
+      {ready && facts === undefined ? error ? <Alert message={`Could not load the facts: ${error}`} onRetry={onRetry} /> : <LoadingRows label="Loading facts…" /> : null}
+      {ready && facts?.length === 0 ? (
+        <p className="empty">No facts were found on this page. Facts are numbers, dates, lists, names and yes/no rules stated in the text.</p>
+      ) : null}
+      {facts && facts.length > 0 ? (
+        <ul className="facts" aria-label="Facts on this page">
+          {facts.map((f) => (
+            <FactCard key={f.id} fact={f} canEdit={canEdit} onAction={onAction} />
+          ))}
+        </ul>
+      ) : null}
+    </>
+  );
+  return ready ? (
+    <TabPanel idPrefix={tabsId} id="facts">
+      {body}
+    </TabPanel>
+  ) : (
+    body
   );
 }
 

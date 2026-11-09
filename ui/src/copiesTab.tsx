@@ -1,52 +1,96 @@
-import { router } from '@forge/bridge';
-import { useCallback, useEffect, useState } from 'react';
-import type { CopyList, CopyStatus, CopyView, ScanStatus } from '../../src/core/views';
+import { router, view } from '@forge/bridge';
+import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
+import type { CopyCounts, CopyList, CopyStatus, CopyView, ScanStatus, ScanView } from '../../src/core/views';
 import { call } from './bridge';
+import { Alert, LoadingRows, errorOf } from './components';
 
 const POLL_MS = 3000;
-const errorOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
+/** Blameless labels (PRD): "out of date", never "wrong". */
 const COPY_LABEL: Record<CopyStatus, string> = {
-  in_sync: 'In sync',
-  drifted: 'Drifted',
+  drifted: 'Out of date',
   unsure: 'Unsure',
-  historical: 'Historical',
-  ignored: 'Ignored',
+  in_sync: 'In sync',
   updated: 'Updated',
+  ignored: 'Ignored',
+  historical: 'Historical',
 };
-/** Filters offered in the tab; `all` = everything except historical mentions. */
-const FILTERS: ('all' | CopyStatus)[] = ['all', 'drifted', 'unsure', 'in_sync', 'historical'];
+/** Out-of-date copies first (PRD "Tab Copies"). */
+const ORDER: readonly CopyStatus[] = ['drifted', 'unsure', 'in_sync', 'updated', 'ignored', 'historical'];
+
+type Filter = 'all' | CopyStatus;
+interface LoadedList {
+  filter: Filter;
+  data: CopyList;
+}
+
+/** Copies that count as restatements of the facts (historical mentions and ignored matches excluded). */
+const totalOf = (c: CopyCounts): number => c.in_sync + c.drifted + c.unsure + c.updated;
+const withUnit = (value: string | null, unit: string | null): string => (value ? (unit && !value.includes(unit) ? `${value} ${unit}` : value) : '—');
+const spaceOf = (url: string | null): string | null => (url ? (/\/spaces\/([^/]+)\//.exec(url)?.[1] ?? null) : null);
+const formatDateTime = (iso: string | null): string | null => {
+  if (!iso) return null;
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? null : d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+};
+
+interface CopiesTabProps {
+  canEdit: boolean;
+  /** Confirmed facts on the source; a scan needs at least one. */
+  confirmed: number;
+  onShowFacts: () => void;
+}
 
 /**
- * Copies tab (FR-4..6): starts / resumes a copy scan, polls its progress and lists copies of the confirmed facts on
- * other pages. Copies on pages the viewer cannot open are only counted.
+ * Copies tab (FR-4..6). Render states: no `status` yet → loading rows (or error + retry); no confirmed facts and no
+ * scan → "Confirm facts to scan for copies"; no scan → intro + "Find copies"; `searching`/`judging` → progress (polled,
+ * stalled → resume); `error` → alert + "Try again"; `done` → counts, filters and the list. The list for the selected
+ * filter shows loading rows until its first reply, so "No copies" only appears for a real empty reply.
  */
-export function CopiesTab({ canEdit, confirmed }: { canEdit: boolean; confirmed: number }) {
+export function CopiesTab({ canEdit, confirmed, onShowFacts }: CopiesTabProps) {
   const [status, setStatus] = useState<ScanStatus>();
-  const [list, setList] = useState<CopyList>();
-  const [filter, setFilter] = useState<'all' | CopyStatus>('all');
+  const [list, setList] = useState<LoadedList>();
+  const [filter, setFilter] = useState<Filter>('all');
   const [error, setError] = useState<string>();
   const [starting, setStarting] = useState(false);
-
-  const load = useCallback(async () => {
-    const s = await call<ScanStatus>('getScanStatus');
-    setStatus(s);
-    if (s.scan?.state === 'done') setList(await call<CopyList>('listCopies', filter === 'all' ? {} : { status: filter }));
-    setError(undefined);
-  }, [filter]);
+  const [siteUrl, setSiteUrl] = useState<string>();
+  const request = useRef(0);
 
   useEffect(() => {
+    view
+      .getContext()
+      .then((ctx) => setSiteUrl(ctx.siteUrl.replace(/\/$/, '')))
+      .catch(() => undefined);
+  }, []);
+
+  const load = useCallback(async () => {
+    const id = ++request.current;
+    const s = await call<ScanStatus>('getScanStatus');
+    // Fetch the list before committing a `done` status so counts and list render together.
+    const data = s.scan?.state === 'done' ? await call<CopyList>('listCopies', filter === 'all' ? {} : { status: filter }) : undefined;
+    if (id !== request.current) return; // a newer load (e.g. another filter) superseded this one
+    setStatus(s);
+    if (data) setList({ filter, data });
+    setError(undefined);
+  }, [filter]);
+  const reload = useCallback(() => {
+    setError(undefined);
     load().catch((e: unknown) => setError(errorOf(e)));
   }, [load]);
 
-  const running = status?.scan?.state === 'searching' || status?.scan?.state === 'judging';
   useEffect(() => {
-    if (!running) return;
+    reload();
+  }, [reload]);
+
+  const running = status?.scan?.state === 'searching' || status?.scan?.state === 'judging';
+  const stalled = running && status?.scan?.stalled === true;
+  useEffect(() => {
+    if (!running || stalled) return;
     const timer = setInterval(() => load().catch((e: unknown) => setError(errorOf(e))), POLL_MS);
     return () => clearInterval(timer);
-  }, [running, load]);
+  }, [running, stalled, load]);
 
-  const start = async () => {
+  const start = useCallback(async () => {
     setStarting(true);
     setError(undefined);
     try {
@@ -56,113 +100,211 @@ export function CopiesTab({ canEdit, confirmed }: { canEdit: boolean; confirmed:
     } finally {
       setStarting(false);
     }
-  };
+  }, []);
 
   if (!status) {
-    return error ? (
-      <p className="alert" role="alert">
-        {error}
-      </p>
-    ) : (
-      <p className="muted" role="status">
-        Loading copies…
-      </p>
-    );
+    return error ? <Alert message={`Could not load the copies: ${error}`} onRetry={reload} /> : <LoadingRows label="Loading copies…" />;
   }
 
   const { scan, counts } = status;
-  const canStart = canEdit && confirmed > 0 && (!running || scan?.stalled === true);
-  const label = !scan ? 'Find copies' : running ? 'Resume scan' : 'Rescan';
+  const mayScan = canEdit && confirmed > 0;
+  const startLabel = (idle: string) => (starting ? 'Starting…' : idle);
+
+  if (!scan) {
+    if (confirmed === 0) {
+      return (
+        <div className="empty empty--action">
+          <p className="empty__title">Confirm facts to scan for copies</p>
+          <p>Ripple only searches for facts you have confirmed, so other pages are compared with values you trust.</p>
+          <button type="button" className="button" onClick={onShowFacts}>
+            Review facts
+          </button>
+        </div>
+      );
+    }
+    return (
+      <div className="empty empty--action">
+        <p className="empty__title">Find where these facts are repeated</p>
+        <p>
+          Ripple searches Confluence for pages that restate the {confirmed} confirmed {confirmed === 1 ? 'fact' : 'facts'}, even in different words, and checks whether
+          each one still matches this page.
+        </p>
+        {error ? <Alert message={error} /> : null}
+        {canEdit ? (
+          <button type="button" className="button button--primary" disabled={starting} onClick={() => void start()}>
+            {startLabel('Find copies')}
+          </button>
+        ) : (
+          <p className="muted">Only people who can edit this page can start a search.</p>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="copies">
-      {scan?.state === 'done' ? (
-        <p className="source__summary">
-          <span className="badge badge--rejected">{counts.drifted} drifted</span>
-          <span className="badge badge--proposed">{counts.unsure} unsure</span>
-          <span className="badge badge--confirmed">{counts.in_sync} in sync</span>
-          {counts.historical > 0 ? <span className="badge">{counts.historical} historical</span> : null}
-        </p>
+      {error ? <Alert message={error} /> : null}
+
+      {running ? <ScanProgress scan={scan} /> : null}
+      {stalled ? (
+        <Alert
+          tone="warning"
+          message="The search stopped making progress."
+          onRetry={canEdit ? () => void start() : undefined}
+          retryLabel={startLabel('Resume search')}
+          retryDisabled={starting}
+        />
+      ) : null}
+      {scan.state === 'error' ? (
+        <Alert
+          message={`The last search failed. ${scan.error ?? ''}`.trim()}
+          onRetry={mayScan ? () => void start() : undefined}
+          retryLabel={startLabel('Try again')}
+          retryDisabled={starting}
+        />
       ) : null}
 
-      {running ? (
-        <p role="status" className="muted">
-          {scan?.state === 'searching'
-            ? `Searching Confluence… ${scan.factsSearched}/${scan.factsTotal} facts`
-            : `Checking pages… ${scan?.pagesJudged ?? 0}/${scan?.candidates ?? 0}`}
-          {scan?.stalled ? ' (stalled)' : ''}
-        </p>
-      ) : null}
-      {scan?.state === 'error' ? (
-        <p className="alert" role="alert">
-          The last scan failed: {scan.error}
-        </p>
-      ) : null}
-      {!scan ? <p className="muted">Ripple searches other pages for these facts and checks whether they still match.</p> : null}
-      {confirmed === 0 ? <p className="muted">Confirm at least one fact to search for copies.</p> : null}
-      {error ? (
-        <p className="alert" role="alert">
-          {error}
-        </p>
+      {scan.state === 'done' ? (
+        <DoneView scan={scan} counts={counts} filter={filter} list={list} siteUrl={siteUrl} onFilter={setFilter} onRetry={reload} hasError={Boolean(error)} />
       ) : null}
 
-      {canStart ? (
-        <div className="actions">
-          <button type="button" className="button button--primary" disabled={starting} onClick={() => void start()}>
-            {starting ? 'Starting…' : label}
-          </button>
+      {scan.state === 'done' && canEdit ? (
+        <div className="source__footer actions">
+          {confirmed > 0 ? (
+            <button type="button" className="button button--subtle" disabled={starting} onClick={() => void start()}>
+              {startLabel('Rescan')}
+            </button>
+          ) : (
+            <p className="muted">Confirm at least one fact to search again.</p>
+          )}
         </div>
-      ) : null}
-
-      {scan?.state === 'done' ? (
-        <>
-          <div className="actions" role="group" aria-label="Filter copies">
-            {FILTERS.map((f) => (
-              <button key={f} type="button" className={`button ${filter === f ? 'button--primary' : 'button--subtle'}`} aria-pressed={filter === f} onClick={() => setFilter(f)}>
-                {f === 'all' ? 'All' : COPY_LABEL[f]}
-              </button>
-            ))}
-          </div>
-          {list && list.copies.length === 0 ? <p className="empty">No copies to show.</p> : null}
-          {list && list.copies.length > 0 ? (
-            <ul className="facts" aria-label="Copies">
-              {list.copies.map((c) => (
-                <CopyCard key={c.id} copy={c} />
-              ))}
-            </ul>
-          ) : null}
-          {list && list.hiddenCount > 0 ? (
-            <p className="muted">
-              {list.hiddenCount} more {list.hiddenCount === 1 ? 'copy is' : 'copies are'} on pages you cannot open.
-            </p>
-          ) : null}
-        </>
       ) : null}
     </div>
   );
 }
 
-function CopyCard({ copy }: { copy: CopyView }) {
-  const stated = copy.statedValue ? `${copy.statedValue}${copy.statedUnit && !copy.statedValue.includes(copy.statedUnit) ? ` ${copy.statedUnit}` : ''}` : '';
+function ScanProgress({ scan }: { scan: ScanView }) {
+  const searching = scan.state === 'searching';
+  const done = searching ? scan.factsSearched : scan.pagesJudged;
+  const total = searching ? scan.factsTotal : scan.candidates;
+  const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  const label = searching ? `Searching Confluence for copies (${done}/${total} facts)` : `Checking ${total} ${total === 1 ? 'page' : 'pages'} for drift (${done}/${total})`;
   return (
-    <li className="fact">
+    <div className="progress">
+      <p className="progress__label" role="status">
+        Step {searching ? 1 : 2} of 2 · {label}…
+      </p>
+      <div className="progress__track" role="progressbar" aria-label={searching ? 'Searching for copies' : 'Checking pages'} aria-valuemin={0} aria-valuemax={total} aria-valuenow={done}>
+        <div className="progress__fill" style={{ width: `${pct}%` }} />
+      </div>
+      <p className="muted progress__hint">Large spaces can take a few minutes. You can close this and come back.</p>
+    </div>
+  );
+}
+
+interface DoneViewProps {
+  scan: ScanView;
+  counts: CopyCounts;
+  filter: Filter;
+  list: LoadedList | undefined;
+  siteUrl: string | undefined;
+  hasError: boolean;
+  onFilter: (f: Filter) => void;
+  onRetry: () => void;
+}
+
+function DoneView({ scan, counts, filter, list, siteUrl, hasError, onFilter, onRetry }: DoneViewProps) {
+  const total = totalOf(counts);
+  const finished = formatDateTime(scan.finishedAt);
+  const filters: { id: Filter; label: string; count: number }[] = [
+    { id: 'all', label: 'All', count: total },
+    ...ORDER.filter((s) => s !== 'ignored' && (counts[s] > 0 || s === 'drifted')).map((s) => ({ id: s, label: COPY_LABEL[s], count: counts[s] })),
+  ];
+  const current = list && list.filter === filter ? list.data : undefined;
+  const copies = current ? [...current.copies].sort((a, b) => ORDER.indexOf(a.status) - ORDER.indexOf(b.status)) : undefined;
+
+  return (
+    <>
+      <div className="copies__headline">
+        <p className="copies__count">
+          <strong>
+            {total} {total === 1 ? 'copy' : 'copies'}
+          </strong>
+          {counts.drifted > 0 ? <span className="badge badge--copy-drifted">{counts.drifted} out of date</span> : <span className="badge badge--copy-in_sync">All in sync</span>}
+        </p>
+        <p className="muted source__meta">
+          {scan.candidates} {scan.candidates === 1 ? 'page' : 'pages'} checked{finished ? ` · last scan ${finished}` : ''}
+        </p>
+      </div>
+
+      {total > 0 || counts.historical > 0 ? (
+        <div className="chips" role="group" aria-label="Filter copies by status">
+          {filters.map((f) => (
+            <button key={f.id} type="button" className={`chip${f.id === 'drifted' && f.count > 0 ? ' chip--danger' : ''}`} aria-pressed={filter === f.id} onClick={() => onFilter(f.id)}>
+              {f.label} <span className="chip__count">{f.count}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+
+      {copies === undefined ? (
+        hasError ? <Alert message="Could not load the copies." onRetry={onRetry} /> : <LoadingRows label="Loading copies…" />
+      ) : copies.length === 0 ? (
+        <p className="empty">
+          {filter === 'all'
+            ? total === 0
+              ? 'No copies found. None of the pages Ripple checked restate these facts.'
+              : 'No copies to show here.'
+            : `No ${COPY_LABEL[filter].toLowerCase()} copies.`}
+        </p>
+      ) : (
+        <ul className="facts" aria-label="Copies">
+          {copies.map((c) => (
+            <CopyCard key={c.id} copy={c} siteUrl={siteUrl} />
+          ))}
+        </ul>
+      )}
+
+      {current && current.hiddenCount > 0 ? (
+        <p className="muted copies__hidden">
+          {current.hiddenCount} {current.hiddenCount === 1 ? 'copy is' : 'copies are'} in pages you can't view.
+        </p>
+      ) : null}
+    </>
+  );
+}
+
+function CopyCard({ copy, siteUrl }: { copy: CopyView; siteUrl: string | undefined }) {
+  const space = spaceOf(copy.pageUrl);
+  const href = siteUrl && copy.pageUrl ? `${siteUrl}${copy.pageUrl.startsWith('/wiki') ? '' : '/wiki'}${copy.pageUrl}` : undefined;
+  const open = (e: MouseEvent<HTMLAnchorElement>) => {
+    e.preventDefault();
+    void router.open({ target: 'contentView', contentId: copy.pageId });
+  };
+  const differs = copy.status === 'drifted';
+  return (
+    <li className={`fact copy copy--${copy.status}`}>
       <div className="fact__top">
-        <span className={`badge badge--copy-${copy.status}`}>{COPY_LABEL[copy.status]}</span>
         <span className="fact__type">{copy.factLabel}</span>
+        <span className={`badge badge--copy-${copy.status}`}>{COPY_LABEL[copy.status]}</span>
       </div>
       <h3 className="fact__title">
-        <button type="button" className="button button--subtle" onClick={() => void router.open({ target: 'contentView', contentId: copy.pageId })}>
+        <a className="copy__link" href={href ?? '#'} target="_blank" rel="noopener noreferrer" onClick={open}>
           {copy.pageTitle || `Page ${copy.pageId}`}
-        </button>
+          <span className="sr-only"> (opens in a new tab)</span>
+        </a>
+        {space ? <span className="fact__attr"> · {space}</span> : null}
       </h3>
-      <dl className="fact__grid">
-        <dt>Says</dt>
-        <dd className="fact__value">{stated}</dd>
-        <dt>Source</dt>
-        <dd>
-          {copy.officialValue}
-          {copy.officialUnit ? ` ${copy.officialUnit}` : ''}
-        </dd>
+      <dl className="copy__compare">
+        <div className={`copy__side${differs ? ' copy__side--drifted' : ''}`}>
+          <dt>This page says</dt>
+          <dd className="fact__value">{withUnit(copy.statedValue, copy.statedUnit)}</dd>
+          {copy.statedCondition ? <dd className="muted copy__when">When {copy.statedCondition}</dd> : null}
+        </div>
+        <div className="copy__side">
+          <dt>Source says</dt>
+          <dd className="fact__value">{withUnit(copy.officialValue, copy.officialUnit)}</dd>
+        </div>
       </dl>
       <figure className="quote">
         <blockquote className="quote__text">{copy.quote}</blockquote>
