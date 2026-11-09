@@ -4,7 +4,8 @@ import { displayNames } from '../adapters/confluenceUsers';
 import { asUserGraph, fetchPageMeta, ownersFromPage, readSpaceTeams, scrubErrorText, type GraphRequest, type PageMeta } from '../adapters/teamworkGraph';
 import { LATEST_MIGRATION, MIGRATIONS } from '../core/migrations';
 import { SchemaSettingUpError } from '../core/schema';
-import type { BylineStatus, OwnerView, SchemaView, SpaceTeamsView } from '../core/views';
+import type { BylineStatus, FactEditPayload, FactIdPayload, OwnerView, SchemaView, SpaceTeamsView } from '../core/views';
+import { confirmFact, editFact, getSourceStatus, listFacts, markSource, rejectFact, unmarkSource, type SourceContext } from './sources';
 import { notImplemented } from './stub';
 
 export type ResolverContext = {
@@ -99,6 +100,14 @@ export async function bylineStatus(ctx: ResolverContext, deps: BylineDeps = defa
 const resolver = new Resolver();
 
 resolver.define('getBylineStatus', ({ context }) => bylineStatus(context as ResolverContext));
+// M1 (FR-1..3); contract in src/core/views.ts `ResolverContract`.
+resolver.define('getSourceStatus', ({ context }) => getSourceStatus(context as SourceContext));
+resolver.define('markSource', ({ context }) => markSource(context as SourceContext));
+resolver.define('unmarkSource', ({ context }) => unmarkSource(context as SourceContext));
+resolver.define('listFacts', ({ context }) => listFacts(context as SourceContext));
+resolver.define('confirmFact', ({ context, payload }) => confirmFact(context as SourceContext, payload as Partial<FactIdPayload>));
+resolver.define('rejectFact', ({ context, payload }) => rejectFact(context as SourceContext, payload as Partial<FactIdPayload>));
+resolver.define('editFact', ({ context, payload }) => editFact(context as SourceContext, payload as Partial<FactEditPayload>));
 resolver.define('getSettings', () => notImplemented('settings'));
 resolver.define('getApproval', () => notImplemented('approval panel'));
 

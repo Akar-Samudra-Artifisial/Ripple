@@ -12,6 +12,7 @@ vi.mock('@forge/resolver', () => ({
   },
 }));
 vi.mock('@forge/sql', () => ({ sql: {}, migrationRunner: {} }));
+vi.mock('@forge/llm', () => ({ chat: vi.fn(), ForgeLlmError: class extends Error {} }));
 vi.mock('@forge/events', () => ({
   Queue: class {
     push = forge.push;
@@ -45,19 +46,19 @@ describe('migrations', () => {
       if (/^\s*ALTER\s+TABLE/i.test(m.statement)) expect(m.statement.match(/\bADD\b/gi) ?? []).toHaveLength(1);
       expect(m.statement.trim()).not.toMatch(/;\s*\S/); // one statement per migration
     }
-    expect(names).toEqual(['v001_create_settings', 'v002_create_audit']);
-    expect(LATEST_MIGRATION).toBe('v002_create_audit');
+    expect(names).toEqual(['v001_create_settings', 'v002_create_audit', 'v003_create_sources', 'v004_create_facts']);
+    expect(LATEST_MIGRATION).toBe('v004_create_facts');
   });
 });
 
 describe('schemaView', () => {
   it('reports ready, setting up and errors', async () => {
-    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 2, total: 2, latest: LATEST_MIGRATION });
+    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 4, total: 4, latest: LATEST_MIGRATION });
     expect(
       await schemaView(async () => {
-        throw new SchemaSettingUpError(1, 2);
+        throw new SchemaSettingUpError(1, 4);
       }),
-    ).toMatchObject({ status: 'setting_up', applied: 1, total: 2 });
+    ).toMatchObject({ status: 'setting_up', applied: 1, total: 4 });
     expect(
       await schemaView(async () => {
         throw new Error('db down');

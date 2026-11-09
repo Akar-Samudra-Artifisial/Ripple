@@ -1,6 +1,7 @@
 import type { BylineStatus } from '../../src/core/views';
 import { useRemote } from './bridge';
 import { mount } from './mount';
+import { SourcePanel } from './sourcePanel';
 
 /** M0 byline popup: readiness, database setup progress and the space's owning teams (Teamwork Graph). */
 function Byline() {
@@ -38,6 +39,7 @@ function Byline() {
         <p className="muted">{spaceTeams.dataPresent ? 'No team is linked to this space.' : 'Teamwork Graph returned no data.'}</p>
       )}
       {spaceTeams.errors.length > 0 ? <p className="error">{spaceTeams.errors.join(' | ')}</p> : null}
+      {schema.status === 'ready' ? <SourcePanel /> : null}
     </>
   );
 }

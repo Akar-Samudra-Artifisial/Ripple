@@ -1,8 +1,9 @@
 import { InvocationError, InvocationErrorCode } from '@forge/events';
 import { requestMigration, runMigrations } from '../adapters/sql';
+import { runExtractJob } from './sources';
 import { notImplemented } from './stub';
 
-export const EXTRACT_QUEUE = 'extract';
+export { EXTRACT_QUEUE } from './sources';
 export const SEARCH_QUEUE = 'search';
 export const JUDGE_QUEUE = 'judge';
 export const DEMO_QUEUE = 'demo-seed';
@@ -44,8 +45,21 @@ export async function onPageEvent(event: PageEvent): Promise<void> {
   notImplemented('page change detection', { eventType: event.eventType, pageId: event.content?.id !== undefined ? String(event.content.id) : undefined });
 }
 
-export async function extractFacts(): Promise<void> {
-  notImplemented(`${EXTRACT_QUEUE} consumer`);
+interface ExtractEvent {
+  body?: { pageId?: unknown };
+  retryContext?: { retryCount?: number };
+}
+
+/** Consumer for `extract`: facts of one source page (body `{ pageId }`), see `runExtractJob`. */
+export async function extractFacts(event: ExtractEvent): Promise<InvocationError | void> {
+  const pageId = event.body?.pageId;
+  if (typeof pageId !== 'string' || !/^\d{1,32}$/.test(pageId)) {
+    console.warn('ripple extract: ignoring event without a valid page id');
+    return;
+  }
+  const outcome = await runExtractJob(pageId, event.retryContext?.retryCount ?? 0);
+  if (outcome.status === 'retry') return retryLater(outcome.seconds, outcome.reason);
+  if (outcome.status === 'skipped') console.info('ripple extract skipped', { pageId, reason: outcome.reason });
 }
 
 export async function searchCopies(): Promise<void> {

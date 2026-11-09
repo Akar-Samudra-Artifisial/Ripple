@@ -45,3 +45,79 @@ ul {
   margin: 4px 0;
   padding-left: 18px;
 }
+
+/* M1 source panel (minimal; to be polished) */
+.source {
+  margin-top: 12px;
+  border-top: 1px solid var(--ds-border, #dcdfe4);
+  padding-top: 8px;
+}
+
+.actions {
+  display: flex;
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.button {
+  padding: 4px 10px;
+  border: 1px solid var(--ds-border, #dcdfe4);
+  border-radius: 3px;
+  background: var(--ds-background-neutral, #f1f2f4);
+  color: var(--rp-ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.button--primary {
+  border-color: transparent;
+  background: var(--ds-background-brand-bold, #0c66e4);
+  color: var(--ds-text-inverse, #fff);
+}
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.facts {
+  list-style: none;
+  padding: 0;
+}
+
+.fact {
+  margin: 8px 0;
+  padding: 6px 8px;
+  border: 1px solid var(--ds-border, #dcdfe4);
+  border-radius: 3px;
+}
+
+.fact--rejected {
+  opacity: 0.6;
+}
+
+.quote {
+  margin: 4px 0;
+  padding-left: 8px;
+  border-left: 3px solid var(--ds-border, #dcdfe4);
+  color: var(--rp-muted);
+}
+
+.badge {
+  margin-left: 4px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--ds-background-neutral, #f1f2f4);
+  font-size: 11px;
+}
+
+.field {
+  display: block;
+  margin: 4px 0;
+}
+
+.field input {
+  display: block;
+  width: 100%;
+  font: inherit;
+}

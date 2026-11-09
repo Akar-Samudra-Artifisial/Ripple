@@ -5,6 +5,9 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 ## [Unreleased]
 
 ### Added
+- M1 (FR-1..3): tombol "Mark as source of truth" di byline (hanya untuk pengguna dengan izin edit halaman, dicek di server), lepas status sumber, status ekstraksi yang di-poll, dan daftar fakta dengan kutipan serta aksi Confirm/Edit/Reject.
+- Ekstraksi fakta di antrean `extract` lewat Forge LLM: maksimal 30 fakta per halaman, hanya jenis yang didukung, kutipan wajib ditemukan persis di teks halaman (fakta dengan kutipan palsu dibuang), dedup kunci identitas subjek + atribut + kondisi; ekstraksi ulang mempertahankan fakta yang sudah dikonfirmasi/diedit dan tidak menghidupkan lagi fakta yang ditolak.
+- Tabel Forge SQL `sources` dan `facts` (migrasi v003, v004) serta baris audit untuk mark/unmark, ekstraksi, dan tiap review fakta.
 - M0: app Ripple ditulis ulang dalam TypeScript dengan Custom UI (esbuild), test vitest, dan `forge lint` sebagai lint.
 - Byline "Ripple" di halaman Confluence menampilkan "Ripple is ready", progres setup database, dan tim pemilik space dari Teamwork Graph (`atlassianTeamsBySpace`).
 - Database Forge SQL dengan migrasi append-only lewat antrean `schema-migrate` (tabel `settings` dan `audit`), dijalankan otomatis saat install/upgrade.
