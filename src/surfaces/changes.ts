@@ -38,6 +38,7 @@ import type {
 import { isLlmRateLimited, LlmOutputError } from '../llm';
 import { runFactExtraction, type ChatToolFn } from '../llm/extract';
 import { pageJobKey } from '../adapters/jobKeys';
+import { issuesNeeded, jiraConfigured, syncIssuesOf, syncOtherChanges } from './changeIssues';
 import { enqueuePropose } from './proposals';
 import { EXTRACT_QUEUE, type SourceContext } from './sources';
 
@@ -147,10 +148,19 @@ export interface DiffDeps {
   /** Space id of a copy page as the app; null when unreadable. */
   spaceOf: (pageId: string) => Promise<string | null>;
   llm?: ChatToolFn;
+  /** M5: closes the Jira issues of changes whose proposals an undo rejected (never throws). Absent = none. */
+  syncIssues?: (changeIds: readonly string[]) => Promise<void>;
   ensure: () => Promise<void>;
 }
 
-const defaultDiffDeps: DiffDeps = { facts: sqlRepo, changes: sqlChangeRepo, page: getSourcePage, spaceOf: pageSpaceIdAsApp, ensure: ensureSchema };
+const defaultDiffDeps: DiffDeps = {
+  facts: sqlRepo,
+  changes: sqlChangeRepo,
+  page: getSourcePage,
+  spaceOf: pageSpaceIdAsApp,
+  syncIssues: (ids) => syncIssuesOf(ids),
+  ensure: ensureSchema,
+};
 
 /** Stored facts of the source with the text matching needs (key/origin from `storedFacts`, wording from `listFacts`). */
 async function knownFacts(facts: FactRepo, pageId: string): Promise<KnownFact[]> {
@@ -170,11 +180,13 @@ async function revertWordingOnly(pageId: string, deps: DiffDeps): Promise<void> 
   const reverts = wordingOnlyReverts(await deps.changes.confirmedChanges(pageId));
   let facts = 0;
   let copies = 0;
+  const rejectedIn: string[] = [];
   for (const r of reverts) {
     const done = await deps.changes.revertFactChange(pageId, r.change, r.copyIds, r.changeId);
     if (!done.reverted) continue;
     facts++;
     copies += done.copies;
+    if ((done.proposals ?? 0) > 0) rejectedIn.push(r.changeId);
     await deps.facts.audit('change.fact_reverted', null, 'change', r.changeId, {
       pageId,
       factId: r.change.factId,
@@ -185,6 +197,8 @@ async function revertWordingOnly(pageId: string, deps: DiffDeps): Promise<void> 
     });
   }
   if (facts > 0) console.info('ripple diff: wording-only confirmations undone', { pageId, facts, copies });
+  // M5: an undo may leave an owner with nothing to do: their issue closes as "reverted".
+  if (rejectedIn.length > 0 && deps.syncIssues) await deps.syncIssues(rejectedIn);
 }
 
 export const MAX_DIFF_RETRIES = 4;
@@ -321,6 +335,10 @@ export interface ChangeDeps {
   enqueuePropose?: (sourcePageId: string, changeId: string) => Promise<string>;
   /** M4: open proposals of older changes of these facts are rejected (`superseded`) once a newer change is confirmed. */
   supersedeProposals?: (sourcePageId: string, changeId: string, factIds: readonly string[]) => Promise<number>;
+  /** M5: closes Jira issues of the source's other changes after their proposals were superseded (never throws). */
+  syncOtherIssues?: (sourcePageId: string, changeId: string) => Promise<void>;
+  /** M5: a Jira project is configured (false on failure). Absent = false. */
+  jiraConfigured?: () => Promise<boolean>;
 }
 
 const defaultDeps: ChangeDeps = {
@@ -336,6 +354,8 @@ const defaultDeps: ChangeDeps = {
   now: () => new Date(),
   enqueuePropose: (sourcePageId, changeId) => enqueuePropose(sourcePageId, changeId),
   supersedeProposals: (sourcePageId, changeId, factIds) => sqlProposalRepo.supersedeOlder(sourcePageId, changeId, factIds),
+  syncOtherIssues: (sourcePageId, changeId) => syncOtherChanges(sourcePageId, changeId),
+  jiraConfigured: () => jiraConfigured(),
 };
 
 export type ChangeContext = SourceContext & { cloudId?: string; installContext?: string };
@@ -368,6 +388,8 @@ export interface HealDeps {
   proposalCount: (changeId: string) => Promise<number>;
   enqueueDiff: (pageId: string, version: number | null) => Promise<string>;
   enqueuePropose: (sourcePageId: string, changeId: string) => Promise<string>;
+  /** M5: the change has proposals but an owner's Jira issue is missing or failed (project configured). Absent = never. */
+  issuesNeeded?: (change: ChangeRow) => Promise<boolean>;
   now: () => number;
 }
 
@@ -377,6 +399,7 @@ const defaultHealDeps: HealDeps = {
   proposalCount: async (changeId) => (await sqlProposalRepo.listForChange(changeId)).length,
   enqueueDiff: (pageId, version) => enqueueDiff(pageId, version),
   enqueuePropose: (sourcePageId, changeId) => enqueuePropose(sourcePageId, changeId),
+  issuesNeeded: (change) => issuesNeeded(change),
   now: Date.now,
 };
 
@@ -413,7 +436,8 @@ export async function healSource(pageId: string, currentVersion: number | null, 
       if ((change.impact?.copies.length ?? 0) === 0) continue;
       const created = change.createdAt ? Date.parse(change.createdAt) : Number.NaN;
       if (!Number.isFinite(created) || now - created > HEAL_CHANGE_MAX_AGE_MS) continue;
-      if ((await deps.proposalCount(change.id)) > 0) continue;
+      // Proposals exist: the job only runs again for missing Jira issues (it skips the existing proposals).
+      if ((await deps.proposalCount(change.id)) > 0 && !(deps.issuesNeeded && (await deps.issuesNeeded(change)))) continue;
       await deps.enqueuePropose(pageId, change.id);
       proposeJobs++;
     }
@@ -540,11 +564,12 @@ async function summarise(ctx: ChangeContext, pageId: string, change: ChangeRow, 
     defaultDeadlineDays: DEFAULT_DEADLINE_DAYS,
     defaultDeadline: addWorkingDays(now, DEFAULT_DEADLINE_DAYS),
     canDecide,
+    jiraConfigured: false,
   };
   const routing: ChangeRouting = {
     deadline: view.defaultDeadline,
     pages: pages.map((p) => ({ pageId: p.pageId, spaceId: p.spaceId, ownerAccountId: p.owner.accountId, ownerRole: p.owner.role, copies: p.copies })),
-    spaces: spaces.map((s) => ({ spaceId: s.spaceId, teamIds: s.teams.map((t) => t.id), teamSource: s.teamSource })),
+    spaces: spaces.map((s) => ({ spaceId: s.spaceId, teamIds: s.teams.map((t) => t.id), teamSource: s.teamSource, teams: s.teams.map((t) => ({ id: t.id, name: t.name })) })),
   };
   return { view, routing };
 }
@@ -555,6 +580,7 @@ export async function getPendingChange(ctx: ChangeContext, deps: ChangeDeps = de
     const change = await deps.changes.pendingChange(pageId);
     if (!change) return { pageId, change: null };
     const { view } = await summarise(ctx, pageId, change, await deps.canEdit(pageId), deps);
+    if (deps.jiraConfigured) view.jiraConfigured = await deps.jiraConfigured();
     return { pageId, change: view };
   });
 }
@@ -650,6 +676,8 @@ export async function confirmChange(ctx: ChangeContext, payload: Partial<Confirm
     let proposalsSuperseded = 0;
     if (deps.supersedeProposals && applied.size > 0) proposalsSuperseded = await deps.supersedeProposals(pageId, change.id, [...applied]);
     if (proposalsSuperseded > 0) await deps.facts.audit('proposal.superseded', actor, 'change', change.id, { pageId, proposals: proposalsSuperseded });
+    // M5: owners of those older changes may have nothing left to do: their issues close as "superseded".
+    if (proposalsSuperseded > 0 && deps.syncOtherIssues) await deps.syncOtherIssues(pageId, change.id);
     // M4: edit proposals per copy (idempotent per change and copy, so a repeated confirm queues a no-op).
     let proposeJob: string | null = null;
     if ((impact?.copies.length ?? 0) > 0 && deps.enqueuePropose) {

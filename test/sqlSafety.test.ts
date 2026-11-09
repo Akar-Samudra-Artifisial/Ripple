@@ -24,6 +24,7 @@ vi.mock('@forge/sql', () => ({
   },
 }));
 
+import { sqlChangeIssueRepo } from '../src/adapters/changeIssueRepo';
 import { sqlChangeRepo } from '../src/adapters/changeRepo';
 import { MIGRATIONS } from '../src/core/migrations';
 import { sqlProposalRepo } from '../src/adapters/proposalRepo';
@@ -168,6 +169,26 @@ describe('migration identifiers (TiDB rejects unquoted reserved words with ER_PA
     expect(definedIdentifiers(bad)).toEqual(['t', 'id', 'delayed', 'idx_t']);
     expect(definedIdentifiers(bad).filter((n) => RESERVED.has(n))).toEqual(['delayed']);
     for (const m of MIGRATIONS.filter((x) => /^CREATE TABLE/i.test(x.statement.trim()))) expect(definedIdentifiers(m.statement).length, m.name).toBeGreaterThan(2);
+  });
+});
+
+describe('change_issues (M5)', () => {
+  it('claims with INSERT IGNORE, then takes over only failed or stale claims; bound values, no LIMIT', async () => {
+    affected = (s) => (s.startsWith('INSERT IGNORE') ? 0 : 1);
+    expect(await sqlChangeIssueRepo.claim('ch-1', 'acc-1', '9600001', 2)).toBe(true);
+    expect(calls[0]?.statement).toBe("INSERT IGNORE INTO change_issues (change_id, owner_account_id, source_page_id, page_count, status) VALUES (?, ?, ?, ?, 'creating')");
+    expect(calls[0]?.params).toEqual(['ch-1', 'acc-1', '9600001', 2]);
+    expect(calls[1]?.statement).toContain("(status = 'failed' OR (status = 'creating' AND updated_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 300 SECOND)))");
+    expect(calls[1]?.params).toEqual([2, 'ch-1', 'acc-1']);
+    affected = () => 0;
+    expect(await sqlChangeIssueRepo.claim('ch-1', 'acc-1', '9600001', 2)).toBe(false);
+    await sqlChangeIssueRepo.complete('ch-1', 'acc-1', { id: '10', key: 'OPS-1', url: 'https://x/browse/OPS-1', assigneeSet: false });
+    await sqlChangeIssueRepo.setStatus('ch-1', 'acc-1', 'created', 'closed');
+    await sqlChangeIssueRepo.saveJiraSettings({ projectKey: 'OPS' });
+    await sqlChangeIssueRepo.byIssueKey('OPS-1');
+    expect(calls.some((c) => /LIMIT/i.test(c.statement))).toBe(false);
+    expect(calls.find((c) => c.statement.startsWith("UPDATE change_issues SET status = 'created'"))?.params).toEqual(['10', 'OPS-1', 'https://x/browse/OPS-1', 0, 'ch-1', 'acc-1']);
+    expect(calls.find((c) => c.statement.startsWith('INSERT INTO settings'))?.params).toEqual(['jira', '{"projectKey":"OPS"}']);
   });
 });
 

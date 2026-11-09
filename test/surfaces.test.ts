@@ -91,14 +91,15 @@ describe('migrations', () => {
       'v024_proposals_change_copy_unique',
       'v025_create_propose_requeues',
       'v026_create_space_team_cache',
+      'v027_create_change_issues',
     ]);
-    expect(LATEST_MIGRATION).toBe('v026_create_space_team_cache');
+    expect(LATEST_MIGRATION).toBe('v027_create_change_issues');
   });
 });
 
 describe('schemaView', () => {
   it('reports ready, setting up and errors', async () => {
-    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 26, total: 26, latest: LATEST_MIGRATION });
+    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 27, total: 27, latest: LATEST_MIGRATION });
     expect(
       await schemaView(async () => {
         throw new SchemaSettingUpError(1, 4);

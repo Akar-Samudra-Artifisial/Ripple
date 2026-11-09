@@ -53,6 +53,8 @@ import { isLlmRateLimited, isLlmRetryable } from '../llm';
 import type { ChatToolFn } from '../llm/extract';
 import { rewriteSentence } from '../llm/rewrite';
 import { proposeJobKey } from '../adapters/jobKeys';
+import { sqlChangeIssueRepo, type ChangeIssueRepo } from '../adapters/changeIssueRepo';
+import { createIssuesForChange, rolloutIssues, syncIssuesOf } from './changeIssues';
 import { EXTRACT_QUEUE, type SourceContext } from './sources';
 
 const errorText = (err: unknown): string => scrubErrorText(err instanceof Error ? err.message : String(err));
@@ -94,10 +96,19 @@ export interface ProposeDeps {
   /** Copy page with its storage body, as the app. */
   page: (pageId: string) => Promise<SourcePage>;
   llm?: ChatToolFn;
+  /** M5: Jira issues of the change, after a full run (never throws). Absent = none. */
+  createIssues?: (changeId: string) => Promise<unknown>;
   ensure: () => Promise<void>;
 }
 
-const defaultProposeDeps: ProposeDeps = { changes: sqlChangeRepo, proposals: sqlProposalRepo, facts: sqlRepo, page: getSourcePage, ensure: ensureSchema };
+const defaultProposeDeps: ProposeDeps = {
+  changes: sqlChangeRepo,
+  proposals: sqlProposalRepo,
+  facts: sqlRepo,
+  page: getSourcePage,
+  createIssues: (changeId) => createIssuesForChange(changeId),
+  ensure: ensureSchema,
+};
 
 export const MAX_PROPOSE_RETRIES = 4;
 const backoff = (retryCount: number): number => 30 * 2 ** retryCount;
@@ -226,6 +237,8 @@ export async function runProposeJob(
       await deps.facts.audit(action, null, 'proposal', saved.id, { changeId: change.id, pageId: copy.pageId, method: draft.method, errorCode: draft.errorCode, repeat: !saved.created });
     }
     console.info('ripple propose done', { changeId, copies: targets.length, ...out });
+    // M5: one Jira issue per owner, once the proposals exist (a re-propose of one page creates none).
+    if (scope === undefined && deps.createIssues) await deps.createIssues(change.id);
     return { status: 'done', ...out };
   } catch (err) {
     if (err instanceof RetryLater) return { status: 'retry', seconds: backoff(retryCount), reason: err.reason };
@@ -251,6 +264,10 @@ export interface ProposalDeps {
   sourceIsOpen: (pageId: string) => Promise<boolean>;
   /** Display names as the viewer may see them (users-bulk, as the user). */
   names: (accountIds: readonly string[]) => Promise<Map<string, string>>;
+  /** M5: closes the Jira issues of these changes whose owner has nothing left to do (never throws). Absent = none. */
+  syncIssues?: (changeIds: readonly string[]) => Promise<void>;
+  /** M5: issue rows and settings for the Rollout. Absent = not configured. */
+  issues?: Pick<ChangeIssueRepo, 'listForChange' | 'getJiraSettings'>;
   ensure: () => Promise<void>;
 }
 
@@ -265,8 +282,15 @@ const defaultDeps: ProposalDeps = {
   enqueuePropose,
   sourceIsOpen: pageIsOpen,
   names: (ids) => displayNames(ids),
+  syncIssues: (ids) => syncIssuesOf(ids),
+  issues: sqlChangeIssueRepo,
   ensure: ensureSchema,
 };
+
+/** Proposals reached a final state: the changes' Jira issues may close. */
+async function afterDecision(deps: ProposalDeps, changeIds: readonly string[]): Promise<void> {
+  if (deps.syncIssues && changeIds.length > 0) await deps.syncIssues(changeIds);
+}
 
 function pageIdOf(ctx: SourceContext): string | undefined {
   const id = ctx.extension?.content?.id;
@@ -433,13 +457,16 @@ export async function approveProposal(ctx: SourceContext, payload: Partial<Appro
       const now = await deps.proposals.get(p.id);
       return decision(now ?? p);
     }
+    let result: ProposalDecision;
     try {
-      return await applyLocked(deps, actor, pageId, { ...p, oldSentence: p.oldSentence, pageVersion: p.pageVersion }, sentence, edited);
+      result = await applyLocked(deps, actor, pageId, { ...p, oldSentence: p.oldSentence, pageVersion: p.pageVersion }, sentence, edited);
     } catch (err) {
       // Never leave the lock held: back to `proposed` so the editor can try again (no-op once applied).
       await deps.proposals.setStatus(p.id, ['approved'], 'proposed', 'http_error').catch(() => false);
       throw err;
     }
+    if (result.status === 'applied' || result.status === 'rejected') await afterDecision(deps, [p.changeId]);
+    return result;
   });
 }
 
@@ -500,13 +527,19 @@ export async function approveAll(ctx: SourceContext, deps: ProposalDeps = defaul
     const all: ProposalRow[] = [];
     for (const p of open) if (await deps.proposals.lock(p.id)) all.push(p);
     if (all.length === 0) return result;
+    let reply: ApproveAllResult | ErrorReply;
     try {
-      return await applyAllLocked(deps, actor, pageId, all, result);
+      reply = await applyAllLocked(deps, actor, pageId, all, result);
     } catch (err) {
       // Never leave locks held: whatever is still `approved` goes back to `proposed`.
       for (const p of all) await deps.proposals.setStatus(p.id, ['approved'], 'proposed', 'http_error').catch(() => false);
       throw err;
     }
+    await afterDecision(
+      deps,
+      all.map((p) => p.changeId),
+    );
+    return reply;
   });
 }
 
@@ -581,6 +614,7 @@ export async function rejectProposal(ctx: SourceContext, payload: Partial<Propos
     const { proposal: p, actor } = r;
     if (await deps.proposals.setStatus(p.id, ['proposed', 'stale', 'needs_manual', 'failed'], 'rejected', null)) {
       await deps.facts.audit('proposal.rejected', actor, 'proposal', p.id, { changeId: p.changeId, pageId, reason: 'rejected' });
+      await afterDecision(deps, [p.changeId]);
       return { proposalId: p.id, status: 'rejected', errorCode: null, version: null };
     }
     return decision((await deps.proposals.get(p.id)) ?? p);
@@ -596,6 +630,7 @@ export async function markNotSameFact(ctx: SourceContext, payload: Partial<Propo
     if (!(await deps.proposals.setStatus(p.id, ['proposed', 'stale', 'needs_manual', 'failed'], 'rejected', null))) return decision((await deps.proposals.get(p.id)) ?? p);
     await deps.proposals.ignoreCopy(p.copyId);
     await deps.facts.audit('proposal.rejected', actor, 'proposal', p.id, { changeId: p.changeId, pageId, reason: 'not_same_fact' });
+    await afterDecision(deps, [p.changeId]);
     return { proposalId: p.id, status: 'rejected', errorCode: null, version: null };
   });
 }
@@ -685,7 +720,16 @@ export async function listRollout(ctx: SourceContext, payload: Partial<ChangeIdO
     });
     const counts: Rollout['counts'] = {};
     for (const p of shown) counts[p.status] = (counts[p.status] ?? 0) + 1;
-    return { changeId, items, counts, hiddenCount: rows.length - shown.length };
+    let issues: Pick<Rollout, 'issues' | 'issuesState'> = { issues: [], issuesState: 'not_configured' };
+    if (deps.issues) {
+      try {
+        issues = await rolloutIssues(change, rows, names, deps.issues);
+      } catch (err) {
+        console.warn('ripple rollout: issues failed', { changeId, error: errorText(err) });
+        issues = { issues: [], issuesState: 'pending' };
+      }
+    }
+    return { changeId, items, counts, hiddenCount: rows.length - shown.length, ...issues };
   });
 }
 

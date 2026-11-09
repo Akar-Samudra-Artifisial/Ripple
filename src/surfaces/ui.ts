@@ -11,7 +11,8 @@ import { approveAll, approveProposal, listProposalsForPage, listRollout, markNot
 import type { ApproveProposalPayload, ChangeIdOnlyPayload, ProposalIdPayload } from '../core/views';
 import type { BylineStatus, ChangeIdPayload, ConfirmChangePayload, CopyListPayload, PendingChangeFlag, FactEditPayload, FactIdPayload, OwnerView, SchemaView, SpaceTeamsView } from '../core/views';
 import { confirmFact, editFact, getSourceStatus, listFacts, markSource, rejectFact, unmarkSource, type SourceContext } from './sources';
-import { notImplemented } from './stub';
+import { getApproval, getSettings, saveSettings, type ApprovalContext, type SettingsContext } from './changeIssues';
+import type { SaveSettingsPayload } from '../core/views';
 
 export type ResolverContext = {
   accountId?: string;
@@ -162,7 +163,9 @@ resolver.define('rejectProposal', ({ context, payload }) => rejectProposal(conte
 resolver.define('markNotSameFact', ({ context, payload }) => markNotSameFact(context as SourceContext, payload as Partial<ProposalIdPayload>));
 resolver.define('approveAll', ({ context }) => approveAll(context as SourceContext));
 resolver.define('listRollout', ({ context, payload }) => listRollout(context as SourceContext, payload as Partial<ChangeIdOnlyPayload>));
-resolver.define('getSettings', () => notImplemented('settings'));
-resolver.define('getApproval', () => notImplemented('approval panel'));
+// M5: Jira project for update tasks (Confluence global settings) and the read-only Jira issue panel.
+resolver.define('getSettings', ({ context }) => getSettings(context as SettingsContext));
+resolver.define('saveSettings', ({ context, payload }) => saveSettings(context as SettingsContext, payload as Partial<SaveSettingsPayload>));
+resolver.define('getApproval', ({ context }) => getApproval(context as ApprovalContext));
 
 export const handler = resolver.getDefinitions();

@@ -194,6 +194,24 @@ const restrictedBy = (r: RawRestrictions): boolean => {
 };
 
 /**
+ * Title and absolute URL (`_links.base` + `_links.webui`) of a page as the app, for links outside Confluence (Jira
+ * issues). Null when the page cannot be read. Never throws.
+ */
+export async function pageLinkAsApp(pageId: string): Promise<{ title: string; url: string | null } | null> {
+  try {
+    const res = await api.asApp().requestConfluence(route`/wiki/api/v2/pages/${pageId}`, { headers: { Accept: 'application/json' } });
+    if (!res.ok) return null;
+    const page = (await res.json()) as { title?: string; _links?: { base?: string; webui?: string } };
+    const base = page._links?.base;
+    const webui = page._links?.webui;
+    const url = base && webui && /^https:\/\//.test(base) && webui.startsWith('/') ? `${base}${webui}` : null;
+    return { title: page.title ?? '', url };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * True when the page's title may be named to anyone (version messages): the app reads its space, and neither the
  * page nor any ancestor has a read restriction (REST v1 `restriction/byOperation/read`, as the app). Any failure
  * counts as restricted. Space permissions themselves cannot be read with the app's scopes.

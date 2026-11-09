@@ -326,6 +326,15 @@ describe('runProposeJob', () => {
     expect(model.calls).toBe(2);
   });
 
+  it('M5: a full run creates the change issues afterwards; a re-propose of one page does not', async () => {
+    const issued: string[] = [];
+    const d = { ...proposeDeps(), createIssues: async (id: string) => void issued.push(id) };
+    await runProposeJob(CHANGE_ID, undefined, 0, d);
+    await runProposeJob(CHANGE_ID, { copyPageId: PAGE_A }, 0, d);
+    await runProposeJob(CHANGE_ID, cid(1), 0, d);
+    expect(issued).toEqual([CHANGE_ID]);
+  });
+
   it('needs a manual edit when the sentence is gone, split by markup or the change is not confirmed', async () => {
     store.pages.set(PAGE_A, { title: 'Onboarding', version: 7, body: `<p>Domestic trips get a per diem of $<em>6</em>0 per day.</p><p>${S2}</p><p>${S2}</p>` });
     store.copies[0] = { ...(store.copies[0] as Copy), quote: S1 };
@@ -446,6 +455,25 @@ describe('proposal resolvers', () => {
     expect(rollout.hiddenCount).toBe(2);
     expect(rollout.counts).toEqual({ proposed: 2 });
     expect(await listRollout(ctx(PAGE_A), { changeId: CHANGE_ID }, deps())).toEqual({ error: expect.stringContaining('does not belong') });
+  });
+
+  it('M5: decisions sync the change issues; the rollout carries its issues', async () => {
+    const synced: string[][] = [];
+    const d = deps({ syncIssues: async (ids) => void synced.push([...ids]) });
+    await rejectProposal(ctx(PAGE_A), { proposalId: byCopy(1).id }, d);
+    await markNotSameFact(ctx(PAGE_A), { proposalId: byCopy(2).id }, d);
+    await approveProposal(ctx(PAGE_B), { proposalId: byCopy(3).id }, d);
+    await approveAll(ctx(PAGE_B), d);
+    expect(synced).toEqual([[CHANGE_ID], [CHANGE_ID], [CHANGE_ID]]);
+    expect(((await listRollout(ctx(SOURCE), { changeId: CHANGE_ID }, deps())) as Rollout).issuesState).toBe('not_configured');
+    const issues = {
+      getJiraSettings: async () => ({ projectKey: 'OPS' }),
+      listForChange: async () => [
+        { changeId: CHANGE_ID, ownerAccountId: 'acc-owner', sourcePageId: SOURCE, issueId: '1', issueKey: 'OPS-1', issueUrl: 'https://x/browse/OPS-1', assigneeSet: true, pageCount: 1, status: 'closed' as const },
+      ],
+    };
+    const rollout = (await listRollout(ctx(SOURCE), { changeId: CHANGE_ID }, deps({ issues }))) as Rollout;
+    expect(rollout.issues).toEqual([{ ownerName: null, issueKey: 'OPS-1', issueUrl: 'https://x/browse/OPS-1', status: 'done', pageCount: 1 }]);
   });
 });
 

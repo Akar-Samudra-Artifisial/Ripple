@@ -15,7 +15,7 @@ export interface ChangeRouting {
   deadline: string;
   pages: { pageId: string; spaceId: string | null; ownerAccountId: string | null; ownerRole: 'owner' | 'author' | null; copies: number }[];
   /** `unknown`: the teams could not be read at confirm time (no team ids recorded; resolve again before routing). */
-  spaces: { spaceId: string; teamIds: string[]; teamSource: TeamSource }[];
+  spaces: { spaceId: string; teamIds: string[]; teamSource: TeamSource; /** Names for the Jira issue (M5); absent on older changes. */ teams?: { id: string; name: string }[] }[];
 }
 
 export interface ChangeRow {

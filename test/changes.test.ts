@@ -296,6 +296,22 @@ describe('healSource (jobs that were never delivered)', () => {
     expect(queued).toEqual([]);
   });
 
+  it('M5: re-queues a change with proposals only when an owner issue is missing (recent changes only)', async () => {
+    const asked: string[] = [];
+    const { deps, queued } = healDeps({
+      proposalCount: async () => 2,
+      issuesNeeded: async (c) => {
+        asked.push(c.id);
+        return c.id === 'ch-v11';
+      },
+      now: () => NOW + 20 * 60_000,
+    });
+    expect(await healSource('9502721', 11, deps)).toEqual({ diffJob: null, proposeJobs: 1 });
+    expect(queued).toEqual(['propose 9502721 ch-v11']);
+    // The old change (> 7 days) and the change without copies are never checked.
+    expect(asked).toEqual(['ch-v11']);
+  });
+
   it('ignores pages that are not a source and never throws', async () => {
     const { deps, queued } = healDeps({ facts: { getSource: async () => undefined } });
     expect(await healSource('123', 5, deps)).toBeNull();
@@ -878,14 +894,14 @@ describe('change resolvers', () => {
     const flaky = () => async () => (++calls === 1 ? failed : { body: teams });
     await confirmChange(ctx, { changeId: id, version: 4 }, changeDeps({ graph: flaky }));
     expect(calls).toBe(2);
-    expect(store.changes.get(id)?.routing?.spaces).toEqual([{ spaceId: 'S-9600001', teamIds: ['team-1'], teamSource: 'teamwork_graph' }]);
+    expect(store.changes.get(id)?.routing?.spaces).toEqual([{ spaceId: 'S-9600001', teamIds: ['team-1'], teamSource: 'teamwork_graph', teams: [{ id: 'team-1', name: 'People Ops' }] }]);
   });
 
   it('confirm with teams still unreadable records them as unknown', async () => {
     const id = await pendingId();
     const failed = { body: { errors: [{ message: 'denied' }], data: null } };
     await confirmChange(ctx, { changeId: id, version: 4 }, changeDeps({ graph: () => async () => failed }));
-    expect(store.changes.get(id)?.routing?.spaces).toEqual([{ spaceId: 'S-9600001', teamIds: [], teamSource: 'unknown' }]);
+    expect(store.changes.get(id)?.routing?.spaces).toEqual([{ spaceId: 'S-9600001', teamIds: [], teamSource: 'unknown', teams: [] }]);
     expect(store.audits.find((a) => a.action === 'change.confirmed')?.detail).toMatchObject({ teamSource: { unknown: 1 } });
   });
 
@@ -922,7 +938,7 @@ describe('change resolvers', () => {
     expect(row?.routing).toEqual({
       deadline: '2026-11-12',
       pages: [{ pageId: '9600001', spaceId: 'S-9600001', ownerAccountId: 'owner-9600001', ownerRole: 'owner', copies: 1 }],
-      spaces: [{ spaceId: 'S-9600001', teamIds: ['team-1'], teamSource: 'teamwork_graph' }],
+      spaces: [{ spaceId: 'S-9600001', teamIds: ['team-1'], teamSource: 'teamwork_graph', teams: [{ id: 'team-1', name: 'People Ops' }] }],
     });
     const audit = store.audits.find((a) => a.action === 'change.confirmed');
     expect(audit?.detail).toMatchObject({ factsUpdated: 1, deadlineDays: 3, ownerSource: { owner: 1 }, teamSource: { teamwork_graph: 1 } });

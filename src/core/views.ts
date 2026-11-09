@@ -297,6 +297,8 @@ export interface PendingChangeView {
   defaultDeadline: string;
   /** Edit permission on the source (required to confirm or dismiss). */
   canDecide: boolean;
+  /** M5: a Jira project is set in Ripple settings; false = confirming creates no update tasks (show a note). */
+  jiraConfigured: boolean;
 }
 
 /** Reply of `getPendingChange`; `change` is null when nothing waits. */
@@ -417,6 +419,60 @@ export interface Rollout {
   items: RolloutItem[];
   counts: Partial<Record<ProposalState, number>>;
   hiddenCount: number;
+  /** M5: Jira update tasks of this change (one per copy-page owner). */
+  issues: RolloutIssue[];
+  /**
+   * `not_configured`: no Jira project in Ripple settings; `pending`: being created (or not yet); `created`: every
+   * owner who needs one has one (also when no owner needs one); `partial`: some failed or missing; `failed`: all failed.
+   */
+  issuesState: IssuesStateView;
+}
+
+export type IssuesStateView = 'not_configured' | 'pending' | 'created' | 'partial' | 'failed';
+
+export interface RolloutIssue {
+  /** Null when the owner's name is not visible to the viewer (no page of theirs the viewer can open). */
+  ownerName: string | null;
+  issueKey: string;
+  issueUrl: string | null;
+  /** `done`: Ripple closed it (every page of the owner updated, declined, superseded or reverted). */
+  status: 'open' | 'done';
+  pageCount: number;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// M5: settings (Confluence global settings page) and the Jira issue panel
+// ---------------------------------------------------------------------------------------------------------------
+
+export interface SettingsView {
+  /** Jira project for update tasks; null = no issues are created. */
+  jiraProjectKey: string | null;
+  /** The viewer may save (Jira administrators). */
+  canEdit: boolean;
+}
+
+export interface SaveSettingsPayload {
+  /** Project key (e.g. `OPS`); empty or null turns update tasks off. */
+  jiraProjectKey: string | null;
+}
+
+export interface SaveSettingsResult {
+  ok: boolean;
+  /** `invalid_key`, `not_allowed`, `project_not_found`, `jira_unavailable` (Ripple not installed in Jira), `jira_error`. */
+  errorCode: 'invalid_key' | 'not_allowed' | 'project_not_found' | 'jira_unavailable' | 'jira_error' | null;
+}
+
+/** Reply of `getApproval` (Jira issue panel, read-only); `task` is null for issues Ripple did not create. */
+export interface ApprovalView {
+  issueKey: string;
+  task: {
+    changeId: string;
+    deadline: string | null;
+    closed: boolean;
+    /** Owner's pages; title null when the page may not be named to everyone (shown as "Page <id>"). */
+    pages: { pageId: string; title: string | null; url: string | null; open: number; applied: number }[];
+    morePages: number;
+  } | null;
 }
 
 /** Resolver name → payload and success reply. Every resolver may also answer `ErrorReply`. */
@@ -430,8 +486,14 @@ export interface ResolverContract {
   markNotSameFact: { payload: ProposalIdPayload; reply: ProposalDecision };
   /** Applies every open proposal of the page in one version. */
   approveAll: { payload: undefined; reply: ApproveAllResult };
-  /** On the source page: proposals of one of its changes. */
+  /** On the source page: proposals of one of its changes, with its Jira update tasks. */
   listRollout: { payload: ChangeIdOnlyPayload; reply: Rollout };
+  /** Ripple settings page (Confluence global settings). */
+  getSettings: { payload: undefined; reply: SettingsView };
+  /** Jira administrators only; the project must exist and be visible to the app. */
+  saveSettings: { payload: SaveSettingsPayload; reply: SaveSettingsResult };
+  /** Jira issue panel: the update task's pages (read-only). */
+  getApproval: { payload: undefined; reply: ApprovalView };
   /** On the source page: the latest confirmed change (for the Rollout tab). */
   getLatestChange: { payload: undefined; reply: LatestChangeReply };
   getPendingChange: { payload: undefined; reply: PendingChangeReply };

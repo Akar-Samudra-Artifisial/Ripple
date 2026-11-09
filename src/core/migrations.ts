@@ -265,6 +265,26 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
       PRIMARY KEY (space_id)
     )`,
   },
+  // M5: one Jira issue per copy-page owner per confirmed change. The row is the claim (`creating`) that keeps a
+  // redelivered job from creating a second issue; `failed` / an old `creating` row may be claimed again.
+  {
+    name: 'v027_create_change_issues',
+    statement: `CREATE TABLE IF NOT EXISTS change_issues (
+      change_id VARCHAR(36) NOT NULL,
+      owner_account_id VARCHAR(128) NOT NULL,
+      source_page_id VARCHAR(32) NOT NULL,
+      issue_id VARCHAR(32) NULL,
+      issue_key VARCHAR(64) NULL,
+      issue_url VARCHAR(512) NULL,
+      assignee_set TINYINT(1) NOT NULL DEFAULT 0,
+      page_count INT NOT NULL DEFAULT 0,
+      status VARCHAR(16) NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (change_id, owner_account_id),
+      KEY idx_change_issues_key (issue_key)
+    )`,
+  },
 ];
 
 /** Name of the newest migration; the byline reports it so admins can confirm the schema is current. */
