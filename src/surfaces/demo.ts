@@ -2,8 +2,9 @@
  * M6 "Load demo data" (Ripple settings page, Jira administrators only): creates the Nimbus Labs spaces and pages of
  * `src/demo/nimbus.ts` as the caller. Loads in steps within a time budget per resolver call and keeps its progress in
  * the `settings` table, so the UI calls again until `done`, and a repeated load finds what it created before (spaces
- * by key carrying `DEMO_MARKER`, pages by title in those spaces) instead of creating it twice. A space with a demo key
- * that Ripple did not create is never used (`space_key_taken`). One load runs at a time (a lease in the state, taken
+ * by key carrying `DEMO_MARKER` and this installation's demo id, pages by title in those spaces) instead of creating it
+ * twice. A space with a demo key that Ripple did not create is never used (`space_key_taken`), nor one marked by
+ * another installation or without a demo id (`foreign_space`). One load runs at a time (a lease in the state, taken
  * and checked with compare-and-swap). Logs carry ids, counts and enums only (never account ids).
  */
 import { randomUUID } from 'node:crypto';
@@ -36,6 +37,8 @@ export interface DemoDeps {
   ensure: () => Promise<void>;
   now: () => number;
   newLease: () => string;
+  /** Random demo id of the installation (`DemoState.nonce`), made once. */
+  newNonce: () => string;
   budgetMs: number;
   /** Deletes Ripple's data of a source page (the `unmarkSource` path) and audits it; idempotent. */
   removeSource: (pageId: string, actor: string | null) => Promise<void>;
@@ -49,6 +52,7 @@ const defaultDemoDeps: DemoDeps = {
   ensure: defaultSettingsDeps.ensure,
   now: () => Date.now(),
   newLease: () => randomUUID(),
+  newNonce: () => randomUUID(),
   budgetMs: DEMO_BUDGET_MS,
   removeSource: async (pageId, actor) => {
     if (!(await sqlRepo.getSource(pageId))) return;
@@ -144,22 +148,44 @@ export async function checkDemoOwners(ctx: SettingsContext, payload: Partial<Che
 
 type Step<T> = { ok: true; value: T } | { ok: false; code: string };
 
-const ours = (s: DemoSpaceRef): Step<DemoRef> => (s.description.includes(DEMO_MARKER) ? { ok: true, value: { id: s.id, url: s.url } } : { ok: false, code: 'space_key_taken' });
+/** Written after `DEMO_MARKER` into the description of each space a load creates. */
+export const demoIdTag = (nonce: string): string => `Ripple demo id: ${nonce}.`;
+const DEMO_ID = /\bRipple demo id: ([A-Za-z0-9-]+)/;
 
 /**
- * Finds the space by key, else creates it (its description carries `DEMO_MARKER`); a failed create is looked up again
- * (a concurrent load made it). A found space without the marker belongs to someone else: `space_key_taken`.
+ * `ours`: marked with this installation's demo id; `legacy`: marked but without any demo id (created by 8.33.0–8.36.0);
+ * `foreign`: marked with another installation's id; `unmarked`: no `DEMO_MARKER` at all.
  */
-async function ensureSpace(c: DemoConfluence, s: NimbusSpace, deleted: ReadonlySet<string>): Promise<Step<DemoRef>> {
+function markOf(space: DemoSpaceRef, nonce: string | undefined): 'ours' | 'legacy' | 'foreign' | 'unmarked' {
+  if (!space.description.includes(DEMO_MARKER)) return 'unmarked';
+  const id = DEMO_ID.exec(space.description)?.[1];
+  if (id === undefined) return 'legacy';
+  return nonce !== undefined && id === nonce ? 'ours' : 'foreign';
+}
+
+/** A space found (not recorded) by a load is adopted only when it carries this installation's demo id. */
+function ours(s: DemoSpaceRef, nonce: string): Step<DemoRef> {
+  const mark = markOf(s, nonce);
+  if (mark === 'ours') return { ok: true, value: { id: s.id, url: s.url } };
+  return { ok: false, code: mark === 'unmarked' ? 'space_key_taken' : 'foreign_space' };
+}
+
+/**
+ * Finds the space by key, else creates it (its description carries `DEMO_MARKER` and the demo id); a failed create is
+ * looked up again (a concurrent load made it). A found space without the marker belongs to someone else
+ * (`space_key_taken`); one with the marker but another or no demo id is not adopted either (`foreign_space`). Spaces
+ * recorded in the state, including those of 8.33.0–8.36.0 without a demo id, are never looked up again by a load.
+ */
+async function ensureSpace(c: DemoConfluence, s: NimbusSpace, deleted: ReadonlySet<string>, nonce: string): Promise<Step<DemoRef>> {
   const found = await c.findSpace(s.key);
   if (!found.ok) return { ok: false, code: `space_find_http_${found.status}` };
   if (found.value && deleted.has(found.value.id)) return { ok: false, code: 'space_being_deleted' };
-  if (found.value) return ours(found.value);
-  const created = await c.createSpace(s.key, s.name, s.description);
+  if (found.value) return ours(found.value, nonce);
+  const created = await c.createSpace(s.key, s.name, `${s.description} ${demoIdTag(nonce)}`);
   if (created.ok) return { ok: true, value: created.value };
   const again = await c.findSpace(s.key);
   if (again.ok && again.value && deleted.has(again.value.id)) return { ok: false, code: 'space_being_deleted' };
-  return again.ok && again.value ? ours(again.value) : { ok: false, code: `space_create_http_${created.status}` };
+  return again.ok && again.value ? ours(again.value, nonce) : { ok: false, code: `space_create_http_${created.status}` };
 }
 
 /** Pages are only looked up in spaces Ripple created (recorded or marked), so a found page is a demo page. */
@@ -204,6 +230,7 @@ export async function loadDemoData(ctx: SettingsContext, payload: Partial<LoadDe
       ...(current ?? { spaces: {}, pages: {}, ownerAccountIds: [], rev: 0 }),
       state: 'loading',
       errorCode: null,
+      nonce: current?.nonce ?? deps.newNonce(),
       lease,
       lockedUntil: started + DEMO_LEASE_MS,
       rev: (current?.rev ?? 0) + 1,
@@ -235,7 +262,7 @@ export async function loadDemoData(ctx: SettingsContext, payload: Partial<LoadDe
       for (const s of NIMBUS_SPACES) {
         if (state.spaces[s.key]) continue;
         if (spent()) return await release();
-        const r = await ensureSpace(deps.confluence, s, new Set(state.deletedSpaceIds ?? []));
+        const r = await ensureSpace(deps.confluence, s, new Set(state.deletedSpaceIds ?? []), state.nonce ?? '');
         if (!r.ok) return await fail(r.code);
         state.spaces[s.key] = { id: r.value.id, url: r.value.url };
         await save();
@@ -281,13 +308,18 @@ export async function loadDemoData(ctx: SettingsContext, payload: Partial<LoadDe
 }
 
 /**
- * "Remove demo data" (Jira administrators, same gate as the load): deletes only the demo spaces Ripple created, i.e.
- * recorded in the demo state with the same id AND carrying `DEMO_MARKER` in their description; any other space with a
- * demo key is left alone and reported in `keptSpaces`. First the Ripple data of the demo source goes (the
- * `unmarkSource` path), then the spaces (REST v1 DELETE as the caller, a background task in Confluence), then the
- * state is reset to `removed` (pages, spaces and owners empty) so the next load starts from scratch. Holds the load
- * lease meanwhile. Idempotent: a space already gone counts as removed; a failed step keeps what is left recorded and
- * pressing again continues. Logs counts and enums only.
+ * "Remove demo data" (Jira administrators, same gate as the load): deletes only the demo spaces this installation
+ * created, i.e. recorded in the demo state with the same id AND carrying `DEMO_MARKER` with this installation's demo id
+ * (`DemoState.nonce`). Migration: spaces of 8.33.0–8.36.0 carry the marker without any demo id; they are removed only
+ * when their id is recorded in the current state (a marker with another demo id never is). Any other space with a demo
+ * key is left alone and reported in `keptSpaces`. The Ripple data of the demo source (the `unmarkSource` path) goes
+ * only once its space (NLHR) is proven ours or already gone. Each space is looked up again right before its DELETE
+ * (REST v1 by key as the caller, a background task in Confluence) and must still have the same id and mark. Remaining
+ * risk (TOCTOU): the DELETE takes a key, not an id, so a space deleted and re-created under the same key in the
+ * moment between that lookup and the DELETE would be deleted; that needs space admin rights in Confluence and a
+ * window of one request. Then the state is reset to `removed` (pages, spaces and owners empty; the demo id is kept) so
+ * the next load starts from scratch. Holds the load lease meanwhile. Idempotent: a space already gone counts as
+ * removed; a failed step keeps what is left recorded and pressing again continues. Logs counts and enums only.
  */
 export async function removeDemoData(ctx: SettingsContext, deps: DemoDeps = defaultDemoDeps): Promise<DemoRemoveResult | ErrorReply> {
   return guard(ctx, deps, 'remove the demo data', async () => {
@@ -320,9 +352,13 @@ export async function removeDemoData(ctx: SettingsContext, deps: DemoDeps = defa
     const kept: string[] = [];
     const deleted = new Set(state.deletedSpaceIds ?? []);
     let failure: string | null = null;
+    /** Recorded with this id AND marked with this installation's demo id (or, for 8.33.0–8.36.0 spaces, with none). */
+    const owned = (key: string, space: DemoSpaceRef): boolean => {
+      const mark = markOf(space, state.nonce);
+      return state.spaces[key]?.id === space.id && (mark === 'ours' || mark === 'legacy');
+    };
     try {
       const sourceId = state.pages[NIMBUS_SOURCE.slug]?.id;
-      if (sourceId) await deps.removeSource(sourceId, ctx.accountId ?? null);
       for (const s of NIMBUS_SPACES) {
         const recorded = state.spaces[s.key];
         const found = await deps.confluence.findSpace(s.key);
@@ -332,11 +368,23 @@ export async function removeDemoData(ctx: SettingsContext, deps: DemoDeps = defa
         }
         const space = found.value;
         if (space && deleted.has(space.id)) continue; // asked before, Confluence is still deleting it
-        if (space && !(recorded && recorded.id === space.id && space.description.includes(DEMO_MARKER))) {
+        if (space && !owned(s.key, space)) {
           kept.push(s.key);
           continue;
         }
+        // The space is ours (or gone): only now Ripple's data of the source in it goes.
+        if (s.key === NIMBUS_SOURCE.space && sourceId) await deps.removeSource(sourceId, ctx.accountId ?? null);
         if (space) {
+          // Looked up again right before the DELETE (by key): still the same space, still ours.
+          const again = await deps.confluence.findSpace(s.key);
+          if (!again.ok) {
+            failure = `space_find_http_${again.status}`;
+            break;
+          }
+          if (again.value && (again.value.id !== space.id || !owned(s.key, again.value))) {
+            kept.push(s.key);
+            continue;
+          }
           const r = await deps.confluence.deleteSpace(s.key);
           if (!r.ok) {
             failure = `space_delete_http_${r.status}`;

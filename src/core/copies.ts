@@ -27,6 +27,8 @@ export interface ScanFact {
   unit: string | null;
   condition: string | null;
   previousValue: string | null;
+  /** The fact's sentence on the source (its limit/scope wording, e.g. "over $2,000"); absent in older callers. */
+  quote?: string;
   /** Position among the source's facts (extraction order); absent = position in the scan's fact list. */
   order?: number;
 }
@@ -646,15 +648,52 @@ export function judgeOutcome(fact: ScanFact, judged: Judgement, siblings: readon
 /**
  * The judge's own "value_differs" with same_fact "unsure" is drift only when the quote proves it (live: "Trips over
  * $2,500 need manager approval before booking." for a $2,000 limit): a current mention, one number each in the same
- * written unit, the sentence names the fact's subject/attribute, the stated condition (if any) is in the sentence
- * (the condition itself was checked by `sameCondition`), and the stated number is not a past value ("was", "from X
- * to Y"). Past-value wording and sibling values are checked afterwards like any drift.
+ * written unit and exactly one number in the sentence, the same limit/scope wording ("over", "up to", "only", …) and
+ * rate ("per day") as the fact's own sentence, no group after "for" the fact does not name, the sentence names the
+ * fact's subject/attribute, the stated condition (if any) is in the sentence (the condition itself was checked by
+ * `sameCondition`, which ignores "over"/"under" as stopwords), and the stated number is not a past value ("was",
+ * "from X to Y"). Past-value wording and sibling values are checked afterwards like any drift.
  */
+/** Limit and scope wording: "over $2,000", "up to $2,500" and "at least $2,500" are not the same rule. */
+const LIMIT_QUALIFIERS: readonly [RegExp, string][] = [
+  [/\b(?:up to|at most|no more than|not more than|maximum|max)\b/iu, 'at_most'],
+  [/\b(?:at least|no less than|not less than|minimum|min)\b/iu, 'at_least'],
+  [/\b(?:over|above|more than|exceeding|exceeds?|greater than|beyond)\b/iu, 'over'],
+  [/\b(?:under|below|less than|fewer than)\b/iu, 'under'],
+  [/\bonly\b/iu, 'only'],
+  [/\b(?:except|excluding|other than)\b/iu, 'except'],
+];
+const limitQualifiers = (text: string): string => LIMIT_QUALIFIERS.filter(([re]) => re.test(text)).map(([, q]) => q).join(',');
+
+/** "per day", "a night", "weekly" → day / night / week …; null when the text states no rate. */
+function rateOf(text: string): string | null {
+  const m = /\b(?:per|a|an|each|every)\s+(day|night|trip|week|month|year)s?\b|\b(daily|nightly|weekly|monthly|yearly|annually)\b/iu.exec(text);
+  if (!m) return null;
+  const w = (m[1] ?? m[2] ?? '').toLowerCase();
+  return ({ daily: 'day', nightly: 'night', weekly: 'week', monthly: 'month', yearly: 'year', annually: 'year' } as Record<string, string>)[w] ?? w;
+}
+
+/** Groups after "for" ("for executives") that the fact itself does not name. */
+function unknownGroups(quote: string, factText: string): string[] {
+  const known = new Set(normaliseKeyPart(factText).split(' '));
+  return [...quote.matchAll(/\bfor\s+(?:the\s+|all\s+)?(\p{L}+)/giu)]
+    .map((m) => normaliseKeyPart(m[1]))
+    .filter((w) => w.length >= 3 && !STOPWORDS.has(w) && !CONDITION_FILLER.has(w) && !stems(w).some((x) => known.has(x)));
+}
+
 function safeValueDiffers(fact: ScanFact, j: Judgement): boolean {
   if (j.reasonCode !== 'value_differs' || j.mention !== 'current') return false;
   const o = normaliseValue(fact.value, fact.unit);
   const s = normaliseValue(j.statedValue, j.statedUnit);
   if (o.numbers.length !== 1 || s.numbers.length !== 1 || !o.unit || o.unit !== s.unit) return false;
+  // Exactly one number in the sentence, and it is the stated one ("over $500 and up to $2,500" is not provable).
+  const inQuote = numbersIn(j.quote);
+  if (inQuote.length !== 1 || inQuote[0] !== s.numbers[0]) return false;
+  // Same limit/scope wording and the same rate as the fact's own sentence (the unit check ignores "per day").
+  const factText = [fact.quote ?? '', fact.condition ?? '', fact.value, fact.unit ?? ''].join(' ');
+  if (limitQualifiers(j.quote) !== limitQualifiers(fact.quote ?? fact.condition ?? '')) return false;
+  if (rateOf(`${j.quote} ${j.statedValue} ${j.statedUnit ?? ''}`) !== rateOf(factText)) return false;
+  if (unknownGroups(j.quote, `${factText} ${fact.subject} ${fact.attribute}`).length > 0) return false;
   const quote = new Set(normaliseKeyPart(j.quote).split(' '));
   const has = (w: string) => stems(w).some((x) => quote.has(x));
   const subject = normaliseKeyPart(`${fact.subject} ${fact.attribute}`)

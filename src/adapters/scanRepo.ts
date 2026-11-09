@@ -110,8 +110,9 @@ export interface ScanRepo {
 }
 
 /**
- * Statuses of the "All" filter, its count and the "N copies" headline: restatements of the facts. Historical mentions
- * and ignored matches have their own filter only, so the All count always equals the cards listed under All.
+ * Statuses of the "All" filter, its count and its list: the restatements of the facts plus historical mentions, so the
+ * All count always equals the cards listed under All. The "N copies" headline counts the restatements only (no
+ * historical); ignored matches have their own filter only.
  */
 export const ALL_FILTER_STATUSES = ['in_sync', 'drifted', 'unsure', 'updated', 'historical'] as const;
 

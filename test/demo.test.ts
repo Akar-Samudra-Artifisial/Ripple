@@ -177,6 +177,7 @@ function deps(): DemoDeps {
     ensure: async () => undefined,
     now: () => clock,
     newLease: () => `lease-${++lease}`,
+    newNonce: () => nonce,
     budgetMs: 18_000,
     removeSource: async (pageId) => {
       removedSources.push(pageId);
@@ -185,6 +186,9 @@ function deps(): DemoDeps {
 }
 /** Source pages whose Ripple data `removeDemoData` deleted. */
 let removedSources: string[];
+/** Demo id a new load state gets. */
+let nonce = 'nonce-1';
+const TAG = `${DEMO_MARKER}. Ripple demo id: nonce-1.`;
 
 const ok = <T extends object>(r: T | ErrorReply): T => {
   if ('error' in r) throw new Error(r.error);
@@ -207,6 +211,7 @@ beforeEach(() => {
   usersFail = false;
   usersCalls = [];
   removedSources = [];
+  nonce = 'nonce-1';
   vi.spyOn(console, 'info').mockImplementation(() => undefined);
   vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 });
@@ -325,12 +330,21 @@ describe('getDemoStatus / loadDemoData', () => {
     expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'failed', step: 0, errorCode: 'space_key_taken' });
     expect(conf.creates).toBe(0);
     expect(stored?.spaces).toEqual({});
-    // Created by an earlier load whose state was lost: the marker says it is ours.
-    conf.spaces.set('NLHR', { id: '5', description: `People Ops. ${DEMO_MARKER}.` });
+    // Marked, but by another installation or without a demo id (8.33.0, state lost): not adopted.
+    for (const description of [`People Ops. ${DEMO_MARKER}.`, `People Ops. ${DEMO_MARKER}. Ripple demo id: other-9.`]) {
+      conf.spaces.set('NLHR', { id: '5', description });
+      expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'failed', errorCode: 'foreign_space' });
+      expect(stored?.spaces).toEqual({});
+    }
+    expect(conf.creates).toBe(0);
+    // Created by an earlier load of this installation (not recorded, e.g. a crash): the demo id says it is ours.
+    conf.spaces.set('NLHR', { id: '5', description: `People Ops. ${TAG}` });
     expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'done', errorCode: null });
     expect(stored?.spaces.NLHR?.id).toBe('5');
-    // Every space Ripple creates carries the marker.
+    // Every space Ripple creates carries the marker and the installation's demo id.
     for (const s of NIMBUS_SPACES) expect(s.description).toContain(DEMO_MARKER);
+    expect(conf.spaces.get('NLFIN')?.description).toContain(TAG);
+    expect(stored?.nonce).toBe('nonce-1');
   });
 
   it('a create that fails because the key appeared meanwhile follows the same marker rule', async () => {
@@ -338,7 +352,7 @@ describe('getDemoStatus / loadDemoData', () => {
     expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'failed', errorCode: 'space_key_taken' });
     conf.spaces.clear();
     stored = undefined;
-    conf.beforeCreateSpace = (key) => conf.spaces.set(key, { id: '8', description: DEMO_MARKER });
+    conf.beforeCreateSpace = (key) => conf.spaces.set(key, { id: '8', description: TAG });
     expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'done', errorCode: null });
     expect((stored as DemoState | undefined)?.spaces.NLHR?.id).toBe('8');
   });
@@ -506,7 +520,7 @@ describe('removeDemoData', () => {
   it('never deletes a space Ripple cannot prove it created; reports it and leaves it', async () => {
     ok(await loadDemoData(CTX, {}, deps()));
     // NLFIN replaced by someone else (other id); NLHELP lost its marker; NLONB marked but not recorded.
-    conf.spaces.set('NLFIN', { id: '77', description: `Finance. ${DEMO_MARKER}.` });
+    conf.spaces.set('NLFIN', { id: '77', description: `Finance. ${TAG}` });
     conf.spaces.set('NLHELP', { id: stored?.spaces.NLHELP?.id ?? '', description: 'Help desk' });
     if (stored) delete stored.spaces.NLONB;
     const r = ok(await removeDemoData(CTX, deps()));
@@ -551,10 +565,49 @@ describe('removeDemoData', () => {
     expect(conf.creates - created).toBe(DEMO_TOTAL);
   });
 
+  it('demo id: a recorded space marked by another installation is kept; 8.33.0 spaces without an id are removed once recorded', async () => {
+    ok(await loadDemoData(CTX, {}, deps()));
+    const nlfin = conf.spaces.get('NLFIN');
+    if (nlfin) nlfin.description = `Finance. ${DEMO_MARKER}. Ripple demo id: other-9.`;
+    expect(ok(await removeDemoData(CTX, deps()))).toMatchObject({ removedSpaces: ['NLHR', 'NLONB', 'NLSALES', 'NLHELP'], keptSpaces: ['NLFIN'] });
+    // Migration: a state of 8.36.0 (no demo id) with spaces created without one.
+    conf.spaces.clear();
+    stored = undefined;
+    ok(await loadDemoData(CTX, {}, deps()));
+    for (const sp of conf.spaces.values()) sp.description = sp.description.replace(' Ripple demo id: nonce-1.', '');
+    delete (stored as DemoState | undefined)?.nonce;
+    expect(ok(await removeDemoData(CTX, deps()))).toMatchObject({ removedSpaces: KEYS, keptSpaces: [], errorCode: null });
+    // Without a recorded id, such a space is not ours.
+    conf.spaces.set('NLHR', { id: '9', description: `People Ops. ${DEMO_MARKER}.` });
+    stored = { state: 'done', spaces: { NLHR: { id: '8', url: null } }, pages: {}, ownerAccountIds: [], errorCode: null, lease: '', lockedUntil: 0, rev: 1 };
+    expect(ok(await removeDemoData(CTX, deps()))).toMatchObject({ removedSpaces: [], keptSpaces: ['NLHR'] });
+  });
+
+  it('removes the source data only once NLHR is proven ours, and looks each space up again right before its DELETE', async () => {
+    ok(await loadDemoData(CTX, {}, deps()));
+    conf.spaces.set('NLHR', { id: '66', description: 'HR team space' });
+    expect(ok(await removeDemoData(CTX, deps()))).toMatchObject({ keptSpaces: ['NLHR'] });
+    expect(removedSources).toEqual([]);
+    // Replaced between the ownership check and the DELETE: the second lookup sees another id, nothing is deleted.
+    conf = new FakeConfluence();
+    stored = undefined;
+    ok(await loadDemoData(CTX, {}, deps()));
+    const finds: string[] = [];
+    const find = conf.findSpace.bind(conf);
+    conf.findSpace = async (key: string) => {
+      finds.push(key);
+      if (key === 'NLSALES' && finds.filter((k) => k === key).length === 2) conf.spaces.set('NLSALES', { id: '55', description: TAG });
+      return find(key);
+    };
+    expect(ok(await removeDemoData(CTX, deps()))).toMatchObject({ removedSpaces: ['NLHR', 'NLONB', 'NLFIN', 'NLHELP'], keptSpaces: ['NLSALES'] });
+    expect(conf.deletes).not.toContain('NLSALES');
+    expect(finds.filter((k) => k === 'NLHR')).toHaveLength(2);
+  });
+
   it('waits while a load holds the lease; logs carry no space keys or account ids', async () => {
     clock = 1_000;
-    stored = { state: 'loading', spaces: { NLHR: { id: '1', url: null } }, pages: {}, ownerAccountIds: OWNERS, errorCode: null, lease: 'other', lockedUntil: clock + 10_000, rev: 2 };
-    conf.spaces.set('NLHR', { id: '1', description: DEMO_MARKER });
+    stored = { state: 'loading', spaces: { NLHR: { id: '1', url: null } }, pages: {}, ownerAccountIds: OWNERS, errorCode: null, lease: 'other', lockedUntil: clock + 10_000, rev: 2, nonce: 'nonce-1' };
+    conf.spaces.set('NLHR', { id: '1', description: TAG });
     expect(ok(await removeDemoData(CTX, deps()))).toMatchObject({ errorCode: 'demo_busy', status: { state: 'loading' } });
     expect(conf.deletes).toEqual([]);
     expect(writes).toBe(0);
@@ -597,8 +650,9 @@ describe('demoConfluence adapter', () => {
     expect(apiCalls.map((c) => [c.method, c.path])).toEqual(Array.from({ length: 3 }, () => ['DELETE', '/wiki/rest/api/space/NLHR']));
   });
 
-  it('parses the removed state and the ids of spaces being deleted', () => {
-    expect(parseDemoState({ state: 'removed', spaces: {}, pages: {}, deletedSpaceIds: ['1', 2, '3'] })).toMatchObject({ state: 'removed', deletedSpaceIds: ['1', '3'] });
+  it('parses the removed state, the ids of spaces being deleted and the demo id', () => {
+    expect(parseDemoState({ state: 'removed', spaces: {}, pages: {}, deletedSpaceIds: ['1', 2, '3'], nonce: 'n-1' })).toMatchObject({ state: 'removed', deletedSpaceIds: ['1', '3'], nonce: 'n-1' });
+    expect(parseDemoState({ state: 'done', spaces: {}, pages: {}, nonce: 7 })).not.toHaveProperty('nonce');
   });
 });
 

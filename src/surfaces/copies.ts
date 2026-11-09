@@ -78,7 +78,7 @@ async function scanFactsOf(facts: FactRepo, sourcePageId: string): Promise<ScanF
   // listFacts keeps the insert (extraction) order within a status: that is the fact's order in the source.
   return (await facts.listFacts(sourcePageId))
     .filter((f) => f.status === 'confirmed')
-    .map((f, order) => ({ id: f.id, type: f.type, subject: f.subject, attribute: f.attribute, value: f.value, unit: f.unit, condition: f.condition, previousValue: f.previousValue, order }))
+    .map((f, order) => ({ id: f.id, type: f.type, subject: f.subject, attribute: f.attribute, value: f.value, unit: f.unit, condition: f.condition, previousValue: f.previousValue, quote: f.quote, order }))
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 

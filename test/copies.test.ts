@@ -63,6 +63,7 @@ const FACTS: ScanFact[] = TRAVEL_POLICY_FACTS.map((f, i) => ({
   unit: f.unit,
   condition: f.condition,
   previousValue: null,
+  quote: f.quote,
 }));
 const fact = (k: FactKey): ScanFact => FACTS[KEYS.indexOf(k)] as ScanFact;
 
@@ -1290,6 +1291,25 @@ describe('M6 Nimbus Labs demo data through the scan rules (simulated judge)', ()
     expect(status({ statedCondition: 'before boarding' })).toBe('unsure');
     expect(status({ reasonCode: 'ambiguous' })).toBe('unsure');
     expect(status({ mention: 'historical' })).toBe('historical');
+    // Review: limit/scope wording must match the fact's sentence ("over"/"under" are stopwords in sameCondition).
+    expect(status({ quote: 'Trips under $2,500 need manager approval before booking.' })).toBe('unsure');
+    expect(status({ quote: 'Trips up to $2,500 need manager approval before booking.' })).toBe('unsure');
+    expect(status({ quote: 'Only trips over $2,500 need manager approval before booking.' })).toBe('unsure');
+    expect(status({ quote: 'Trips over $2,500 need manager approval before booking, except conferences.' })).toBe('unsure');
+    expect(status({ statedCondition: null, quote: 'Trips up to $2,500 for executives need manager approval before booking.' })).toBe('unsure');
+    expect(status({ statedCondition: null, quote: 'Trips over $2,500 for executives need manager approval before booking.' })).toBe('unsure');
+    expect(status({ quote: 'Trips above $2,500 need manager approval before booking.' })).toBe('drifted');
+    // More than one number in the sentence: not provable.
+    expect(status({ quote: 'Trips over $2,500 need manager approval before booking, up to 3 per month.' })).toBe('unsure');
+    expect(status({ quote: 'Trips over $2,500 need manager approval 2 weeks before booking.' })).toBe('unsure');
+    // Rate: the unit check drops "per day", so the rates are compared here.
+    const domestic = fact('domestic');
+    const perDiem = (quote: string, statedUnit: string | null = 'per day') =>
+      judgeOutcome(domestic, judgement('domestic', { sameFact: 'unsure', reasonCode: 'value_differs', statedValue: '$75', statedUnit, statedCondition: 'domestic travel', quote }), siblingsOf(domestic, FACTS)).decision?.status;
+    expect(perDiem('The per diem for domestic travel is $75 per day.')).toBe('drifted');
+    expect(perDiem('The per diem for domestic travel is $75 per week.', 'per week')).toBe('unsure');
+    expect(perDiem('The per diem for domestic travel is $75 per trip.', 'per trip')).toBe('unsure');
+    expect(perDiem('The per diem for domestic travel is $75.', null)).toBe('unsure');
     // Every drifted demo sentence stays drifted when the judge hedges with unsure / value_differs.
     for (const m of NIMBUS_PAGES.flatMap((p) => p.mentions).filter((x) => x.status === 'drifted')) {
       const f = fact(m.fact);

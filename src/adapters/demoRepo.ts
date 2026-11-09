@@ -29,6 +29,12 @@ export interface DemoState {
    * listed for a while: a load must not reuse it (`space_being_deleted`).
    */
   deletedSpaceIds?: string[];
+  /**
+   * Random id of this installation's demo data, written into the description of every space it creates
+   * (`demoIdTag`): a space carrying `DEMO_MARKER` with another id (or none) was not created by this installation.
+   * Absent in states of 8.33.0–8.36.0 (spaces created without it); set by the next load.
+   */
+  nonce?: string;
   /** Space key → id and link. */
   spaces: Record<string, { id: string; url: string | null }>;
   /** Page slug → id, link and owner progress. */
@@ -83,6 +89,7 @@ export function parseDemoState(raw: unknown): DemoState | undefined {
     lease: typeof v.lease === 'string' ? v.lease : '',
     lockedUntil: typeof v.lockedUntil === 'number' ? v.lockedUntil : 0,
     rev: typeof v.rev === 'number' ? v.rev : 0,
+    ...(typeof v.nonce === 'string' && v.nonce !== '' ? { nonce: v.nonce } : {}),
     ...(Array.isArray(v.deletedSpaceIds) ? { deletedSpaceIds: v.deletedSpaceIds.filter((x): x is string => typeof x === 'string') } : {}),
   };
 }

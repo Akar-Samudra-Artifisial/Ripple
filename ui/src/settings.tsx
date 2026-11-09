@@ -163,6 +163,8 @@ const DEMO_ERROR: Record<string, string> = {
   owner_change_failed: 'Demo data loaded, but some pages could not be given to the other owners. You own those pages for now.',
   space_key_taken:
     'A space with one of the demo keys (NLHR, NLONB, NLFIN, NLSALES, NLHELP) already exists and was not created by Ripple, so Ripple left it alone. Rename or delete that space to load the demo data.',
+  foreign_space:
+    'A space with one of the demo keys (NLHR, NLONB, NLFIN, NLSALES, NLHELP) is marked as Ripple demo data but was not created by this Ripple installation, so Ripple left it alone. Rename or delete that space to load the demo data.',
   space_being_deleted: 'Confluence is still deleting the earlier demo spaces. Wait a minute, then load the demo data again.',
   demo_busy: 'Demo data is being loaded or removed right now. Try again in a minute.',
 };
@@ -252,6 +254,7 @@ function DemoData() {
   };
 
   const remove = async () => {
+    if (busy) return;
     setConfirmRemove(false);
     setProblem(undefined);
     setRemoved(undefined);
