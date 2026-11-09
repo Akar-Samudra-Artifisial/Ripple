@@ -18,9 +18,12 @@ and an audit trail of who confirmed, approved or rejected what and when.
 - **Confluence pages, labels, spaces, search** (`read:confluence-content.*`, `read:page:confluence`,
   `read:label:confluence`, `read:space:confluence`, `search:confluence`): find source-of-truth facts and their copies.
 - **Write pages** (`write:page:confluence`): apply an edit only after its page owner approves it, as that user.
-- **Create spaces** (`write:confluence-space`): used **only** by the admin's "Load demo data" button, which creates
+- **Create and delete spaces** (`write:confluence-space`): used **only** by the admin's "Load demo data" and
+  "Remove demo data" buttons. "Remove demo data" deletes only the demo spaces Ripple recorded as created and marked
+  ("Created by Ripple demo data" in the description), with their pages, and Ripple's data for the demo source; other
+  spaces with the same keys are left alone. "Load demo data" creates
   the Nimbus Labs demo spaces (`NLHR`, `NLONB`, `NLFIN`, `NLSALES`, `NLHELP`) and their pages as that admin (Jira
-  administrators only). Ripple never creates or changes spaces otherwise. Its progress (space and page ids and links,
+  administrators only). Ripple never creates, changes or deletes spaces otherwise. Its progress (space and page ids and links,
   and the optional owner account ids the admin entered, at most 6) is stored in the `settings` table under `demo`;
   logs carry only ids, counts and error codes, never an account id. Copy pages are handed to those owners by saving
   the page once more with a new owner; if that fails, the admin stays the owner.

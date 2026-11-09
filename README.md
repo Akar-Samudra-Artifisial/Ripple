@@ -10,8 +10,8 @@ owning team via Teamwork Graph; every other module is declared and answers "not 
 
 ## Permissions
 
-See `docs/PRIVACY.md`. `write:confluence-space` is used only by the "Load demo data" button (creates the demo
-spaces NLHR/NLONB/NLFIN/NLSALES/NLHELP); no other code path creates or changes spaces.
+See `docs/PRIVACY.md`. `write:confluence-space` is used only by the "Load demo data" and "Remove demo data" buttons
+(create / delete the demo spaces NLHR/NLONB/NLFIN/NLSALES/NLHELP); no other code path creates, changes or deletes spaces.
 
 ## Demo data (M6)
 
@@ -20,7 +20,9 @@ as the admin: five spaces, the "Travel Policy" page (not marked as a source: do 
 one history page. Expected after marking the source and scanning: "23 copies, 4 out of date"; changing the domestic
 per diem $60 → $75 affects 14 copies. Loading runs in steps (~18 s per call, the page continues by itself) and is
 idempotent: spaces are found by key, pages by title. Optional "Owner account IDs" (up to 6) share the copy pages
-round robin. Removing demo data is not available yet.
+round robin. **Remove demo data** (same gate, explicit confirmation) deletes the demo spaces Ripple created (recorded
+in the state and marked), Ripple's data for the demo source, and resets the state; Confluence deletes spaces in the
+background, so wait a minute before loading again.
 
 ## Layout
 

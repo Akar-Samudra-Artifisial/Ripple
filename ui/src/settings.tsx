@@ -1,6 +1,6 @@
 import { router } from '@forge/bridge';
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from 'react';
-import type { DemoOwnersCheck, DemoStatus, SaveSettingsResult, SettingsView } from '../../src/core/views';
+import type { DemoOwnersCheck, DemoRemoveResult, DemoStatus, SaveSettingsResult, SettingsView } from '../../src/core/views';
 import { call } from './bridge';
 import { Alert, LoadingRows, errorOf } from './components';
 import { httpsUrl } from './links';
@@ -163,13 +163,19 @@ const DEMO_ERROR: Record<string, string> = {
   owner_change_failed: 'Demo data loaded, but some pages could not be given to the other owners. You own those pages for now.',
   space_key_taken:
     'A space with one of the demo keys (NLHR, NLONB, NLFIN, NLSALES, NLHELP) already exists and was not created by Ripple, so Ripple left it alone. Rename or delete that space to load the demo data.',
+  space_being_deleted: 'Confluence is still deleting the earlier demo spaces. Wait a minute, then load the demo data again.',
+  demo_busy: 'Demo data is being loaded or removed right now. Try again in a minute.',
 };
+
+const DEMO_KEYS = 'NLHR, NLONB, NLFIN, NLSALES and NLHELP';
 
 const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 function demoErrorText(code: string): string {
   if (DEMO_ERROR[code]) return DEMO_ERROR[code];
   if (code.startsWith('space_create_http_403')) return 'You need permission to create spaces in Confluence to load demo data.';
+  if (code === 'space_delete_http_403') return 'You need permission to delete these spaces in Confluence to remove the demo data.';
+  if (code.startsWith('space_delete_') || (code.startsWith('space_find_') && code !== 'space_find_http_403')) return `Removing stopped (${code}). Press Remove demo data again to continue.`;
   return `Loading stopped (${code}). Press the button again to continue where it stopped.`;
 }
 
@@ -203,6 +209,10 @@ function DemoData() {
   const [problem, setProblem] = useState<string>();
   /** Owners looked up and waiting for the admin's confirmation. */
   const [confirm, setConfirm] = useState<{ ids: string[]; check: DemoOwnersCheck }>();
+  /** "Remove demo data" waits for an explicit confirmation. */
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const [removed, setRemoved] = useState<string>();
+  const [removing, setRemoving] = useState(false);
   const id = useId();
 
   const refresh = useCallback(async () => {
@@ -241,8 +251,32 @@ function DemoData() {
     }
   };
 
+  const remove = async () => {
+    setConfirmRemove(false);
+    setProblem(undefined);
+    setRemoved(undefined);
+    setBusy(true);
+    setRemoving(true);
+    try {
+      const r = await call<DemoRemoveResult>('removeDemoData');
+      setStatus(r.status);
+      if (r.errorCode) {
+        setProblem(demoErrorText(r.errorCode));
+      } else {
+        const kept = r.keptSpaces.length ? ` Left alone because Ripple did not create them: ${r.keptSpaces.join(', ')}.` : '';
+        setRemoved(`Demo data removed. Confluence finishes deleting the spaces in the background, so wait a minute before loading it again.${kept}`);
+      }
+    } catch (e) {
+      setProblem(`Removing stopped. ${errorOf(e)} Press Remove demo data again to continue.`);
+    } finally {
+      setRemoving(false);
+      setBusy(false);
+    }
+  };
+
   const start = async () => {
     if (busy) return;
+    setRemoved(undefined);
     const ids = owners
       .split(/[\s,]+/)
       .map((x) => x.trim())
@@ -341,8 +375,33 @@ function DemoData() {
       ) : !status.canEdit ? (
         <p className="muted">Only Jira administrators can load demo data.</p>
       ) : null}
+      {status.canEdit && (status.state !== 'idle' || status.spaces.length > 0) ? (
+        confirmRemove ? (
+          <div className="settings__confirm" role="alertdialog" aria-labelledby={`${id}-remove`}>
+            <p id={`${id}-remove`}>
+              Remove demo data? Ripple deletes the spaces {DEMO_KEYS} with all their pages, and its own data for the demo Travel Policy. This cannot be undone from
+              Ripple. Spaces with these keys that Ripple did not create are left alone.
+            </p>
+            <div className="actions">
+              <button type="button" className="button button--danger" disabled={busy} onClick={() => void remove()}>
+                Delete demo spaces
+              </button>
+              <button type="button" className="button" disabled={busy} onClick={() => setConfirmRemove(false)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="actions">
+            <button type="button" className="button" disabled={busy} aria-busy={busy} onClick={() => setConfirmRemove(true)}>
+              {removing ? 'Removing…' : 'Remove demo data'}
+            </button>
+          </div>
+        )
+      ) : null}
       <div aria-live="polite" className="settings__result">
-        {status.state === 'loading' || busy ? (
+        {removing ? <p className="muted">Removing demo data…</p> : null}
+        {(status.state === 'loading' || busy) && !removing ? (
           <p className="muted">
             Created {status.step} of {status.total} spaces and pages…
           </p>
@@ -353,6 +412,7 @@ function DemoData() {
             {source ? <ExternalLink url={source}>Open the Travel Policy</ExternalLink> : null}
           </p>
         ) : null}
+        {removed ? <p className="ok">{removed}</p> : null}
         {error ? <p className="field__error">{error}</p> : null}
       </div>
       {status.spaces.length > 0 ? (

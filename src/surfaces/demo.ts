@@ -10,10 +10,11 @@ import { randomUUID } from 'node:crypto';
 import { userAccounts, type UserAccount } from '../adapters/confluenceUsers';
 import { demoConfluence, type DemoConfluence, type DemoRef, type DemoSpaceRef } from '../adapters/demoConfluence';
 import { sqlDemoRepo, type DemoPage, type DemoRepo, type DemoState } from '../adapters/demoRepo';
+import { sqlRepo } from '../adapters/repo';
 import { scrubErrorText } from '../adapters/teamworkGraph';
 import { DEMO_MARKER, NIMBUS_ALL_PAGES, NIMBUS_SOURCE, NIMBUS_SPACES, type NimbusPage, type NimbusSpace } from '../demo/nimbus';
 import { SchemaSettingUpError } from '../core/schema';
-import { adminErrorCode, type AdminCheck, type CheckDemoOwnersPayload, type DemoOwnersCheck, type DemoStatus, type ErrorReply, type LoadDemoPayload } from '../core/views';
+import { adminErrorCode, type AdminCheck, type CheckDemoOwnersPayload, type DemoOwnersCheck, type DemoRemoveResult, type DemoStatus, type ErrorReply, type LoadDemoPayload } from '../core/views';
 import { adminCheck, defaultSettingsDeps, SETTINGS_MODULE, type SettingsContext } from './changeIssues';
 
 /** Time one `loadDemoData` call may spend before it returns `loading` (resolvers time out at 25 s). */
@@ -36,6 +37,8 @@ export interface DemoDeps {
   now: () => number;
   newLease: () => string;
   budgetMs: number;
+  /** Deletes Ripple's data of a source page (the `unmarkSource` path) and audits it; idempotent. */
+  removeSource: (pageId: string, actor: string | null) => Promise<void>;
 }
 
 const defaultDemoDeps: DemoDeps = {
@@ -47,6 +50,12 @@ const defaultDemoDeps: DemoDeps = {
   now: () => Date.now(),
   newLease: () => randomUUID(),
   budgetMs: DEMO_BUDGET_MS,
+  removeSource: async (pageId, actor) => {
+    if (!(await sqlRepo.getSource(pageId))) return;
+    const counts = await sqlRepo.countFacts(pageId);
+    await sqlRepo.unmarkSource(pageId);
+    await sqlRepo.audit('source.unmarked', actor, 'page', pageId, { ...counts, reason: 'demo_removed' });
+  },
 };
 
 const ownerErrors = (state: DemoState | undefined): number => Object.values(state?.pages ?? {}).filter((p) => p.ownerState === 'failed').length;
@@ -56,7 +65,7 @@ function statusOf(state: DemoState | undefined, canEdit: boolean, errorCode: str
   const step = state ? Object.keys(state.spaces).length + Object.keys(state.pages).length : 0;
   const ownerCode = state?.state === 'done' && ownerErrors(state) > 0 ? 'owner_change_failed' : null;
   return {
-    state: busy ? 'loading' : (state?.state ?? 'idle'),
+    state: busy ? 'loading' : !state || state.state === 'removed' ? 'idle' : state.state,
     step: Math.min(step, DEMO_TOTAL),
     total: DEMO_TOTAL,
     spaces: NIMBUS_SPACES.filter((s) => state?.spaces[s.key]).map((s) => ({ key: s.key, name: s.name, url: state?.spaces[s.key]?.url ?? null })),
@@ -141,13 +150,15 @@ const ours = (s: DemoSpaceRef): Step<DemoRef> => (s.description.includes(DEMO_MA
  * Finds the space by key, else creates it (its description carries `DEMO_MARKER`); a failed create is looked up again
  * (a concurrent load made it). A found space without the marker belongs to someone else: `space_key_taken`.
  */
-async function ensureSpace(c: DemoConfluence, s: NimbusSpace): Promise<Step<DemoRef>> {
+async function ensureSpace(c: DemoConfluence, s: NimbusSpace, deleted: ReadonlySet<string>): Promise<Step<DemoRef>> {
   const found = await c.findSpace(s.key);
   if (!found.ok) return { ok: false, code: `space_find_http_${found.status}` };
+  if (found.value && deleted.has(found.value.id)) return { ok: false, code: 'space_being_deleted' };
   if (found.value) return ours(found.value);
   const created = await c.createSpace(s.key, s.name, s.description);
   if (created.ok) return { ok: true, value: created.value };
   const again = await c.findSpace(s.key);
+  if (again.ok && again.value && deleted.has(again.value.id)) return { ok: false, code: 'space_being_deleted' };
   return again.ok && again.value ? ours(again.value) : { ok: false, code: `space_create_http_${created.status}` };
 }
 
@@ -224,7 +235,7 @@ export async function loadDemoData(ctx: SettingsContext, payload: Partial<LoadDe
       for (const s of NIMBUS_SPACES) {
         if (state.spaces[s.key]) continue;
         if (spent()) return await release();
-        const r = await ensureSpace(deps.confluence, s);
+        const r = await ensureSpace(deps.confluence, s, new Set(state.deletedSpaceIds ?? []));
         if (!r.ok) return await fail(r.code);
         state.spaces[s.key] = { id: r.value.id, url: r.value.url };
         await save();
@@ -265,6 +276,97 @@ export async function loadDemoData(ctx: SettingsContext, payload: Partial<LoadDe
       if (!(err instanceof DemoLeaseLost)) throw err;
       console.info('ripple demo: lease lost, stopped', { step: Object.keys(state.spaces).length + Object.keys(state.pages).length });
       return statusOf(await deps.repo.getDemoState(), true, null, true);
+    }
+  });
+}
+
+/**
+ * "Remove demo data" (Jira administrators, same gate as the load): deletes only the demo spaces Ripple created, i.e.
+ * recorded in the demo state with the same id AND carrying `DEMO_MARKER` in their description; any other space with a
+ * demo key is left alone and reported in `keptSpaces`. First the Ripple data of the demo source goes (the
+ * `unmarkSource` path), then the spaces (REST v1 DELETE as the caller, a background task in Confluence), then the
+ * state is reset to `removed` (pages, spaces and owners empty) so the next load starts from scratch. Holds the load
+ * lease meanwhile. Idempotent: a space already gone counts as removed; a failed step keeps what is left recorded and
+ * pressing again continues. Logs counts and enums only.
+ */
+export async function removeDemoData(ctx: SettingsContext, deps: DemoDeps = defaultDemoDeps): Promise<DemoRemoveResult | ErrorReply> {
+  return guard(ctx, deps, 'remove the demo data', async () => {
+    const started = deps.now();
+    const current = await deps.repo.getDemoState();
+    const reply = (status: DemoStatus, errorCode: string | null, removedSpaces: string[] = [], keptSpaces: string[] = []): DemoRemoveResult => ({ status, removedSpaces, keptSpaces, errorCode });
+    const admin = await deps.admin(ctx);
+    if (admin !== 'admin') {
+      const code = adminErrorCode(admin);
+      return reply(statusOf(current, false, code), code);
+    }
+    const busy = (): DemoRemoveResult => reply(statusOf(current, true, null, true), 'demo_busy');
+    if (current && current.lease !== '' && current.lockedUntil > started) return busy();
+
+    const lease = deps.newLease();
+    const state: DemoState = {
+      ...(current ?? { state: 'removed', spaces: {}, pages: {}, ownerAccountIds: [], errorCode: null, rev: 0 }),
+      lease,
+      lockedUntil: started + DEMO_LEASE_MS,
+      rev: (current?.rev ?? 0) + 1,
+    };
+    const taken = current ? await deps.repo.replaceDemoState(state, current.lease) : await deps.repo.createDemoState(state);
+    if (!taken) return busy();
+    const save = async (): Promise<void> => {
+      state.rev += 1;
+      if (!(await deps.repo.replaceDemoState(state, lease))) throw new DemoLeaseLost();
+    };
+
+    const removed: string[] = [];
+    const kept: string[] = [];
+    const deleted = new Set(state.deletedSpaceIds ?? []);
+    let failure: string | null = null;
+    try {
+      const sourceId = state.pages[NIMBUS_SOURCE.slug]?.id;
+      if (sourceId) await deps.removeSource(sourceId, ctx.accountId ?? null);
+      for (const s of NIMBUS_SPACES) {
+        const recorded = state.spaces[s.key];
+        const found = await deps.confluence.findSpace(s.key);
+        if (!found.ok) {
+          failure = `space_find_http_${found.status}`;
+          break;
+        }
+        const space = found.value;
+        if (space && deleted.has(space.id)) continue; // asked before, Confluence is still deleting it
+        if (space && !(recorded && recorded.id === space.id && space.description.includes(DEMO_MARKER))) {
+          kept.push(s.key);
+          continue;
+        }
+        if (space) {
+          const r = await deps.confluence.deleteSpace(s.key);
+          if (!r.ok) {
+            failure = `space_delete_http_${r.status}`;
+            break;
+          }
+          if (r.value === 'deleted') deleted.add(space.id);
+          removed.push(s.key);
+        }
+        if (!recorded) continue;
+        delete state.spaces[s.key];
+        for (const p of NIMBUS_ALL_PAGES) if (p.space === s.key) delete state.pages[p.slug];
+        state.deletedSpaceIds = [...deleted];
+        await save();
+      }
+      if (failure) {
+        state.state = 'failed';
+        state.errorCode = failure;
+        console.warn('ripple demo: remove step failed', { error: failure, removed: removed.length, kept: kept.length });
+      } else {
+        Object.assign(state, { state: 'removed', spaces: {}, pages: {}, ownerAccountIds: [], errorCode: null, deletedSpaceIds: [...deleted] });
+        console.info('ripple demo: removed', { removed: removed.length, kept: kept.length });
+      }
+      state.lease = '';
+      state.lockedUntil = 0;
+      await save();
+      return reply(statusOf(state, true), failure, removed, kept);
+    } catch (err) {
+      if (!(err instanceof DemoLeaseLost)) throw err;
+      console.info('ripple demo: lease lost, remove stopped', { removed: removed.length });
+      return reply(statusOf(await deps.repo.getDemoState(), true, null, true), 'demo_busy', removed, kept);
     }
   });
 }

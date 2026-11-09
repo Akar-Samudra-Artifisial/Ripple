@@ -13,7 +13,7 @@ import type { BylineStatus, ChangeIdPayload, ConfirmChangePayload, CopyListPaylo
 import { confirmFact, editFact, getSourceStatus, listFacts, markSource, rejectFact, unmarkSource, type SourceContext } from './sources';
 import { getApproval, getSettings, saveSettings, type ApprovalContext, type SettingsContext } from './changeIssues';
 import type { CheckDemoOwnersPayload, LoadDemoPayload, SaveSettingsPayload } from '../core/views';
-import { checkDemoOwners, getDemoStatus, loadDemoData } from './demo';
+import { checkDemoOwners, getDemoStatus, loadDemoData, removeDemoData } from './demo';
 
 export type ResolverContext = {
   accountId?: string;
@@ -172,5 +172,6 @@ resolver.define('getApproval', ({ context }) => getApproval(context as ApprovalC
 resolver.define('getDemoStatus', ({ context }) => getDemoStatus(context as SettingsContext));
 resolver.define('loadDemoData', ({ context, payload }) => loadDemoData(context as SettingsContext, payload as Partial<LoadDemoPayload>));
 resolver.define('checkDemoOwners', ({ context, payload }) => checkDemoOwners(context as SettingsContext, payload as Partial<CheckDemoOwnersPayload>));
+resolver.define('removeDemoData', ({ context }) => removeDemoData(context as SettingsContext));
 
 export const handler = resolver.getDefinitions();

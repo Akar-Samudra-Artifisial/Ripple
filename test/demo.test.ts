@@ -50,7 +50,7 @@ import type { UserAccount } from '../src/adapters/confluenceUsers';
 import type { UserResult } from '../src/adapters/confluence';
 import { DEMO_MARKER, NIMBUS_ALL_PAGES, NIMBUS_EXPECTED, NIMBUS_PAGES, NIMBUS_SOURCE, NIMBUS_SPACES, TRAP_FORBIDDEN, TRAP_SLUG } from '../src/demo/nimbus';
 import type { AdminCheck, DemoStatus, ErrorReply } from '../src/core/views';
-import { checkDemoOwners, DEMO_LEASE_MS, DEMO_TOTAL, getDemoStatus, loadDemoData, type DemoDeps } from '../src/surfaces/demo';
+import { checkDemoOwners, DEMO_LEASE_MS, DEMO_TOTAL, getDemoStatus, loadDemoData, removeDemoData, type DemoDeps } from '../src/surfaces/demo';
 
 const CTX = { moduleKey: 'ripple-settings', accountId: '557058:admin-0000' };
 const OWNERS = ['557058:aaaa-1111', '557058:bbbb-2222', '5b10a2844c20165700ede21g'];
@@ -103,6 +103,18 @@ class FakeConfluence implements DemoConfluence {
     this.pageOwner.set(pageId, owner);
     this.owners.push({ pageId, owner });
     return { ok: true, value: true };
+  }
+  /** Space keys whose deletion was requested. */
+  deletes: string[] = [];
+  failDelete?: number;
+  /** Confluence deletes in the background: the space is still listed after the 202. */
+  listedWhileDeleting = false;
+  async deleteSpace(key: string): Promise<UserResult<'deleted' | 'gone'>> {
+    if (this.failDelete) return { ok: false, status: this.failDelete };
+    if (!this.spaces.has(key)) return { ok: true, value: 'gone' };
+    this.deletes.push(key);
+    if (!this.listedWhileDeleting) this.spaces.delete(key);
+    return { ok: true, value: 'deleted' };
   }
 }
 
@@ -166,8 +178,13 @@ function deps(): DemoDeps {
     now: () => clock,
     newLease: () => `lease-${++lease}`,
     budgetMs: 18_000,
+    removeSource: async (pageId) => {
+      removedSources.push(pageId);
+    },
   };
 }
+/** Source pages whose Ripple data `removeDemoData` deleted. */
+let removedSources: string[];
 
 const ok = <T extends object>(r: T | ErrorReply): T => {
   if ('error' in r) throw new Error(r.error);
@@ -189,6 +206,7 @@ beforeEach(() => {
   accounts = new Map(OWNERS.map((id, i) => [id, active(`Owner ${i}`)]));
   usersFail = false;
   usersCalls = [];
+  removedSources = [];
   vi.spyOn(console, 'info').mockImplementation(() => undefined);
   vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 });
@@ -450,6 +468,103 @@ describe('getDemoStatus / loadDemoData', () => {
   });
 });
 
+describe('removeDemoData', () => {
+  const KEYS = NIMBUS_SPACES.map((s) => s.key);
+
+  it('only Jira administrators may remove, fail closed; other modules are refused; nothing is touched', async () => {
+    ok(await loadDemoData(CTX, {}, deps()));
+    const before = JSON.stringify(stored);
+    for (const [a, code] of [
+      ['not_admin', 'not_allowed'],
+      ['check_failed', 'admin_check_failed'],
+      ['needs_auth', 'admin_needs_auth'],
+    ] as const) {
+      admin = a;
+      expect(ok(await removeDemoData(CTX, deps()))).toMatchObject({ errorCode: code, removedSpaces: [], status: { canEdit: false } });
+    }
+    expect(await removeDemoData({ ...CTX, moduleKey: 'ripple-byline' }, deps())).toEqual({ error: 'Open Ripple settings to do that.' });
+    expect(conf.deletes).toEqual([]);
+    expect(removedSources).toEqual([]);
+    expect(JSON.stringify(stored)).toBe(before);
+  });
+
+  it('deletes the recorded, marked spaces and the source data, resets the state; the next load starts from scratch', async () => {
+    ok(await loadDemoData(CTX, { ownerAccountIds: OWNERS }, deps()));
+    const sourceId = stored?.pages[NIMBUS_SOURCE.slug]?.id;
+    const r = ok(await removeDemoData(CTX, deps()));
+    expect(r).toMatchObject({ removedSpaces: KEYS, keptSpaces: [], errorCode: null, status: { state: 'idle', step: 0, spaces: [], sourcePageUrl: null } });
+    expect(conf.deletes).toEqual(KEYS);
+    expect(removedSources).toEqual([sourceId]);
+    expect(stored).toMatchObject({ state: 'removed', spaces: {}, pages: {}, ownerAccountIds: [], errorCode: null, lease: '', lockedUntil: 0 });
+    expect(ok(await getDemoStatus(CTX, deps()))).toMatchObject({ state: 'idle', step: 0 });
+    const created = conf.creates;
+    expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'done', errorCode: null });
+    expect(conf.creates - created).toBe(DEMO_TOTAL);
+    expect(conf.owners.length).toBe(NIMBUS_PAGES.length); // owners of the earlier load are not reused
+  });
+
+  it('never deletes a space Ripple cannot prove it created; reports it and leaves it', async () => {
+    ok(await loadDemoData(CTX, {}, deps()));
+    // NLFIN replaced by someone else (other id); NLHELP lost its marker; NLONB marked but not recorded.
+    conf.spaces.set('NLFIN', { id: '77', description: `Finance. ${DEMO_MARKER}.` });
+    conf.spaces.set('NLHELP', { id: stored?.spaces.NLHELP?.id ?? '', description: 'Help desk' });
+    if (stored) delete stored.spaces.NLONB;
+    const r = ok(await removeDemoData(CTX, deps()));
+    expect(r).toMatchObject({ removedSpaces: ['NLHR', 'NLSALES'], keptSpaces: ['NLONB', 'NLFIN', 'NLHELP'], errorCode: null });
+    expect(conf.deletes).toEqual(['NLHR', 'NLSALES']);
+    expect([...conf.spaces.keys()].sort()).toEqual(['NLFIN', 'NLHELP', 'NLONB']);
+    expect(stored).toMatchObject({ state: 'removed', spaces: {}, pages: {} });
+    // The next load refuses the foreign key as before.
+    expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'failed', errorCode: 'space_key_taken' });
+  });
+
+  it('is idempotent: gone spaces count as removed, a second press changes nothing, a failed delete resumes', async () => {
+    ok(await loadDemoData(CTX, {}, deps()));
+    conf.spaces.delete('NLONB'); // deleted by hand in Confluence
+    conf.failDelete = 403;
+    expect(ok(await removeDemoData(CTX, deps()))).toMatchObject({ errorCode: 'space_delete_http_403', status: { state: 'failed' } });
+    expect(Object.keys(stored?.spaces ?? {}).sort()).toEqual(['NLFIN', 'NLHELP', 'NLHR', 'NLONB', 'NLSALES']);
+    expect(stored?.lease).toBe('');
+    conf.failDelete = undefined;
+    expect(ok(await removeDemoData(CTX, deps()))).toMatchObject({ removedSpaces: ['NLHR', 'NLFIN', 'NLSALES', 'NLHELP'], errorCode: null });
+    expect(removedSources).toHaveLength(2);
+    const deletes = conf.deletes.length;
+    expect(ok(await removeDemoData(CTX, deps()))).toMatchObject({ removedSpaces: [], keptSpaces: [], errorCode: null, status: { state: 'idle' } });
+    expect(conf.deletes).toHaveLength(deletes);
+    // Nothing loaded at all: nothing to remove.
+    stored = undefined;
+    expect(ok(await removeDemoData(CTX, deps()))).toMatchObject({ removedSpaces: [], errorCode: null, status: { state: 'idle' } });
+  });
+
+  it('a space Confluence is still deleting (202, still listed) is neither deleted twice nor reused by a load', async () => {
+    ok(await loadDemoData(CTX, {}, deps()));
+    conf.listedWhileDeleting = true;
+    expect(ok(await removeDemoData(CTX, deps()))).toMatchObject({ removedSpaces: KEYS, errorCode: null });
+    expect(ok(await removeDemoData(CTX, deps()))).toMatchObject({ removedSpaces: [], keptSpaces: [], errorCode: null });
+    expect(conf.deletes).toEqual(KEYS);
+    const created = conf.creates;
+    expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'failed', errorCode: 'space_being_deleted' });
+    expect(conf.creates).toBe(created);
+    // Once Confluence is done, the load creates everything anew.
+    conf.spaces.clear();
+    expect(ok(await loadDemoData(CTX, {}, deps()))).toMatchObject({ state: 'done' });
+    expect(conf.creates - created).toBe(DEMO_TOTAL);
+  });
+
+  it('waits while a load holds the lease; logs carry no space keys or account ids', async () => {
+    clock = 1_000;
+    stored = { state: 'loading', spaces: { NLHR: { id: '1', url: null } }, pages: {}, ownerAccountIds: OWNERS, errorCode: null, lease: 'other', lockedUntil: clock + 10_000, rev: 2 };
+    conf.spaces.set('NLHR', { id: '1', description: DEMO_MARKER });
+    expect(ok(await removeDemoData(CTX, deps()))).toMatchObject({ errorCode: 'demo_busy', status: { state: 'loading' } });
+    expect(conf.deletes).toEqual([]);
+    expect(writes).toBe(0);
+    clock += DEMO_LEASE_MS;
+    expect(ok(await removeDemoData(CTX, deps()))).toMatchObject({ removedSpaces: ['NLHR'], errorCode: null });
+    const logged = JSON.stringify([vi.mocked(console.warn).mock.calls, vi.mocked(console.info).mock.calls]);
+    for (const x of [...KEYS, ...OWNERS]) expect(logged).not.toContain(x);
+  });
+});
+
 describe('demoConfluence adapter', () => {
   it('creates spaces with REST v1 and sets the owner with a v2 PUT (version 2, same title and body)', async () => {
     apiReply = { status: 200, body: { id: 77, _links: { base: 'https://x.atlassian.net/wiki', webui: '/spaces/NLHR' } } };
@@ -472,6 +587,18 @@ describe('demoConfluence adapter', () => {
     apiReply = { status: 200, body: { results: [{ id: 5, key: 'NLHR', description: { plain: { value: `x ${DEMO_MARKER}` } }, _links: { webui: '/spaces/NLHR' } }], _links: { base: 'https://x.atlassian.net/wiki' } } };
     expect(await demoConfluence.findSpace('NLHR')).toEqual({ ok: true, value: { id: '5', url: 'https://x.atlassian.net/wiki/spaces/NLHR', description: `x ${DEMO_MARKER}` } });
     expect(apiCalls[0]?.path).toBe('/wiki/api/v2/spaces?keys=NLHR&description-format=plain&limit=1');
+  });
+
+  it('deletes a space with REST v1 DELETE: 202 long task → deleted, 404 → gone, other → status', async () => {
+    apiQueue.push({ status: 202, body: { id: 'task-1' } }, { status: 404, body: {} }, { status: 403, body: {} });
+    expect(await demoConfluence.deleteSpace('NLHR')).toEqual({ ok: true, value: 'deleted' });
+    expect(await demoConfluence.deleteSpace('NLHR')).toEqual({ ok: true, value: 'gone' });
+    expect(await demoConfluence.deleteSpace('NLHR')).toEqual({ ok: false, status: 403 });
+    expect(apiCalls.map((c) => [c.method, c.path])).toEqual(Array.from({ length: 3 }, () => ['DELETE', '/wiki/rest/api/space/NLHR']));
+  });
+
+  it('parses the removed state and the ids of spaces being deleted', () => {
+    expect(parseDemoState({ state: 'removed', spaces: {}, pages: {}, deletedSpaceIds: ['1', 2, '3'] })).toMatchObject({ state: 'removed', deletedSpaceIds: ['1', '3'] });
   });
 });
 

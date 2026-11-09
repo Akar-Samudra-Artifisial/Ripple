@@ -522,6 +522,21 @@ export interface LoadDemoPayload {
   retryOwners?: boolean;
 }
 
+/** Reply of `removeDemoData`. */
+export interface DemoRemoveResult {
+  /** Status after the removal (`idle` once everything Ripple created is gone). */
+  status: DemoStatus;
+  /** Demo spaces whose deletion Confluence accepted (it finishes in the background). */
+  removedSpaces: string[];
+  /** Spaces with a demo key Ripple did not delete: not recorded as created by Ripple, or without `DEMO_MARKER`. */
+  keptSpaces: string[];
+  /**
+   * `not_allowed`, `admin_check_failed`, `admin_needs_auth`, `demo_busy` (a load or removal is running), or the
+   * failing step (`space_find_http_500`, `space_delete_http_403`, …); null when done.
+   */
+  errorCode: string | null;
+}
+
 export interface CheckDemoOwnersPayload {
   ownerAccountIds: string[];
 }
@@ -562,6 +577,11 @@ export interface ResolverContract {
   loadDemoData: { payload: LoadDemoPayload; reply: DemoStatus };
   /** Jira administrators only: names of the owners (active Atlassian accounts) before `loadDemoData`. */
   checkDemoOwners: { payload: CheckDemoOwnersPayload; reply: DemoOwnersCheck };
+  /**
+   * Jira administrators only: deletes the demo spaces Ripple created (recorded and marked), the Ripple data of the
+   * demo source, and resets the demo state; idempotent.
+   */
+  removeDemoData: { payload: undefined; reply: DemoRemoveResult };
   /** On the source page: the latest confirmed change (for the Rollout tab). */
   getLatestChange: { payload: undefined; reply: LatestChangeReply };
   getPendingChange: { payload: undefined; reply: PendingChangeReply };

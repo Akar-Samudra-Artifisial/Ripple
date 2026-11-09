@@ -1,7 +1,8 @@
 /**
  * M6 "Load demo data": Confluence calls as the admin who pressed the button (resolvers only). Spaces are created with
  * REST v1 `POST /wiki/rest/api/space` (`write:confluence-space`; v2 space creation needs a scope Ripple does not
- * have), pages with REST v2 (`write:page:confluence`). Every call returns the HTTP status only, never a body.
+ * have), pages with REST v2 (`write:page:confluence`); "Remove demo data" deletes spaces with REST v1 DELETE. Every call
+ * returns the HTTP status only, never a body.
  */
 import api, { route } from '@forge/api';
 import type { UserResult } from './confluence';
@@ -27,6 +28,11 @@ export interface DemoConfluence {
    * owner differs, saves the next version with the same title and the body as read (so edits made meanwhile are kept).
    */
   ensureOwner(pageId: string, ownerAccountId: string): Promise<UserResult<true>>;
+  /**
+   * "Remove demo data": REST v1 `DELETE /wiki/rest/api/space/{key}` (`write:confluence-space`). `deleted` when
+   * Confluence accepted it (202, a long task that finishes in the background), `gone` when the space no longer exists.
+   */
+  deleteSpace(key: string): Promise<UserResult<'deleted' | 'gone'>>;
 }
 
 interface Links {
@@ -107,5 +113,11 @@ export const demoConfluence: DemoConfluence = {
       }),
     });
     return res.ok ? { ok: true, value: true } : { ok: false, status: res.status };
+  },
+
+  async deleteSpace(key) {
+    const res = await api.asUser().requestConfluence(route`/wiki/rest/api/space/${key}`, { method: 'DELETE', headers: json });
+    if (res.status === 404) return { ok: true, value: 'gone' };
+    return res.ok ? { ok: true, value: 'deleted' } : { ok: false, status: res.status };
   },
 };

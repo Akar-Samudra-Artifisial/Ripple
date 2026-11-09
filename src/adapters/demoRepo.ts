@@ -22,7 +22,13 @@ export interface DemoPage {
 }
 
 export interface DemoState {
-  state: 'loading' | 'done' | 'failed';
+  /** `removed`: "Remove demo data" ran; shown as idle, the next load starts from scratch. */
+  state: 'loading' | 'done' | 'failed' | 'removed';
+  /**
+   * Ids of spaces Ripple asked Confluence to delete. Deletion is a background task, so such a space may still be
+   * listed for a while: a load must not reuse it (`space_being_deleted`).
+   */
+  deletedSpaceIds?: string[];
   /** Space key → id and link. */
   spaces: Record<string, { id: string; url: string | null }>;
   /** Page slug → id, link and owner progress. */
@@ -62,7 +68,7 @@ function parsePage(raw: unknown): DemoPage | null {
 
 export function parseDemoState(raw: unknown): DemoState | undefined {
   const v = raw as Partial<Record<keyof DemoState, unknown>> | null;
-  if (!v || (v.state !== 'loading' && v.state !== 'done' && v.state !== 'failed')) return undefined;
+  if (!v || (v.state !== 'loading' && v.state !== 'done' && v.state !== 'failed' && v.state !== 'removed')) return undefined;
   const pages: Record<string, DemoPage> = {};
   for (const [slug, p] of Object.entries((v.pages as Record<string, unknown> | undefined) ?? {})) {
     const page = parsePage(p);
@@ -77,6 +83,7 @@ export function parseDemoState(raw: unknown): DemoState | undefined {
     lease: typeof v.lease === 'string' ? v.lease : '',
     lockedUntil: typeof v.lockedUntil === 'number' ? v.lockedUntil : 0,
     rev: typeof v.rev === 'number' ? v.rev : 0,
+    ...(Array.isArray(v.deletedSpaceIds) ? { deletedSpaceIds: v.deletedSpaceIds.filter((x): x is string => typeof x === 'string') } : {}),
   };
 }
 
