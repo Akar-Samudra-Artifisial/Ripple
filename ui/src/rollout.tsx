@@ -1,6 +1,6 @@
 import { router } from '@forge/bridge';
-import { useCallback, useEffect, useState } from 'react';
-import type { ProposalState, Rollout, RolloutItem } from '../../src/core/views';
+import { useCallback, useEffect, useId, useState } from 'react';
+import type { IssuesStateView, ProposalState, Rollout, RolloutIssue, RolloutItem } from '../../src/core/views';
 import { call } from './bridge';
 import { Alert, LoadingRows, errorOf } from './components';
 import { PROPOSAL_STATUS_LABEL, proposalProblem } from './proposalText';
@@ -35,7 +35,8 @@ export function RolloutTab({ changeId, onGone }: { changeId: string; onGone: () 
     void load();
   }, [load]);
 
-  const open = rollout ? rollout.items.some((i) => OPEN.has(i.status)) : false;
+  // Keep polling while proposals are open or the Jira tasks are still being created.
+  const open = rollout ? rollout.items.some((i) => OPEN.has(i.status)) || rollout.issuesState === 'pending' : false;
   useEffect(() => {
     if (!open) return;
     const timer = setInterval(() => void load(), POLL_MS);
@@ -74,7 +75,6 @@ export function RolloutTab({ changeId, onGone }: { changeId: string; onGone: () 
               </li>
             ))}
           </ul>
-          <p className="muted source__meta">Page owners see the suggestion in the Ripple byline on their page and approve it there.</p>
           {items.length > 0 ? (
             <ul className="rollout__list" aria-label="Copy pages">
               {items.map((i) => (
@@ -87,6 +87,7 @@ export function RolloutTab({ changeId, onGone }: { changeId: string; onGone: () 
               {rollout.hiddenCount} {rollout.hiddenCount === 1 ? 'copy is' : 'copies are'} in pages you can't view.
             </p>
           ) : null}
+          <JiraTasks state={rollout.issuesState} issues={rollout.issues} />
         </>
       )}
       <div className="actions">
@@ -95,6 +96,68 @@ export function RolloutTab({ changeId, onGone }: { changeId: string; onGone: () 
         </button>
       </div>
     </div>
+  );
+}
+
+const ISSUES_NOTE: Record<IssuesStateView, string> = {
+  not_configured: 'No Jira project set. Choose one in Ripple settings.',
+  pending: 'Creating Jira tasks…',
+  created: 'One Jira task per page owner.',
+  partial: 'Some Jira tasks could not be created. Owners without a task still see the suggestion on their page.',
+  failed: 'Ripple could not create Jira tasks for this change. Owners still see the suggestion on their page.',
+};
+
+/**
+ * M5 Jira tasks of the change: one row per owner that actually has an issue; the note says what happened to the rest
+ * (never claims a task or notification that does not exist).
+ */
+function JiraTasks({ state, issues }: { state: IssuesStateView; issues: readonly RolloutIssue[] }) {
+  const headingId = useId();
+  const note = state === 'created' && issues.length === 0 ? 'No Jira tasks were needed for this change.' : ISSUES_NOTE[state];
+  const tone = state === 'partial' || state === 'failed' ? ' jira__note--warning' : '';
+  return (
+    <section className="jira" aria-labelledby={headingId}>
+      <h3 id={headingId} className="jira__title">
+        Jira tasks
+      </h3>
+      <p className={`muted source__meta jira__note${tone}`} role="status">
+        {note}
+      </p>
+      {issues.length > 0 ? (
+        <ul className="rollout__list" aria-label="Jira tasks by owner">
+          {issues.map((i) => (
+            <li key={i.issueKey} className="rollout__row jira__row">
+              <span className="jira__owner">{i.ownerName ?? "Owner you can't view"}</span>
+              <span aria-hidden="true" className="muted">
+                ·
+              </span>
+              {i.issueUrl ? (
+                <a
+                  className="copy__link jira__key"
+                  href={i.issueUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    void router.open(i.issueUrl as string).catch(() => undefined);
+                  }}
+                >
+                  {i.issueKey}
+                  <span className="sr-only"> (opens in a new tab)</span>
+                </a>
+              ) : (
+                <span className="jira__key">{i.issueKey}</span>
+              )}
+              <span className={`badge ${i.status === 'done' ? 'badge--proposal-applied' : 'badge--proposal-proposed'}`}>{i.status === 'done' ? 'Done' : 'Open'}</span>
+              <span className="muted source__meta">
+                {i.pageCount} {i.pageCount === 1 ? 'page' : 'pages'}
+              </span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      <p className="muted source__meta">Owners approve each suggestion in the Ripple byline on their Confluence page.</p>
+    </section>
   );
 }
 

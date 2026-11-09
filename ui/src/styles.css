@@ -1065,3 +1065,56 @@ ul {
   flex-basis: 100%;
   font-size: 12px;
 }
+
+/* M5 Jira tasks (Rollout tab), settings page, Jira issue panel */
+.jira {
+  margin: 12px 0 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--ds-border, #dcdfe4);
+}
+
+.jira__title {
+  margin: 0 0 4px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.jira__note--warning {
+  color: var(--ds-text-warning, #a54800);
+}
+
+.jira__owner {
+  font-weight: 600;
+}
+
+.jira__key {
+  font-family: var(--ds-font-family-code, ui-monospace, monospace);
+}
+
+.field__error {
+  margin: 4px 0 0;
+  color: var(--ds-text-danger, #ae2e24);
+  font-size: 12px;
+}
+
+.settings {
+  max-width: 560px;
+}
+
+.settings__intro {
+  margin: 0 0 12px;
+}
+
+.settings__input {
+  max-width: 200px;
+  text-transform: uppercase;
+}
+
+.settings__input[readonly] {
+  background: var(--ds-background-disabled, #091e4208);
+  color: var(--ds-text-subtle, #44546f);
+}
+
+.settings__result p {
+  margin: 8px 0 0;
+}

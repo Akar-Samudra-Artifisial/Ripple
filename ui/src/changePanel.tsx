@@ -328,7 +328,13 @@ function ChangeReview({ mode, onDecided }: ChangeReviewProps) {
               </select>
               <span className="muted change__due">Due {dueDate}</span>
             </label>
-            <p className="muted change__note">Nothing is sent until you press Send update proposals.</p>
+            <p className="muted change__note">
+              Nothing is sent until you press Send update proposals.
+              {change.jiraConfigured ? ' Ripple then creates one Jira task per page owner.' : null}
+            </p>
+            {change.jiraConfigured ? null : (
+              <p className="muted change__note change__note--jira">No Jira project is set in Ripple settings, so no Jira tasks will be created until one is chosen. Owners still see the suggestion on their page.</p>
+            )}
             <div className="actions">
               <button type="button" className="button button--primary" disabled={busy} aria-busy={pending === 'confirmChange'} onClick={() => void decide('confirmChange')}>
                 {pending === 'confirmChange' ? 'Confirming…' : 'Send update proposals'}
