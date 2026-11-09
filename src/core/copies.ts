@@ -27,6 +27,8 @@ export interface ScanFact {
   unit: string | null;
   condition: string | null;
   previousValue: string | null;
+  /** Position among the source's facts (extraction order); absent = position in the scan's fact list. */
+  order?: number;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -421,7 +423,7 @@ export interface Judgement {
 }
 
 /** Fixed reason codes of the judge's `reason_code` field; the only judge wording ever logged. */
-export const JUDGE_REASON_CODES = ['value_differs', 'value_matches', 'different_condition', 'sibling_fact', 'different_subject', 'historical', 'no_mention', 'ambiguous'] as const;
+export const JUDGE_REASON_CODES = ['no_mention', 'value_matches', 'value_differs', 'different_condition', 'sibling_fact', 'different_subject', 'historical', 'ambiguous'] as const;
 export type ReasonCode = (typeof JUDGE_REASON_CODES)[number] | 'other';
 
 export const parseReasonCode = (v: unknown): ReasonCode => JUDGE_REASON_CODES.find((x) => x === v) ?? 'other';
@@ -593,7 +595,8 @@ export type NotCopyReason = 'not_same_fact' | 'example' | 'value_not_comparable'
  * fact's. Sibling mentions are no copy of this fact; only a condition the source does not cover is "different".
  */
 function isSiblingMention(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[]): boolean {
-  if (j.reasonCode === 'sibling_fact') return true;
+  // The judge's own "sibling_fact" counts only when the source really has a sibling (see `judgeOutcome` otherwise).
+  if (j.reasonCode === 'sibling_fact') return siblings.some((s) => s.id !== fact.id);
   if (!j.statedCondition || sameCondition(fact, j.statedCondition)) return false;
   return siblings.some((s) => s.id !== fact.id && s.condition !== null && sameCondition(s, j.statedCondition));
 }
@@ -603,11 +606,15 @@ function isSiblingMention(fact: ScanFact, j: Judgement, siblings: readonly ScanF
  * condition (e.g. per diem for external training vs domestic travel); such a current mention with a comparable value
  * is still reported as `unsure` (PRD: different condition → unsure), only an unrelated "no" is dropped.
  */
-export function judgeOutcome(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[] = []): { decision: CopyDecision | null; reason?: NotCopyReason } {
-  if (j.mention === 'example') return { decision: null, reason: 'example' };
-  if (isSiblingMention(fact, j, siblings)) return { decision: null, reason: 'sibling_fact' };
+export function judgeOutcome(fact: ScanFact, judged: Judgement, siblings: readonly ScanFact[] = []): { decision: CopyDecision | null; reason?: NotCopyReason } {
+  if (judged.mention === 'example') return { decision: null, reason: 'example' };
+  if (isSiblingMention(fact, judged, siblings)) return { decision: null, reason: 'sibling_fact' };
+  // "sibling_fact" without any sibling in the source: the judge is unsure which fact it is (never dropped, never drift).
+  const j: Judgement = judged.reasonCode === 'sibling_fact' && judged.mention === 'current' ? { ...judged, sameFact: 'unsure', reasonCode: 'ambiguous' } : judged;
   if (j.sameFact === 'no') {
-    const otherCondition = j.mention === 'current' && (j.reasonCode === 'different_condition' || (j.statedCondition !== null && !sameCondition(fact, j.statedCondition)));
+    // Only the judge's explicit "different_condition" keeps a "no" as unsure; a stated condition alone does not
+    // (with different_subject / ambiguous / other the sentence is about something else).
+    const otherCondition = j.mention === 'current' && j.reasonCode === 'different_condition';
     if (!otherCondition || compareValues({ value: fact.value, unit: fact.unit }, { value: j.statedValue, unit: j.statedUnit }) === 'unknown') {
       return { decision: null, reason: 'not_same_fact' };
     }
@@ -646,16 +653,28 @@ export interface PageMention {
   reason?: NotCopyReason;
 }
 
-const firstNumber = (v: string): number | undefined => numbersIn(v)[0];
+/** Same sentence on a page: equal after normalising, or one quote contains the other (the judge trims differently). */
+function sameSentence(a: string, b: string): boolean {
+  const x = normaliseKeyPart(a);
+  const y = normaliseKeyPart(b);
+  return x.length > 0 && y.length > 0 && (x === y || x.includes(y) || y.includes(x));
+}
+
+/** True when the unsure card comes from a condition other than the fact's own. */
+const otherConditionCard = (i: PageMention): boolean =>
+  i.judgement.reasonCode === 'different_condition' || (i.judgement.statedCondition !== null && !sameCondition(i.fact, i.judgement.statedCondition));
 
 /**
- * Page-level guard against one sentence becoming cards for several sibling facts (same subject and attribute, other
- * condition), per quote:
- * - an `unsure` for a fact whose sibling got in sync / drifted / historical from the same quote is dropped (the
- *   sentence is about the sibling: "$75 for domestic trips" is no unsure international copy);
- * - several `unsure` for sibling facts from the same quote ("$40 for external training" for both per diems) keep one:
- *   the fact whose official value is nearest to the stated one (first fact on a tie).
- * Dropped mentions get reason `sibling_fact`. Mentions of unrelated facts are untouched.
+ * Page-level guard so one sentence gives at most one card per sibling family (facts with the same subject and
+ * attribute, other condition):
+ * - an `unsure` whose sibling got in sync / drifted / historical from the same sentence is dropped (the sentence is
+ *   about the sibling: "$75 for domestic trips" is no unsure international copy);
+ * - the remaining `unsure` cards of a family for one sentence become one card, on the preferred fact of the family:
+ *   the fact without a condition (general rule) first, then the fact's order in the source. A card for a condition
+ *   the source lacks ("$40 for external training") moves to that fact even when the judge named only a sibling, if
+ *   the preferred fact has no mention of that sentence and the card stays unsure for it; otherwise the preferred fact
+ *   among the mentioned ones keeps it.
+ * Dropped mentions get reason `sibling_fact`; a moved card is appended. Mentions of unrelated facts are untouched.
  */
 export function settleSiblings(items: readonly PageMention[], facts: readonly ScanFact[]): PageMention[] {
   const out = items.map((i) => ({ ...i }));
@@ -663,35 +682,38 @@ export function settleSiblings(items: readonly PageMention[], facts: readonly Sc
     i.decision = null;
     i.reason = 'sibling_fact';
   };
-  const byQuote = new Map<string, PageMention[]>();
-  for (const i of out) {
-    const key = normaliseKeyPart(i.judgement.quote);
-    byQuote.set(key, [...(byQuote.get(key) ?? []), i]);
-  }
-  for (const group of byQuote.values()) {
-    const siblingIds = (i: PageMention) => new Set(siblingsOf(i.fact, facts).map((s) => s.id).filter((id) => id !== i.fact.id));
-    for (const u of group) {
-      if (u.decision?.status !== 'unsure') continue;
-      const ids = siblingIds(u);
-      if (group.some((o) => o !== u && ids.has(o.fact.id) && o.decision && o.decision.status !== 'unsure')) drop(u);
+  const rank = (f: ScanFact): [number, number] => {
+    const at = facts.findIndex((x) => x.id === f.id);
+    const known = facts[at] ?? f;
+    return [known.condition === null ? 0 : 1, known.order ?? at];
+  };
+  const before = (a: ScanFact, b: ScanFact) => {
+    const [ra, rb] = [rank(a), rank(b)];
+    return ra[0] !== rb[0] ? ra[0] < rb[0] : ra[1] !== rb[1] ? ra[1] < rb[1] : a.id < b.id;
+  };
+  const family = (f: ScanFact) => new Set([f.id, ...siblingsOf(f, facts).map((s) => s.id)]);
+  const moved: PageMention[] = [];
+  for (const u of out) {
+    if (u.decision?.status !== 'unsure') continue;
+    const ids = family(u.fact);
+    if (ids.size < 2) continue;
+    const group = out.filter((o) => ids.has(o.fact.id) && sameSentence(o.judgement.quote, u.judgement.quote));
+    if (group.some((o) => o.decision && o.decision.status !== 'unsure')) {
+      for (const o of group) if (o.decision?.status === 'unsure') drop(o);
+      continue;
     }
-    const unsure = group.filter((i) => i.decision?.status === 'unsure');
-    for (const u of unsure) {
-      if (!u.decision) continue;
-      const ids = siblingIds(u);
-      const rivals = unsure.filter((o) => o !== u && o.decision && ids.has(o.fact.id));
-      if (rivals.length === 0) continue;
-      const stated = firstNumber(u.judgement.statedValue);
-      const dist = (i: PageMention) => {
-        const a = firstNumber(i.fact.value);
-        return stated === undefined || a === undefined ? Number.POSITIVE_INFINITY : Math.abs(a - stated);
-      };
-      const order = (i: PageMention) => facts.findIndex((f) => f.id === i.fact.id);
-      const best = [u, ...rivals].reduce((b, i) => (dist(i) < dist(b) || (dist(i) === dist(b) && order(i) < order(b)) ? i : b));
-      for (const i of [u, ...rivals]) if (i !== best) drop(i);
-    }
+    const unsure = group.filter((o) => o.decision?.status === 'unsure');
+    const keep = unsure.reduce((b, o) => (before(o.fact, b.fact) ? o : b));
+    for (const o of unsure) if (o !== keep) drop(o);
+    const target = facts.filter((f) => ids.has(f.id)).reduce((b, f) => (before(f, b) ? f : b));
+    if (target.id === keep.fact.id || !otherConditionCard(keep) || group.some((o) => o.fact.id === target.id)) continue;
+    const judgement = { ...keep.judgement, factId: target.id };
+    const outcome = judgeOutcome(target, judgement, siblingsOf(target, facts));
+    if (outcome.decision?.status !== 'unsure') continue;
+    moved.push({ fact: target, judgement, ...outcome });
+    drop(keep);
   }
-  return out;
+  return [...out, ...moved];
 }
 
 const RANK: Record<CopyStatus, number> = { drifted: 5, in_sync: 4, unsure: 3, historical: 2, updated: 1, ignored: 0 };

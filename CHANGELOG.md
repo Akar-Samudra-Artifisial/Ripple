@@ -38,6 +38,7 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Halaman arsip/draft tidak lagi menjadi kandidat salinan. Pengecualian space lewat pengaturan belum ada.
 
 ### Fixed
+- Aturan fakta saudara dan kondisi lebih ketat: `sibling_fact` hanya membuang mention bila sumber memang punya fakta saudara (selain itu Tidak pasti, drift tidak hilang); jawaban "no" menjadi Tidak pasti hanya dengan `reason_code` `different_condition`; kartu Tidak pasti untuk kondisi yang tidak ada di sumber (mis. pelatihan) dipasang pada fakta pilihan keluarga saudara (tanpa kondisi dulu, lalu urutan di sumber) menggantikan heuristik nilai terdekat, satu kartu per kalimat per halaman (kutipan yang dipotong berbeda tetap dianggap satu kalimat); enum `reason_code` diurutkan netral.
 - Salinan dengan nilai sama kembali In sync walaupun judge ragu (`reason_code` value_matches, nilai sama, kondisi tidak berbeda), bukan "not sure this is the same fact".
 - Satu kalimat tidak lagi menghasilkan kartu Tidak pasti untuk fakta saudara (atribut sama, kondisi lain yang juga ada di sumber, mis. per diem domestik vs internasional): kode baru `sibling_fact` di prompt judge, kondisi yang cocok dengan fakta saudara diabaikan, dan per kutipan di halaman yang sama hanya satu kartu per kelompok saudara (yang cocok/menyimpang menang; bila semuanya Tidak pasti, fakta dengan nilai resmi terdekat). Kondisi yang tidak ada di sumber (mis. pelatihan) tetap Tidak pasti.
 - Log `ripple judge page` mengisi `reasonCode` di setiap fakta (`no_mention` bila tidak ada mention yang dinilai).

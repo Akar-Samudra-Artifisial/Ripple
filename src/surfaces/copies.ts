@@ -74,10 +74,11 @@ const NOT_ALLOWED = 'You need edit permission on this page to do that.';
 
 /** Confirmed facts of the source, in a stable order (by id). */
 async function scanFactsOf(facts: FactRepo, sourcePageId: string): Promise<ScanFact[]> {
+  // listFacts keeps the insert (extraction) order within a status: that is the fact's order in the source.
   return (await facts.listFacts(sourcePageId))
     .filter((f) => f.status === 'confirmed')
-    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-    .map((f) => ({ id: f.id, type: f.type, subject: f.subject, attribute: f.attribute, value: f.value, unit: f.unit, condition: f.condition, previousValue: f.previousValue }));
+    .map((f, order) => ({ id: f.id, type: f.type, subject: f.subject, attribute: f.attribute, value: f.value, unit: f.unit, condition: f.condition, previousValue: f.previousValue, order }))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
 const scanView = (s: ScanRow): ScanView => ({

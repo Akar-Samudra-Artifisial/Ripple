@@ -32,6 +32,7 @@ import {
   parseJudgement,
   parseReasonCode,
   settleSiblings,
+  siblingsOf,
   parseTermSuggestions,
   strongest,
   type Judgement,
@@ -84,8 +85,8 @@ class FakeFacts {
   }
   async listFacts(pageId: string): Promise<FactView[]> {
     if (!this.sources.has(pageId)) return [];
-    // Reverse order on purpose: the scan sorts by id itself.
-    return [...FACTS].reverse().map((f) => ({ ...f, quote: 'q', status: this.status, edited: false, pageVersion: 3, effectiveSince: null }));
+    // Source (insert) order, like the real query; the scan keeps it as `order` and sorts by id itself.
+    return [...FACTS].map((f) => ({ ...f, quote: 'q', status: this.status, edited: false, pageVersion: 3, effectiveSince: null }));
   }
   async audit(action: string) {
     this.audits.push(action);
@@ -548,10 +549,56 @@ describe('parseJudgement', () => {
       });
       const settled = (items: ReturnType<typeof m>[]) => settleSiblings(items, FACTS).map((i) => i.decision?.status ?? i.reason);
       expect(settled([m('domestic', 'drifted', '$75'), m('international', 'unsure', '$75')])).toEqual(['drifted', 'sibling_fact']);
-      // Both unsure (training $40): the nearest official value wins (domestic 60 vs international 90).
+      // Both unsure (training $40): the preferred fact wins (no condition first, then source order: domestic before international).
       expect(settled([m('international', 'unsure', '$40'), m('domestic', 'unsure', '$40')])).toEqual(['sibling_fact', 'unsure']);
+      // Source order comes from `order` when set, not from the position in the list.
+      const reordered = FACTS.map((f) => ({ ...f, order: f.id === factId('international') ? 0 : 1 }));
+      expect(settleSiblings([m('international', 'unsure', '$40'), m('domestic', 'unsure', '$40')], reordered).map((i) => i.decision?.status ?? i.reason)).toEqual(['unsure', 'sibling_fact']);
+      // A sibling without a condition (general rule) is preferred over source order.
+      const general = FACTS.map((f) => (f.id === factId('international') ? { ...f, condition: null } : f));
+      expect(settleSiblings([m('domestic', 'unsure', '$40'), m('international', 'unsure', '$40')], general).map((i) => i.decision?.status ?? i.reason)).toEqual(['sibling_fact', 'unsure']);
       // Other quotes and unrelated facts are untouched.
       expect(settled([m('domestic', 'drifted', '$75'), m('international', 'unsure', '$75', 'Abroad: $75.'), m('claims', 'unsure', '$75')])).toEqual(['drifted', 'unsure', 'unsure']);
+    });
+
+    it('settleSiblings, live shape of 12c67ab: the judge names only the international per diem for the training sentence → one unsure card on the preferred fact', () => {
+      const text = 'The per diem for external training is $40 per day.';
+      const intl = judgement('international', { sameFact: 'no', statedValue: '$40', statedUnit: 'per day', statedCondition: 'External training', quote: text, reasonCode: 'different_condition' });
+      const only = settleSiblings([{ fact: fact('international'), judgement: intl, ...judgeOutcome(fact('international'), intl, [fact('domestic')]) }], FACTS);
+      expect(only.map((i) => [i.fact.id, i.decision?.status ?? i.reason])).toEqual([
+        [factId('international'), 'sibling_fact'],
+        [factId('domestic'), 'unsure'],
+      ]);
+      expect(only[1]?.judgement.factId).toBe(factId('domestic'));
+      // Quotes trimmed differently per fact still count as one sentence: one card per sentence per page.
+      const dom = judgement('domestic', { sameFact: 'unsure', statedValue: '$40', statedUnit: 'per day', statedCondition: 'External training', quote: 'per diem for external training is $40 per day', reasonCode: 'different_condition' });
+      const both = settleSiblings(
+        [
+          { fact: fact('international'), judgement: intl, ...judgeOutcome(fact('international'), intl, [fact('domestic')]) },
+          { fact: fact('domestic'), judgement: dom, ...judgeOutcome(fact('domestic'), dom, [fact('international')]) },
+        ],
+        FACTS,
+      );
+      expect(both.filter((i) => i.decision).map((i) => [i.fact.id, i.decision?.status])).toEqual([[factId('domestic'), 'unsure']]);
+      // A card from the fact's own condition (judge unsure which fact) is never moved to a sibling.
+      const own = judgement('international', { sameFact: 'unsure', statedValue: '$40', statedCondition: 'International travel', quote: text, reasonCode: 'ambiguous' });
+      expect(settleSiblings([{ fact: fact('international'), judgement: own, ...judgeOutcome(fact('international'), own, [fact('domestic')]) }], FACTS).map((i) => [i.fact.id, i.decision?.status])).toEqual([[factId('international'), 'unsure']]);
+    });
+
+    it('sibling_fact counts only when the source has a sibling; otherwise the mention stays (unsure, never lost)', () => {
+      const claims = (over: Partial<Judgement>) => judgeOutcome(fact('claims'), judgement('claims', { statedValue: '45 days', statedUnit: 'days', quote: 'q', reasonCode: 'sibling_fact', ...over }), siblingsOf(fact('claims'), FACTS));
+      expect(siblingsOf(fact('claims'), FACTS)).toEqual([]);
+      for (const sameFact of ['yes', 'no', 'unsure'] as const) expect(claims({ sameFact }).decision?.status, sameFact).toBe('unsure');
+      expect(claims({ mention: 'historical' }).decision?.status).toBe('historical');
+      // With a real sibling it is still dropped.
+      expect(judgeOutcome(fact('domestic'), judgement('domestic', { statedValue: '$90', quote: 'q', reasonCode: 'sibling_fact' }), [fact('international')])).toEqual({ decision: null, reason: 'sibling_fact' });
+    });
+
+    it('"no" with a stated condition is unsure only for reason_code different_condition', () => {
+      const training = { stated_value: '$40', quote: 'Training per diem: $40 per day.', same_fact: 'no', stated_condition: 'External training' };
+      const text = 'Training per diem: $40 per day.';
+      for (const code of ['different_subject', 'ambiguous', 'other', 'made up']) expect(status({ ...training, reason_code: code }, text), code).toEqual({ decision: null, reason: 'not_same_fact' });
+      expect(status({ ...training, reason_code: 'different_condition' }, text)?.decision?.status).toBe('unsure');
     });
 
     it('(c) another topic → not a copy', () => {
@@ -604,8 +651,8 @@ describe('decideStatus', () => {
       const d = decideStatus(fact('domestic'), judgement('domestic', { sameFact, statedValue: '$40', statedCondition: 'External training', quote: 'The per diem for external training is $40 per day.' }), siblings);
       expect(d?.status).toBe('unsure');
     }
-    // The judge is told to say "no" for another condition: still unsure (L&D budget page), not dropped.
-    expect(judgeOutcome(fact('domestic'), judgement('domestic', { sameFact: 'no', statedValue: '$40', statedCondition: 'External training', quote: 'x' }), siblings).decision?.status).toBe('unsure');
+    // "no" with reason_code different_condition: still unsure (L&D budget page), not dropped.
+    expect(judgeOutcome(fact('domestic'), judgement('domestic', { sameFact: 'no', statedValue: '$40', statedCondition: 'External training', quote: 'x', reasonCode: 'different_condition' }), siblings).decision?.status).toBe('unsure');
     // An unrelated "no" (same condition or none, or a value of another kind) is not a copy.
     expect(judgeOutcome(fact('domestic'), judgement('domestic', { sameFact: 'no', statedValue: '$40', statedCondition: null, quote: 'x' }))).toEqual({ decision: null, reason: 'not_same_fact' });
     expect(judgeOutcome(fact('domestic'), judgement('domestic', { sameFact: 'no', statedValue: 'economy', statedCondition: 'External training', quote: 'x' }))).toEqual({ decision: null, reason: 'not_same_fact' });
@@ -664,14 +711,14 @@ describe('copy scan (search + judge consumers)', () => {
     const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
     try {
       // The real judge answers "no" for the training per diem (another condition), as its prompt tells it to.
-      await fullScan(jobDeps({ llm: fakeLlm(llmCalls, undefined, (m) => (m.stated_condition === 'External training' ? { ...m, same_fact: 'no' } : m)) }));
+      await fullScan(jobDeps({ llm: fakeLlm(llmCalls, undefined, (m) => (m.stated_condition === 'External training' ? { ...m, same_fact: 'no', reason_code: 'different_condition' } : m)) }));
       const pageLog = (title: string) => {
         const id = COPY_PAGES.find((p) => p.title === title)?.id;
         return info.mock.calls.find((c) => c[0] === 'ripple judge page' && (c[1] as { pageId: string }).pageId === id)?.[1] as { facts: { factId: string; outcome: string }[]; dropReasons: Record<string, number> };
       };
       expect(pageLog('Finance FAQ').facts).toContainEqual({ factId: factId('claims'), outcome: 'drifted', reasonCode: 'other' });
       const training = COPY_PAGES.find((p) => p.kind === 'trap' && p.expect.domestic === 'unsure');
-      expect(pageLog(training?.title ?? '').facts).toContainEqual({ factId: factId('domestic'), outcome: 'unsure', reasonCode: 'other' });
+      expect(pageLog(training?.title ?? '').facts).toContainEqual({ factId: factId('domestic'), outcome: 'unsure', reasonCode: 'different_condition' });
       expect(scans.statusOf('domestic', training?.id ?? '')).toBe('unsure');
       const logged = JSON.stringify(info.mock.calls.filter((c) => c[0] === 'ripple judge page'));
       expect(logged).not.toMatch(/acc-1|per diem|\$40|External training/i);
@@ -739,6 +786,17 @@ describe('copy scan (search + judge consumers)', () => {
     } finally {
       info.mockRestore();
     }
+  });
+
+  it('live run of 12c67ab: the judge names only the international per diem for the training sentence → domestic unsure only', async () => {
+    const live = (m: JudgeMention): JudgeMention => {
+      const status = COPY_PAGES.find((p) => p.judge.includes(m))?.expect[m.fact];
+      if (status === 'unsure') return { ...m, fact: 'international', same_fact: 'no', reason_code: 'different_condition' };
+      if (status === 'historical') return { ...m, reason_code: 'historical' };
+      return { ...m, reason_code: status === 'drifted' ? 'value_differs' : 'value_matches' };
+    };
+    await fullScan(jobDeps({ llm: fakeLlm(llmCalls, undefined, live) }));
+    for (const p of COPY_PAGES) for (const k of KEYS) expect(scans.statusOf(k, p.id), `${p.title} / ${k}`).toBe(p.expect[k] ?? null);
   });
 
   it('keeps at most 200 candidates per fact', async () => {
