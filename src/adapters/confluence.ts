@@ -193,11 +193,29 @@ const restrictedBy = (r: RawRestrictions): boolean => {
   return n(r.restrictions?.user) + n(r.restrictions?.group) > 0;
 };
 
+export interface AppPageLink {
+  title: string;
+  /** `_links.base` + `_links.webui` (its path carries the title slug): only for pages that may be named. */
+  url: string | null;
+  /** `<site>/wiki/pages/viewpage.action?pageId=<id>`: no title in it, for pages that may not be named. */
+  idUrl: string | null;
+}
+
+/** Link to a page by id only (no title slug), on the site of `base` (`_links.base`); null when not https. */
+export function pageIdUrl(base: string | undefined, pageId: string): string | null {
+  if (!base || !/^https:\/\//.test(base) || !/^\d{1,32}$/.test(pageId)) return null;
+  try {
+    return `${new URL(base).origin}/wiki/pages/viewpage.action?pageId=${pageId}`;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Title and absolute URL (`_links.base` + `_links.webui`) of a page as the app, for links outside Confluence (Jira
- * issues). Null when the page cannot be read. Never throws.
+ * Title and absolute URLs of a page as the app, for links outside Confluence (Jira issues). Null when the page cannot
+ * be read. Never throws.
  */
-export async function pageLinkAsApp(pageId: string): Promise<{ title: string; url: string | null } | null> {
+export async function pageLinkAsApp(pageId: string): Promise<AppPageLink | null> {
   try {
     const res = await api.asApp().requestConfluence(route`/wiki/api/v2/pages/${pageId}`, { headers: { Accept: 'application/json' } });
     if (!res.ok) return null;
@@ -205,7 +223,7 @@ export async function pageLinkAsApp(pageId: string): Promise<{ title: string; ur
     const base = page._links?.base;
     const webui = page._links?.webui;
     const url = base && webui && /^https:\/\//.test(base) && webui.startsWith('/') ? `${base}${webui}` : null;
-    return { title: page.title ?? '', url };
+    return { title: page.title ?? '', url, idUrl: pageIdUrl(base, pageId) };
   } catch {
     return null;
   }
@@ -214,7 +232,8 @@ export async function pageLinkAsApp(pageId: string): Promise<{ title: string; ur
 /**
  * True when the page's title may be named to anyone (version messages): the app reads its space, and neither the
  * page nor any ancestor has a read restriction (REST v1 `restriction/byOperation/read`, as the app). Any failure
- * counts as restricted. Space permissions themselves cannot be read with the app's scopes.
+ * counts as restricted. Space permissions themselves cannot be read with the app's scopes (`read:space.permission:
+ * confluence` is not granted), so a page in a space only some groups can view counts as open: see docs/PRIVACY.md.
  */
 export async function pageIsOpen(pageId: string): Promise<boolean> {
   try {

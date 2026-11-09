@@ -469,7 +469,7 @@ describe('proposal resolvers', () => {
     const issues = {
       getJiraSettings: async () => ({ projectKey: 'OPS' }),
       listForChange: async () => [
-        { changeId: CHANGE_ID, ownerAccountId: 'acc-owner', sourcePageId: SOURCE, issueId: '1', issueKey: 'OPS-1', issueUrl: 'https://x/browse/OPS-1', assigneeSet: true, pageCount: 1, status: 'closed' as const },
+        { changeId: CHANGE_ID, ownerAccountId: 'acc-owner', sourcePageId: SOURCE, issueId: '1', issueKey: 'OPS-1', issueUrl: 'https://x/browse/OPS-1', assigneeSet: true, pageCount: 1, status: 'closed' as const, attempts: 1, commentSent: true },
       ],
     };
     const rollout = (await listRollout(ctx(SOURCE), { changeId: CHANGE_ID }, deps({ issues }))) as Rollout;

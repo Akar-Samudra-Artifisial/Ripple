@@ -265,14 +265,20 @@ describe('spaceTeamsLookup (cache and dedup)', () => {
     expect(r).not.toHaveBeenCalled();
   });
 
-  it('miss: reads the graph and stores the answer, also "no teams"', async () => {
+  it('miss: reads the graph and stores a complete, non-empty answer only', async () => {
     const { cache, puts } = memCache();
     expect(await lookupWith(cache, read({ teams: T }))('7')).toMatchObject({ teams: T, origin: 'live' });
+    // "No teams" may only mean this user's graph access is limited: shown, never stored for other users.
     expect(await lookupWith(cache, read({ teams: [] }))('8')).toMatchObject({ teams: [], origin: 'live', dataPresent: true });
-    expect(puts).toEqual([
-      ['7', T],
-      ['8', []],
-    ]);
+    // A list with more pages is not the space's full list: shown, not stored.
+    expect(await lookupWith(cache, read({ teams: T, hasNextPage: true }))('9')).toMatchObject({ teams: T, origin: 'live' });
+    expect(puts).toEqual([['7', T]]);
+  });
+
+  it('an empty answer does not overwrite a cached team list', async () => {
+    const old = memCache({ teams: T, ageSeconds: SPACE_TEAMS_FRESH_SECONDS + 1 });
+    expect(await lookupWith(old.cache, read({ teams: [] }))('7')).toMatchObject({ teams: [], origin: 'live' });
+    expect(old.puts).toEqual([]);
   });
 
   it('expired entry and a failing graph: the stale entry (≤24 h) is shown without errors; errors are never stored', async () => {

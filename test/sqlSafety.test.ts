@@ -173,21 +173,34 @@ describe('migration identifiers (TiDB rejects unquoted reserved words with ER_PA
 });
 
 describe('change_issues (M5)', () => {
-  it('claims with INSERT IGNORE, then takes over only failed or stale claims; bound values, no LIMIT', async () => {
+  it('claims with INSERT IGNORE, then takes over only failed (< 3 attempts) or stale claims with a new token; bound values, no LIMIT', async () => {
     affected = (s) => (s.startsWith('INSERT IGNORE') ? 0 : 1);
-    expect(await sqlChangeIssueRepo.claim('ch-1', 'acc-1', '9600001', 2)).toBe(true);
-    expect(calls[0]?.statement).toBe("INSERT IGNORE INTO change_issues (change_id, owner_account_id, source_page_id, page_count, status) VALUES (?, ?, ?, ?, 'creating')");
-    expect(calls[0]?.params).toEqual(['ch-1', 'acc-1', '9600001', 2]);
-    expect(calls[1]?.statement).toContain("(status = 'failed' OR (status = 'creating' AND updated_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 300 SECOND)))");
-    expect(calls[1]?.params).toEqual([2, 'ch-1', 'acc-1']);
+    const token = await sqlChangeIssueRepo.claim('ch-1', 'acc-1', '9600001', 2);
+    expect(token).toMatch(/^[0-9a-f-]{36}$/);
+    expect(calls[0]?.statement).toBe(
+      "INSERT IGNORE INTO change_issues (change_id, owner_account_id, source_page_id, page_count, status, claim_token, attempts) VALUES (?, ?, ?, ?, 'creating', ?, 1)",
+    );
+    expect(calls[0]?.params).toEqual(['ch-1', 'acc-1', '9600001', 2, token]);
+    expect(calls[1]?.statement).toContain('claim_token = ?, attempts = attempts + 1');
+    expect(calls[1]?.statement).toContain("((status = 'failed' AND attempts < 3) OR (status = 'creating' AND updated_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 300 SECOND)))");
+    expect(calls[1]?.params).toEqual([token, 2, 'ch-1', 'acc-1']);
     affected = () => 0;
-    expect(await sqlChangeIssueRepo.claim('ch-1', 'acc-1', '9600001', 2)).toBe(false);
-    await sqlChangeIssueRepo.complete('ch-1', 'acc-1', { id: '10', key: 'OPS-1', url: 'https://x/browse/OPS-1', assigneeSet: false });
+    expect(await sqlChangeIssueRepo.claim('ch-1', 'acc-1', '9600001', 2)).toBeNull();
+    expect(await sqlChangeIssueRepo.complete('ch-1', 'acc-1', 'tok-1', { id: '10', key: 'OPS-1', url: 'https://x/browse/OPS-1', assigneeSet: false })).toBe(false);
+    await sqlChangeIssueRepo.fail('ch-1', 'acc-1', 'tok-1');
+    await sqlChangeIssueRepo.markCommentSent('ch-1', 'acc-1');
     await sqlChangeIssueRepo.setStatus('ch-1', 'acc-1', 'created', 'closed');
     await sqlChangeIssueRepo.saveJiraSettings({ projectKey: 'OPS' });
     await sqlChangeIssueRepo.byIssueKey('OPS-1');
     expect(calls.some((c) => /LIMIT/i.test(c.statement))).toBe(false);
-    expect(calls.find((c) => c.statement.startsWith("UPDATE change_issues SET status = 'created'"))?.params).toEqual(['10', 'OPS-1', 'https://x/browse/OPS-1', 0, 'ch-1', 'acc-1']);
+    // complete / fail only by the holder of the claim token.
+    const complete = calls.find((c) => c.statement.startsWith("UPDATE change_issues SET status = 'created'"));
+    expect(complete?.statement).toMatch(/AND status = 'creating' AND claim_token = \?$/);
+    expect(complete?.params).toEqual(['10', 'OPS-1', 'https://x/browse/OPS-1', 0, 'ch-1', 'acc-1', 'tok-1']);
+    const fail = calls.find((c) => c.statement.startsWith("UPDATE change_issues SET status = 'failed'"));
+    expect(fail?.statement).toMatch(/AND status = 'creating' AND claim_token = \?$/);
+    expect(fail?.params).toEqual(['ch-1', 'acc-1', 'tok-1']);
+    expect(calls.find((c) => c.statement.includes('comment_sent = 1'))?.statement).toContain("status = 'closed'");
     expect(calls.find((c) => c.statement.startsWith('INSERT INTO settings'))?.params).toEqual(['jira', '{"projectKey":"OPS"}']);
   });
 });

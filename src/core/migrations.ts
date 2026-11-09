@@ -285,6 +285,11 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
       KEY idx_change_issues_key (issue_key)
     )`,
   },
+  // M5 hardening: the claim's token (complete/fail only by the job that holds the claim), the number of claims (no
+  // more retries after 3 failed ones) and whether the closing comment was posted (not posted twice).
+  { name: 'v028_change_issues_claim_token', statement: 'ALTER TABLE change_issues ADD COLUMN IF NOT EXISTS claim_token VARCHAR(36) NULL' },
+  { name: 'v029_change_issues_attempts', statement: 'ALTER TABLE change_issues ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0' },
+  { name: 'v030_change_issues_comment_sent', statement: 'ALTER TABLE change_issues ADD COLUMN IF NOT EXISTS comment_sent TINYINT(1) NOT NULL DEFAULT 0' },
 ];
 
 /** Name of the newest migration; the byline reports it so admins can confirm the schema is current. */

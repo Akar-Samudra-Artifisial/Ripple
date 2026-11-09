@@ -2,6 +2,7 @@ import { router } from '@forge/bridge';
 import type { ApprovalView } from '../../src/core/views';
 import { useRemote } from './bridge';
 import { Alert, LoadingRows } from './components';
+import { httpsUrl } from './links';
 import { mount } from './mount';
 
 type Page = NonNullable<ApprovalView['task']>['pages'][number];
@@ -15,17 +16,18 @@ const formatDay = (iso: string | null): string | null => {
 function PageRow({ page }: { page: Page }) {
   const title = page.title ?? `Page ${page.pageId}`;
   const done = page.open === 0;
+  const url = httpsUrl(page.url);
   return (
     <li className="rollout__row">
-      {page.url ? (
+      {url ? (
         <a
           className="copy__link rollout__page"
-          href={page.url}
+          href={url}
           target="_blank"
           rel="noreferrer"
           onClick={(e) => {
             e.preventDefault();
-            void router.open(page.url as string).catch(() => undefined);
+            void router.open(url).catch(() => undefined);
           }}
         >
           {title}

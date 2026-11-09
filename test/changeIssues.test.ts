@@ -22,19 +22,45 @@ vi.mock('@forge/events', () => ({ Queue: class {} }));
 import type { ChangeIssueRepo, ChangeIssueRow, JiraSettings } from '../src/adapters/changeIssueRepo';
 import { parseJiraSettings } from '../src/adapters/changeIssueRepo';
 import type { ChangeRow } from '../src/adapters/changeRepo';
-import { jira, JiraError, JiraUnavailableError, type CreateIssueInput, type JiraClient } from '../src/adapters/jira';
+import { sha256 } from '../src/adapters/changeRepo';
+import { pageIdUrl } from '../src/adapters/confluence';
+import { jira, JiraError, JiraUnavailableError, type CreatedIssue, type CreateIssueInput, type JiraClient } from '../src/adapters/jira';
 import type { ProposalRow } from '../src/adapters/proposalRepo';
-import { closeKind, groupByOwner, issueAdf, issuesMissing, issuesState, issueSummary, type AdfDoc, type AdfNode, type IssueStatus } from '../src/core/changeIssues';
+import {
+  closeKind,
+  GENERIC_FACT_TEXT,
+  groupByOwner,
+  ISSUE_TAG,
+  issueAdf,
+  issuesMissing,
+  issuesState,
+  issueSummary,
+  issueTag,
+  type AdfDoc,
+  type AdfNode,
+  type IssueStatus,
+} from '../src/core/changeIssues';
+import { httpsUrl } from '../ui/src/links';
 import { createIssuesForChange, getApproval, getSettings, issuesNeeded, saveSettings, syncIssues, syncOtherChanges, type IssueDeps } from '../src/surfaces/changeIssues';
 
 const SOURCE = '9600001';
 const CHANGE = '11111111-1111-1111-1111-111111111111';
 const OLDER = '22222222-2222-2222-2222-222222222222';
 
+type StoredRow = ChangeIssueRow & { claimedAt: number; token: string };
+
 class Store {
   settings: JiraSettings | undefined = { projectKey: 'OPS' };
-  rows = new Map<string, ChangeIssueRow & { claimedAt: number }>();
+  rows = new Map<string, StoredRow>();
   now = 0;
+  tokens = 0;
+  /** `complete` throws (SQL failure) this many more times. */
+  completeFails = 0;
+  /** Issues in Jira by their per-(change, owner) label (what the JQL search finds). */
+  byLabel = new Map<string, CreatedIssue>();
+  searches: { projectKey: string; label: string }[] = [];
+  searchFails = false;
+  transitionFails = false;
   proposals: Pick<ProposalRow, 'id' | 'changeId' | 'pageId' | 'factId' | 'status' | 'errorCode'>[] = [
     { id: 'p1', changeId: CHANGE, pageId: 'A', factId: 'f1', status: 'proposed', errorCode: null },
     { id: 'p2', changeId: CHANGE, pageId: 'B', factId: 'f1', status: 'needs_manual', errorCode: 'crosses_markup' },
@@ -79,23 +105,48 @@ class Store {
     return {
       claim: async (changeId, owner, sourcePageId, pageCount) => {
         const row = this.rows.get(key(changeId, owner));
+        const token = `tok-${++this.tokens}`;
         if (!row) {
-          this.rows.set(key(changeId, owner), { changeId, ownerAccountId: owner, sourcePageId, issueId: null, issueKey: null, issueUrl: null, assigneeSet: false, pageCount, status: 'creating', claimedAt: this.now });
-          return true;
+          this.rows.set(key(changeId, owner), {
+            changeId,
+            ownerAccountId: owner,
+            sourcePageId,
+            issueId: null,
+            issueKey: null,
+            issueUrl: null,
+            assigneeSet: false,
+            pageCount,
+            status: 'creating',
+            attempts: 1,
+            commentSent: false,
+            claimedAt: this.now,
+            token,
+          });
+          return token;
         }
-        if (row.status === 'failed' || (row.status === 'creating' && this.now - row.claimedAt > 300)) {
-          Object.assign(row, { status: 'creating', claimedAt: this.now, pageCount });
-          return true;
+        if ((row.status === 'failed' && row.attempts < 3) || (row.status === 'creating' && this.now - row.claimedAt > 300)) {
+          Object.assign(row, { status: 'creating', claimedAt: this.now, pageCount, token, attempts: row.attempts + 1 });
+          return token;
         }
-        return false;
+        return null;
       },
-      complete: async (changeId, owner, issue) => {
+      complete: async (changeId, owner, token, issue) => {
+        if (this.completeFails > 0) {
+          this.completeFails--;
+          throw new Error('sql down');
+        }
         const row = this.rows.get(key(changeId, owner));
-        if (row?.status === 'creating') Object.assign(row, { status: 'created', issueId: issue.id, issueKey: issue.key, issueUrl: issue.url, assigneeSet: issue.assigneeSet });
+        if (row?.status !== 'creating' || row.token !== token) return false;
+        Object.assign(row, { status: 'created', issueId: issue.id, issueKey: issue.key, issueUrl: issue.url, assigneeSet: issue.assigneeSet });
+        return true;
       },
-      fail: async (changeId, owner) => {
+      fail: async (changeId, owner, token) => {
         const row = this.rows.get(key(changeId, owner));
-        if (row?.status === 'creating') row.status = 'failed';
+        if (row?.status === 'creating' && row.token === token) row.status = 'failed';
+      },
+      markCommentSent: async (changeId, owner) => {
+        const row = this.rows.get(key(changeId, owner));
+        if (row?.status === 'closed') row.commentSent = true;
       },
       listForChange: async (changeId) => [...this.rows.values()].filter((r) => r.changeId === changeId),
       byIssueKey: async (k) => [...this.rows.values()].find((r) => r.issueKey === k),
@@ -120,10 +171,18 @@ class Store {
         if (this.createFails) throw new JiraError(500, 'Jira 500: boom');
         this.created.push(input);
         const n = this.created.length;
-        return { id: `10${n}`, key: `OPS-${n}`, url: `https://x.atlassian.net/browse/OPS-${n}`, assigneeSet: true, dueSet: true };
+        const issue = { id: `10${n}`, key: `OPS-${n}`, url: `https://x.atlassian.net/browse/OPS-${n}`, assigneeSet: true, dueSet: true };
+        const tag = input.labels.find((l) => l.startsWith('ripple-c'));
+        if (tag) this.byLabel.set(tag, issue);
+        return issue;
+      },
+      findByLabel: async (projectKey, label) => {
+        if (this.searchFails) throw new JiraError(500, 'Jira 500: search');
+        this.searches.push({ projectKey, label });
+        return this.byLabel.get(label);
       },
       transitionToDone: async (k) => {
-        if (this.closeFails) throw new JiraUnavailableError('down');
+        if (this.closeFails || this.transitionFails) throw new JiraUnavailableError('down');
         this.transitions.push(k);
         return true;
       },
@@ -145,7 +204,7 @@ class Store {
         listFacts: async () => [{ id: 'f1', subject: 'Domestic per diem', attribute: 'amount' } as Awaited<ReturnType<IssueDeps['facts']['listFacts']>>[number]],
       },
       isOpen: async (id) => this.open.has(id),
-      pageLink: async (id) => ({ title: `Title ${id}`, url: `https://x.atlassian.net/wiki/spaces/K/pages/${id}` }),
+      pageLink: async (id) => ({ title: `Title ${id}`, url: `https://x.atlassian.net/wiki/spaces/K/pages/${id}/Title+${id}`, idUrl: `https://x.atlassian.net/wiki/pages/viewpage.action?pageId=${id}` }),
     };
   }
 }
@@ -236,6 +295,9 @@ describe('grouping and content (pure)', () => {
     expect(issuesMissing(pages, store.proposals, [])).toBe(true);
     expect(issuesMissing(pages, store.proposals, [row('owner-1', 'created'), row('owner-2', 'failed')])).toBe(true);
     expect(issuesMissing(pages, store.proposals, [row('owner-1', 'created'), row('owner-2', 'creating')])).toBe(false);
+    // Heal stops after 3 failed attempts.
+    expect(issuesMissing(pages, store.proposals, [row('owner-1', 'created'), { ...row('owner-2', 'failed'), attempts: 2 }])).toBe(true);
+    expect(issuesMissing(pages, store.proposals, [row('owner-1', 'created'), { ...row('owner-2', 'failed'), attempts: 3 }])).toBe(false);
   });
 
   it('parses stored settings strictly', () => {
@@ -250,8 +312,13 @@ describe('createIssuesForChange', () => {
     const r = await createIssuesForChange(CHANGE, store.deps());
     expect(r).toEqual({ status: 'done', created: 2, failed: 0, skipped: 0, unowned: 1 });
     expect(store.created.map((c) => [c.assigneeAccountId, c.summary, c.duedate, c.labels])).toEqual([
-      ['owner-1', 'Update 2 pages for Travel Policy', '2026-11-16', ['ripple', 'ripple-update']],
-      ['owner-2', 'Update 1 page for Travel Policy', '2026-11-16', ['ripple', 'ripple-update']],
+      ['owner-1', 'Update 2 pages for Travel Policy', '2026-11-16', ['ripple', 'ripple-update', issueTag(CHANGE, sha256('owner-1'))]],
+      ['owner-2', 'Update 1 page for Travel Policy', '2026-11-16', ['ripple', 'ripple-update', issueTag(CHANGE, sha256('owner-2'))]],
+    ]);
+    // Searched by its label (in the configured project) before each create.
+    expect(store.searches).toEqual([
+      { projectKey: 'OPS', label: issueTag(CHANGE, sha256('owner-1')) },
+      { projectKey: 'OPS', label: issueTag(CHANGE, sha256('owner-2')) },
     ]);
     // Page titles only for open pages; team line only where the routing has team names.
     const first = JSON.stringify(store.created[0]?.description);
@@ -290,6 +357,108 @@ describe('createIssuesForChange', () => {
     expect([...store.rows.values()].map((x) => x.status)).toEqual(['failed', 'failed']);
     store.createFails = false;
     expect(await createIssuesForChange(CHANGE, store.deps())).toMatchObject({ created: 2 });
+  });
+
+  it('the per-owner label is deterministic, unique per change and owner, and carries no raw account id', () => {
+    const a = issueTag(CHANGE, sha256('owner-1'));
+    expect(a).toMatch(ISSUE_TAG);
+    expect(a).toBe(`ripple-c11111111-${sha256('owner-1').slice(0, 8)}`);
+    expect(a).not.toContain('owner');
+    expect(issueTag(CHANGE, sha256('owner-2'))).not.toBe(a);
+    expect(issueTag(OLDER, sha256('owner-1'))).not.toBe(a);
+    expect(() => issueTag('zz', 'zz')).toThrow();
+  });
+
+  it('a recording (SQL) failure after Jira created the issue never marks it failed; the next claim reuses it by label', async () => {
+    store.completeFails = 3;
+    expect(await createIssuesForChange(CHANGE, store.deps())).toMatchObject({ created: 1, failed: 0, skipped: 1 });
+    const row = () => [...store.rows.values()].find((r) => r.ownerAccountId === 'owner-1');
+    expect(row()?.status).toBe('creating');
+    expect(store.created).toHaveLength(2);
+    // Heal / redelivery after the claim went stale: the issue is found by its label, not created again.
+    store.now = 301;
+    expect(await createIssuesForChange(CHANGE, store.deps())).toMatchObject({ created: 1, skipped: 1 });
+    expect(store.created).toHaveLength(2);
+    expect(row()).toMatchObject({ status: 'created', issueKey: 'OPS-1', attempts: 2 });
+  });
+
+  it('a transient recording failure is retried', async () => {
+    store.completeFails = 2;
+    expect(await createIssuesForChange(CHANGE, store.deps())).toMatchObject({ created: 2, failed: 0 });
+    expect([...store.rows.values()].map((r) => r.status)).toEqual(['created', 'created']);
+  });
+
+  it('a failed claim is reclaimed after a search; an issue already in Jira is reused', async () => {
+    store.createFails = true;
+    await createIssuesForChange(CHANGE, store.deps());
+    // The issue exists in Jira (created by a job whose reply was lost) although the row says failed.
+    store.byLabel.set(issueTag(CHANGE, sha256('owner-1')), { id: '900', key: 'OPS-900', url: 'https://x.atlassian.net/browse/OPS-900', assigneeSet: true, dueSet: true });
+    store.createFails = false;
+    expect(await createIssuesForChange(CHANGE, store.deps())).toMatchObject({ created: 2 });
+    expect(store.created.map((c) => c.assigneeAccountId)).toEqual(['owner-2']);
+    expect([...store.rows.values()].map((r) => [r.ownerAccountId, r.issueKey])).toEqual([
+      ['owner-1', 'OPS-900'],
+      ['owner-2', 'OPS-1'],
+    ]);
+  });
+
+  it('a failing search creates nothing (no blind create) and releases the claim', async () => {
+    store.searchFails = true;
+    expect(await createIssuesForChange(CHANGE, store.deps())).toMatchObject({ created: 0, failed: 2 });
+    expect(store.created).toHaveLength(0);
+    expect([...store.rows.values()].map((r) => r.status)).toEqual(['failed', 'failed']);
+  });
+
+  it('a claim taken over meanwhile is not completed or failed by the old job (token)', async () => {
+    const r = store.repo();
+    const old = await r.claim(CHANGE, 'owner-1', SOURCE, 2);
+    store.now = 301;
+    const fresh = await r.claim(CHANGE, 'owner-1', SOURCE, 2);
+    expect(old).not.toBe(fresh);
+    const issue = { id: '1', key: 'OPS-1', url: 'https://x/browse/OPS-1', assigneeSet: true };
+    expect(await r.complete(CHANGE, 'owner-1', old ?? '', issue)).toBe(false);
+    await r.fail(CHANGE, 'owner-1', old ?? '');
+    expect(store.rows.get(`${CHANGE}|owner-1`)?.status).toBe('creating');
+    expect(await r.complete(CHANGE, 'owner-1', fresh ?? '', issue)).toBe(true);
+  });
+
+  it('after 3 failed attempts heal stops and the Rollout state is failed', async () => {
+    store.createFails = true;
+    for (let i = 0; i < 3; i++) await createIssuesForChange(CHANGE, store.deps());
+    expect([...store.rows.values()].map((r) => [r.status, r.attempts])).toEqual([
+      ['failed', 3],
+      ['failed', 3],
+    ]);
+    expect(await issuesNeeded(store.change, store.deps())).toBe(false);
+    expect(await createIssuesForChange(CHANGE, store.deps())).toMatchObject({ created: 0, failed: 0, skipped: 2 });
+    expect(issuesState(true, [...store.rows.values()], ['owner-1', 'owner-2'])).toBe('failed');
+  });
+
+  it('privacy: a restricted source gives a generic body (no fact label, no values); hidden pages link by id only', async () => {
+    store.open = new Set(['A']);
+    await createIssuesForChange(CHANGE, store.deps());
+    const body = JSON.stringify(store.created[0]?.description);
+    expect(body).toContain(GENERIC_FACT_TEXT);
+    for (const secret of ['Domestic per diem', '$60', '$75', 'What changed']) expect(body).not.toContain(secret);
+    // Open page A: title and slugged link; hidden page B: "Page B" with the id-only link (no title slug).
+    expect(body).toContain('Title+A');
+    expect(body).not.toContain('Title+B');
+    expect(body).not.toContain('Title B');
+    expect(body).toContain('viewpage.action?pageId=B');
+  });
+
+  it('privacy: team names only for spaces of open pages', async () => {
+    store.open = new Set([SOURCE]);
+    await createIssuesForChange(CHANGE, store.deps());
+    expect(JSON.stringify(store.created[0]?.description)).not.toContain('People Ops');
+    expect(JSON.stringify(store.created[0]?.description)).not.toContain('Team:');
+  });
+
+  it('pageIdUrl: site origin + viewpage.action, https and numeric ids only', () => {
+    expect(pageIdUrl('https://x.atlassian.net/wiki', '123')).toBe('https://x.atlassian.net/wiki/pages/viewpage.action?pageId=123');
+    expect(pageIdUrl('http://x.atlassian.net/wiki', '123')).toBeNull();
+    expect(pageIdUrl('https://x.atlassian.net/wiki', '12&x=1')).toBeNull();
+    expect(pageIdUrl(undefined, '123')).toBeNull();
   });
 
   it('without a Jira project nothing is created and the log says so', async () => {
@@ -335,6 +504,19 @@ describe('closing issues', () => {
     store.closeFails = false;
     expect(await syncIssues(CHANGE, store.deps())).toBe(1);
   });
+
+  it('a transition that fails after the comment is retried without a second comment', async () => {
+    set('p3', 'rejected');
+    store.transitionFails = true;
+    expect(await syncIssues(CHANGE, store.deps())).toBe(0);
+    const row = () => [...store.rows.values()].find((r) => r.ownerAccountId === 'owner-2');
+    expect(row()).toMatchObject({ status: 'created', commentSent: true });
+    expect(store.comments).toHaveLength(1);
+    store.transitionFails = false;
+    expect(await syncIssues(CHANGE, store.deps())).toBe(1);
+    expect(store.comments).toHaveLength(1);
+    expect(store.transitions).toEqual(['OPS-2']);
+  });
 });
 
 describe('heal check', () => {
@@ -370,11 +552,36 @@ describe('settings and approval panel', () => {
     expect(await getSettings(ctx('admin'), d)).toMatchObject({ canEdit: false });
   });
 
+  it('the real admin check: a Jira 403 means canEdit false and save refused with jira_unavailable; a 500 jira_error', async () => {
+    const d = { ...sdeps(), jira };
+    jiraReplies = [{ status: 403, body: { errorMessages: ['Forbidden'] } }];
+    expect(await getSettings(ctx('acc-admin'), d)).toEqual({ jiraProjectKey: 'OPS', canEdit: false });
+    jiraReplies = [{ status: 403, body: {} }];
+    expect(await saveSettings(ctx('acc-admin'), { jiraProjectKey: 'OPS' }, d)).toEqual({ ok: false, errorCode: 'jira_unavailable' });
+    jiraReplies = [{ status: 500, body: {} }];
+    expect(await saveSettings(ctx('acc-admin'), { jiraProjectKey: 'OPS' }, d)).toEqual({ ok: false, errorCode: 'jira_error' });
+    // No ADMINISTER in the reply: not allowed.
+    jiraReplies = [{ status: 200, body: { globalPermissions: [] } }];
+    expect(await saveSettings(ctx('acc-admin'), { jiraProjectKey: 'OPS' }, d)).toEqual({ ok: false, errorCode: 'not_allowed' });
+    expect(store.settings).toEqual({ projectKey: 'OPS' });
+  });
+
   it('the issue panel lists the pages of a Ripple issue, null for other issues', async () => {
     await createIssuesForChange(CHANGE, store.deps());
     const d = { ...store.deps(), ensure: async () => undefined };
     const r = await getApproval({ moduleKey: 'ripple-approval', extension: { issue: { key: 'OPS-1' } } }, d);
-    expect(r).toMatchObject({ issueKey: 'OPS-1', task: { changeId: CHANGE, closed: false, pages: [{ pageId: 'A', title: 'Title A', open: 1 }, { pageId: 'B', title: null, open: 1 }] } });
+    expect(r).toMatchObject({
+      issueKey: 'OPS-1',
+      task: {
+        changeId: CHANGE,
+        closed: false,
+        pages: [
+          { pageId: 'A', title: 'Title A', url: 'https://x.atlassian.net/wiki/spaces/K/pages/A/Title+A', open: 1 },
+          // Not open: no title and the id-only link (no title slug).
+          { pageId: 'B', title: null, url: 'https://x.atlassian.net/wiki/pages/viewpage.action?pageId=B', open: 1 },
+        ],
+      },
+    });
     expect(await getApproval({ moduleKey: 'ripple-approval', extension: { issue: { key: 'OPS-99' } } }, d)).toEqual({ issueKey: 'OPS-99', task: null });
     expect(await getApproval({ moduleKey: 'ripple-approval', extension: { issue: { key: 'x"' } } }, d)).toEqual({ error: expect.any(String) });
   });
@@ -414,5 +621,39 @@ describe('Jira adapter', () => {
     expect(await jira.getProject('NOPE')).toBeUndefined();
     jiraReplies = [{ status: 403, body: {} }];
     await expect(jira.getProject('OPS')).rejects.toBeInstanceOf(JiraUnavailableError);
+  });
+
+  it('isAdmin asks permissions/check for the caller and ADMINISTER only; 403 throws JiraUnavailableError', async () => {
+    jiraReplies = [{ status: 200, body: { globalPermissions: ['ADMINISTER'] } }];
+    expect(await jira.isAdmin('acc-7')).toBe(true);
+    expect(jiraCalls).toEqual([{ path: '/rest/api/3/permissions/check', method: 'POST', body: { accountId: 'acc-7', globalPermissions: ['ADMINISTER'] } }]);
+    jiraReplies = [{ status: 200, body: {} }];
+    expect(await jira.isAdmin('acc-7')).toBe(false);
+    jiraReplies = [{ status: 403, body: {} }];
+    await expect(jira.isAdmin('acc-7')).rejects.toBeInstanceOf(JiraUnavailableError);
+  });
+
+  it('findByLabel: JQL search as the app with validated, quoted values', async () => {
+    const label = issueTag(CHANGE, sha256('owner-1'));
+    jiraReplies = [{ status: 200, body: { issues: [{ id: 100, key: 'OPS-7', self: 'https://x.atlassian.net/rest/api/3/issue/100', fields: { assignee: { accountId: 'owner-1' }, duedate: null } }] } }];
+    expect(await jira.findByLabel('OPS', label, 'owner-1')).toEqual({ id: '100', key: 'OPS-7', url: 'https://x.atlassian.net/browse/OPS-7', assigneeSet: true, dueSet: false });
+    expect(jiraCalls[0]).toEqual({
+      path: '/rest/api/3/search/jql',
+      method: 'POST',
+      body: { jql: `project = "OPS" AND labels = "${label}" ORDER BY created ASC`, fields: ['assignee', 'duedate'], maxResults: 1 },
+    });
+    jiraReplies = [{ status: 200, body: { issues: [] } }];
+    expect(await jira.findByLabel('OPS', label, 'owner-1')).toBeUndefined();
+    jiraCalls.length = 0;
+    await expect(jira.findByLabel('OPS', 'ripple" OR project = "X', 'owner-1')).rejects.toBeInstanceOf(JiraError);
+    await expect(jira.findByLabel('OPS" OR x="', label, 'owner-1')).rejects.toBeInstanceOf(JiraError);
+    expect(jiraCalls).toEqual([]);
+  });
+});
+
+describe('UI links', () => {
+  it('httpsUrl only lets absolute https URLs through to router.open', () => {
+    expect(httpsUrl('https://x.atlassian.net/browse/OPS-1')).toBe('https://x.atlassian.net/browse/OPS-1');
+    for (const bad of ['javascript:alert(1)', 'http://x', '//x.atlassian.net', '/wiki/x', 'https://x y', '', null, undefined]) expect(httpsUrl(bad)).toBeNull();
   });
 });

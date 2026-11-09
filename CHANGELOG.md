@@ -56,6 +56,10 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Halaman arsip/draft tidak lagi menjadi kandidat salinan. Pengecualian space lewat pengaturan belum ada.
 
 ### Fixed
+- M5: issue Jira tidak lagi ganda bila pencatatan gagal setelah Jira membuat issue. Tiap issue membawa label unik `ripple-c<8 char change id>-<8 char sha256 owner>` (tanpa account id mentah); sebelum membuat (termasuk klaim ulang dari `failed`/`creating` basi) Ripple mencari label itu lewat JQL `POST /rest/api/3/search/jql` sebagai app (nilai divalidasi dan di-quote) dan memakai issue yang ditemukan. Pencatatan (`complete`) dicoba ulang 3 kali dan klaim tidak pernah ditandai `failed` setelah issue tercipta; pencarian yang gagal tidak berujung create buta.
+- `change_issues` mendapat `claim_token`, `attempts`, dan `comment_sent` (migrasi `v028_change_issues_claim_token`, `v029_change_issues_attempts`, `v030_change_issues_comment_sent`). `complete`/`fail` hanya berlaku untuk pemegang token klaim. Setelah 3 percobaan gagal, heal byline berhenti dan klaim tidak diambil lagi; Rollout menampilkan `failed`. Komentar penutup tidak dikirim dua kali bila transisi ke Done gagal lalu dicoba ulang.
+- Cek admin di settings: 403 dari Jira kini `canEdit: false` dan simpan ditolak dengan `jira_unavailable` (error lain `jira_error`), tetap fail closed.
+- Cache tim space: jawaban kosong dari Teamwork Graph dan daftar yang masih punya halaman berikutnya (`hasNextPage`) tidak lagi disimpan, sehingga user dengan akses graph terbatas tidak mengotori cache bersama.
 - "Team unavailable, try again" lebih jarang muncul. Bacaan tim space dari Teamwork Graph kini dicoba sampai 3 kali dengan backoff 300/800 ms ditambah jitter. `Retry-After` dihormati, dibatasi 1,5 dtk, dan total waktu maksimal ±4 dtk. Hasil per space dipakai bersama dalam satu panggilan resolver.
 - Jawaban sukses (termasuk "tidak ada tim") disimpan per space di tabel baru `space_team_cache` (migrasi `v026_create_space_team_cache`) dan dipakai selama 10 menit. Bila Teamwork Graph gagal, cache berumur ≤24 jam tetap ditampilkan seperti biasa tanpa label error. Error tidak pernah disimpan.
 - `cloudId` diambil dari `installContext` bila konteks resolver tidak memuatnya.
@@ -142,6 +146,8 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Mengedit subjek/atribut/kondisi tidak lagi memunculkan duplikat saat ekstraksi ulang (kolom `origin_key`, migrasi v005).
 
 ### Security
+- Issue Jira M5: bila sumber tidak open, body hanya berisi "An official fact changed; open the pages below to review the proposed update." (tanpa label fakta dan nilai lama/baru). Halaman yang tidak open tampil "Page <id>" dengan tautan `/wiki/pages/viewpage.action?pageId=<id>` tanpa slug judul (juga di panel issue Jira). Nama tim hanya untuk space dari halaman yang open. Keterbatasan izin space (tidak terbaca dengan scope yang ada) dicatat di `docs/PRIVACY.md` beserta saran memilih project Jira yang audiensnya sama.
+- UI panel issue Jira dan Rollout hanya membuka tautan `https://` lewat `router.open`.
 - Pesan versi suntingan Ripple hanya menyebut judul sumber bila halaman sumber dan leluhurnya tanpa read restriction dan space-nya terbaca app; selain itu (atau approve all dengan >1 sumber) "Updated by Ripple".
 - Usulan dari sumber yang tidak bisa dibuka viewer tampil sebagai kartu generik "An update from a source you can't view" tanpa id/judul sumber dan label fakta; kalimat/nilai baru hanya untuk yang bisa melihat sumber atau editor halaman salinan.
 - Log menyamarkan account id berprefiks 5–7 digit (sebelumnya hanya 6 digit).

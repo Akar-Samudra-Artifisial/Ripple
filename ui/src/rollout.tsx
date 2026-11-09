@@ -3,6 +3,7 @@ import { useCallback, useEffect, useId, useState } from 'react';
 import type { IssuesStateView, ProposalState, Rollout, RolloutIssue, RolloutItem } from '../../src/core/views';
 import { call } from './bridge';
 import { Alert, LoadingRows, errorOf } from './components';
+import { httpsUrl } from './links';
 import { PROPOSAL_STATUS_LABEL, proposalProblem } from './proposalText';
 
 const POLL_MS = 5000;
@@ -125,35 +126,38 @@ function JiraTasks({ state, issues }: { state: IssuesStateView; issues: readonly
       </p>
       {issues.length > 0 ? (
         <ul className="rollout__list" aria-label="Jira tasks by owner">
-          {issues.map((i) => (
-            <li key={i.issueKey} className="rollout__row jira__row">
-              <span className="jira__owner">{i.ownerName ?? "Owner you can't view"}</span>
-              <span aria-hidden="true" className="muted">
-                ·
-              </span>
-              {i.issueUrl ? (
-                <a
-                  className="copy__link jira__key"
-                  href={i.issueUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    void router.open(i.issueUrl as string).catch(() => undefined);
-                  }}
-                >
-                  {i.issueKey}
-                  <span className="sr-only"> (opens in a new tab)</span>
-                </a>
-              ) : (
-                <span className="jira__key">{i.issueKey}</span>
-              )}
-              <span className={`badge ${i.status === 'done' ? 'badge--proposal-applied' : 'badge--proposal-proposed'}`}>{i.status === 'done' ? 'Done' : 'Open'}</span>
-              <span className="muted source__meta">
-                {i.pageCount} {i.pageCount === 1 ? 'page' : 'pages'}
-              </span>
-            </li>
-          ))}
+          {issues.map((i) => {
+            const url = httpsUrl(i.issueUrl);
+            return (
+              <li key={i.issueKey} className="rollout__row jira__row">
+                <span className="jira__owner">{i.ownerName ?? "Owner you can't view"}</span>
+                <span aria-hidden="true" className="muted">
+                  ·
+                </span>
+                {url ? (
+                  <a
+                    className="copy__link jira__key"
+                    href={url}
+                    target="_blank"
+                    rel="noreferrer"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      void router.open(url).catch(() => undefined);
+                    }}
+                  >
+                    {i.issueKey}
+                    <span className="sr-only"> (opens in a new tab)</span>
+                  </a>
+                ) : (
+                  <span className="jira__key">{i.issueKey}</span>
+                )}
+                <span className={`badge ${i.status === 'done' ? 'badge--proposal-applied' : 'badge--proposal-proposed'}`}>{i.status === 'done' ? 'Done' : 'Open'}</span>
+                <span className="muted source__meta">
+                  {i.pageCount} {i.pageCount === 1 ? 'page' : 'pages'}
+                </span>
+              </li>
+            );
+          })}
         </ul>
       ) : null}
       <p className="muted source__meta">Owners approve each suggestion in the Ripple byline on their Confluence page.</p>

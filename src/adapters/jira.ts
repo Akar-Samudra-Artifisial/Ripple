@@ -3,7 +3,8 @@
  * installed on the site (or refuses the app) calls throw `JiraUnavailableError`.
  */
 import api, { route, type APIResponse, type Route } from '@forge/api';
-import type { AdfDoc } from '../core/changeIssues';
+import { ISSUE_TAG, type AdfDoc } from '../core/changeIssues';
+import { PROJECT_KEY } from './changeIssueRepo';
 
 /** Jira replied with a non-2xx status. */
 export class JiraError extends Error {
@@ -92,6 +93,11 @@ export interface JiraClient {
   /** True when `accountId` holds the global Jira ADMINISTER permission. */
   isAdmin(accountId: string): Promise<boolean>;
   createIssue(input: CreateIssueInput): Promise<CreatedIssue>;
+  /**
+   * The issue of the project carrying Ripple's per-(change, owner) label (`ISSUE_TAG`), or undefined. Used before
+   * creating, so an issue created by a job that died before recording it is reused instead of duplicated.
+   */
+  findByLabel(projectKey: string, label: string, assigneeAccountId: string): Promise<CreatedIssue | undefined>;
   /** Moves the issue to a Done-category status; false when the workflow offers no such transition. */
   transitionToDone(key: string): Promise<boolean>;
   addComment(key: string, body: AdfDoc): Promise<void>;
@@ -144,6 +150,25 @@ export const jira: JiraClient = {
         if (dropDue) withDue = false;
       }
     }
+  },
+
+  async findByLabel(projectKey, label, assigneeAccountId) {
+    // Both values are validated, so the quoted JQL literals cannot be broken out of.
+    if (!PROJECT_KEY.test(projectKey) || !ISSUE_TAG.test(label)) throw new JiraError(400, 'Invalid project key or label for the issue search');
+    const body = await request<{ issues?: { id: string | number; key: string; self: string; fields?: { assignee?: { accountId?: string } | null; duedate?: string | null } }[] }>(
+      'POST',
+      route`/rest/api/3/search/jql`,
+      { jql: `project = "${projectKey}" AND labels = "${label}" ORDER BY created ASC`, fields: ['assignee', 'duedate'], maxResults: 1 },
+    );
+    const found = body.issues?.[0];
+    if (!found) return undefined;
+    return {
+      id: String(found.id),
+      key: found.key,
+      url: `${new URL(found.self).origin}/browse/${found.key}`,
+      assigneeSet: found.fields?.assignee?.accountId === assigneeAccountId,
+      dueSet: typeof found.fields?.duedate === 'string',
+    };
   },
 
   async transitionToDone(key) {

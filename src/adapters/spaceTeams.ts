@@ -2,7 +2,8 @@
  * Space teams with a per-space cache in Forge SQL and a per-invocation memo. Teamwork Graph intermittently refuses a
  * read ("User is not permitted to query this organization"), so the last good answer of a space is kept: fresh for
  * `SPACE_TEAMS_FRESH_SECONDS`, and served (marked `stale`) for up to `SPACE_TEAMS_STALE_SECONDS` when the graph
- * fails. Only good answers are stored, including "no teams"; errors never are.
+ * fails. Only complete, non-empty answers are stored: never errors, never "no teams" (it may only reflect the
+ * caller's limited graph access) and never a list with more pages.
  *
  * The cache is shared by every user of the installation. Callers only ask for spaces of pages the viewer can see
  * (byline: the viewed page; change panel: copies filtered by `visible`), so a cached name is never shown for a space
@@ -111,10 +112,14 @@ export function spaceTeamsLookup(deps: SpaceTeamsDeps): (spaceId: string) => Pro
       live = { teams: [], rawCount: 0, nullNodes: 0, types: [], dataPresent: false, hasNextPage: false, errors: [errorText(err)], errorClass: 'gql_other', attempts: 0 };
     }
     if (live.errorClass === null) {
-      try {
-        await deps.cache.put(spaceId, live.teams);
-      } catch (err) {
-        console.warn('ripple space teams: cache write failed', { spaceId, error: errorText(err) });
+      // Shared cache: only a complete, non-empty answer is stored. An empty one may only mean this user's graph
+      // access is limited, and a partial page (`hasNextPage`) is not the space's full list.
+      if (live.teams.length > 0 && !live.hasNextPage) {
+        try {
+          await deps.cache.put(spaceId, live.teams);
+        } catch (err) {
+          console.warn('ripple space teams: cache write failed', { spaceId, error: errorText(err) });
+        }
       }
       return { teams: live.teams, origin: 'live', dataPresent: true, errors: [] };
     }

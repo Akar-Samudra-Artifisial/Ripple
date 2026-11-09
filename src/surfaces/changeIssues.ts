@@ -5,10 +5,10 @@
  *
  * Settings (Confluence global settings page): the Jira project key, saved by Jira administrators only.
  */
-import { sqlChangeIssueRepo, PROJECT_KEY, type ChangeIssueRepo, type ChangeIssueRow } from '../adapters/changeIssueRepo';
-import { sqlChangeRepo, type ChangeRepo, type ChangeRow } from '../adapters/changeRepo';
-import { pageIsOpen, pageLinkAsApp } from '../adapters/confluence';
-import { JiraError, JiraUnavailableError, jira, type JiraClient } from '../adapters/jira';
+import { sqlChangeIssueRepo, PROJECT_KEY, type ChangeIssueRepo, type ChangeIssueRow, type CreatedIssueRef } from '../adapters/changeIssueRepo';
+import { sha256, sqlChangeRepo, type ChangeRepo, type ChangeRow } from '../adapters/changeRepo';
+import { pageIsOpen, pageLinkAsApp, type AppPageLink } from '../adapters/confluence';
+import { JiraError, JiraUnavailableError, jira, type CreatedIssue, type JiraClient } from '../adapters/jira';
 import { sqlProposalRepo, type ProposalRepo, type ProposalRow } from '../adapters/proposalRepo';
 import { sqlRepo, type FactRepo } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
@@ -23,6 +23,7 @@ import {
   issuesMissing,
   issuesState,
   issueSummary,
+  issueTag,
   MAX_ISSUE_PAGES,
   type IssueFact,
   type IssuePage,
@@ -50,8 +51,8 @@ export interface IssueDeps {
   facts: Pick<FactRepo, 'getSource' | 'listFacts'>;
   /** The page's title may be named to anyone (no read restriction). */
   isOpen: (pageId: string) => Promise<boolean>;
-  /** Title and absolute URL as the app; null when unreadable. */
-  pageLink: (pageId: string) => Promise<{ title: string; url: string | null } | null>;
+  /** Title and absolute URLs as the app; null when unreadable. */
+  pageLink: (pageId: string) => Promise<AppPageLink | null>;
 }
 
 export const defaultIssueDeps: IssueDeps = {
@@ -80,21 +81,46 @@ async function factLines(deps: IssueDeps, change: ChangeRow, rows: readonly Prop
     });
 }
 
-/** Listed pages: the title only when the page may be named to anyone, with its absolute URL. */
+/**
+ * Listed pages: title and URL (with its title slug) only when the page may be named to anyone; otherwise
+ * "Page <id>" linked by id only (`viewpage.action?pageId=`).
+ */
 async function issuePages(deps: IssueDeps, pageIds: readonly string[]): Promise<IssuePage[]> {
   const out: IssuePage[] = [];
   for (const pageId of pageIds.slice(0, MAX_ISSUE_PAGES)) {
     const link = await deps.pageLink(pageId);
     const open = link !== null && (await deps.isOpen(pageId));
-    out.push({ pageId, title: open ? link.title : null, url: link?.url ?? null });
+    out.push(open ? { pageId, title: link.title, url: link.url } : { pageId, title: null, url: link?.idUrl ?? null });
   }
   return out;
 }
 
-function teamNames(change: ChangeRow, pageIds: readonly string[]): string[] {
-  const spaces = new Set((change.routing?.pages ?? []).filter((p) => pageIds.includes(p.pageId)).map((p) => p.spaceId));
+/** Team names of the spaces of `openPageIds` only (pages that may be named), so no team is tied to a hidden page. */
+function teamNames(change: ChangeRow, openPageIds: readonly string[]): string[] {
+  const pageIds = new Set(openPageIds);
+  const spaces = new Set((change.routing?.pages ?? []).filter((p) => pageIds.has(p.pageId)).map((p) => p.spaceId));
   const names = (change.routing?.spaces ?? []).filter((s) => spaces.has(s.spaceId)).flatMap((s) => (s.teams ?? []).map((t) => t.name));
   return [...new Set(names.filter((n) => n.trim() !== ''))];
+}
+
+/** Tries of recording a created issue on its claim. */
+const COMPLETE_TRIES = 3;
+
+/**
+ * Records the created issue on the claim, retrying SQL failures. `lost`: another job took the claim over (it finds
+ * the issue by label); `error`: still failing (the claim goes stale and the next claim finds the issue by label).
+ */
+async function completeWithRetry(repo: ChangeIssueRepo, changeId: string, owner: string, token: string, issue: CreatedIssueRef): Promise<'done' | 'lost' | 'error'> {
+  for (let i = 1; ; i++) {
+    try {
+      return (await repo.complete(changeId, owner, token, issue)) ? 'done' : 'lost';
+    } catch (err) {
+      if (i >= COMPLETE_TRIES) {
+        console.warn('ripple issue not recorded', { changeId, issueId: issue.id, tries: i, error: scrubErrorText(err instanceof Error ? err.message : String(err)) });
+        return 'error';
+      }
+    }
+  }
 }
 
 /**
@@ -113,44 +139,68 @@ export async function createIssuesForChange(changeId: string, deps: IssueDeps = 
     const proposals = await deps.proposals.listForChange(changeId);
     const { groups, unowned } = groupByOwner(change.routing.pages, proposals);
     const out = { created: 0, failed: 0, skipped: 0, unowned };
-    let sourceTitle: string | null | undefined;
+    let source: { open: boolean; title: string | null } | undefined;
     for (const g of groups) {
-      if (!(await deps.repo.claim(changeId, g.ownerAccountId, change.sourcePageId, g.pageIds.length))) {
+      const token = await deps.repo.claim(changeId, g.ownerAccountId, change.sourcePageId, g.pageIds.length);
+      if (!token) {
         out.skipped++;
         continue;
       }
+      const label = issueTag(changeId, sha256(g.ownerAccountId));
+      let issue: CreatedIssue;
+      let reused = false;
       try {
-        if (sourceTitle === undefined) sourceTitle = (await deps.isOpen(change.sourcePageId)) ? ((await deps.facts.getSource(change.sourcePageId))?.title ?? null) : null;
-        const pages = new Set(g.pageIds);
-        const description = issueAdf({
-          ownerAccountId: g.ownerAccountId,
-          facts: await factLines(
-            deps,
-            change,
-            proposals.filter((p) => pages.has(p.pageId)),
-          ),
-          pages: await issuePages(deps, g.pageIds),
-          morePages: Math.max(0, g.pageIds.length - MAX_ISSUE_PAGES),
-          teams: teamNames(change, g.pageIds),
-          deadline: dueDate(change.routing.deadline) ?? null,
-        });
-        const due = dueDate(change.routing.deadline);
-        const issue = await deps.jira.createIssue({
-          projectKey: settings.projectKey,
-          summary: issueSummary(g.pageIds.length, sourceTitle),
-          description,
-          labels: [...ISSUE_LABELS],
-          assigneeAccountId: g.ownerAccountId,
-          ...(due ? { duedate: due } : {}),
-        });
-        await deps.repo.complete(changeId, g.ownerAccountId, issue);
-        out.created++;
-        console.info('ripple issue created', { changeId, issueId: issue.id, pages: g.pageIds.length, assigneeSet: issue.assigneeSet, dueSet: issue.dueSet });
+        // An issue created by an earlier claim that died before recording it carries the same label: reuse it.
+        const found = await deps.jira.findByLabel(settings.projectKey, label, g.ownerAccountId);
+        if (found) {
+          issue = found;
+          reused = true;
+        } else {
+          if (source === undefined) {
+            const open = await deps.isOpen(change.sourcePageId);
+            source = { open, title: open ? ((await deps.facts.getSource(change.sourcePageId))?.title ?? null) : null };
+          }
+          const pages = new Set(g.pageIds);
+          const listed = await issuePages(deps, g.pageIds);
+          const description = issueAdf({
+            ownerAccountId: g.ownerAccountId,
+            facts: source.open
+              ? await factLines(
+                  deps,
+                  change,
+                  proposals.filter((p) => pages.has(p.pageId)),
+                )
+              : null,
+            pages: listed,
+            morePages: Math.max(0, g.pageIds.length - MAX_ISSUE_PAGES),
+            teams: teamNames(
+              change,
+              listed.filter((p) => p.title !== null).map((p) => p.pageId),
+            ),
+            deadline: dueDate(change.routing.deadline) ?? null,
+          });
+          const due = dueDate(change.routing.deadline);
+          issue = await deps.jira.createIssue({
+            projectKey: settings.projectKey,
+            summary: issueSummary(g.pageIds.length, source.title),
+            description,
+            labels: [...ISSUE_LABELS, label],
+            assigneeAccountId: g.ownerAccountId,
+            ...(due ? { duedate: due } : {}),
+          });
+        }
       } catch (err) {
         out.failed++;
         console.warn('ripple issue not created', { changeId, pages: g.pageIds.length, error: jiraErrorCode(err) });
-        await deps.repo.fail(changeId, g.ownerAccountId).catch(() => undefined);
+        await deps.repo.fail(changeId, g.ownerAccountId, token).catch(() => undefined);
+        continue;
       }
+      // The issue exists now: never mark the claim failed (that would create a second one). If recording fails, the
+      // claim goes stale and the next claim finds the issue by its label.
+      const recorded = await completeWithRetry(deps.repo, changeId, g.ownerAccountId, token, issue);
+      if (recorded === 'done') out.created++;
+      else out.skipped++;
+      console.info('ripple issue created', { changeId, issueId: issue.id, pages: g.pageIds.length, assigneeSet: issue.assigneeSet, dueSet: issue.dueSet, reused, recorded });
     }
     console.info('ripple issues done', { changeId, owners: groups.length, ...out });
     return { status: 'done', ...out };
@@ -161,9 +211,9 @@ export async function createIssuesForChange(changeId: string, deps: IssueDeps = 
 }
 
 /**
- * Closes the change's open issues whose owner has nothing left to do: a comment (updated / superseded / reverted),
- * then a transition to Done. The status flip `created` → `closed` lets one caller through; a Jira failure puts it
- * back so a later call tries again. Never throws.
+ * Closes the change's open issues whose owner has nothing left to do: a comment (updated / superseded / reverted,
+ * once: `comment_sent`), then a transition to Done. The status flip `created` → `closed` lets one caller through; a
+ * Jira failure puts it back so a later call tries again. Never throws.
  */
 export async function syncIssues(changeId: string, deps: IssueDeps = defaultIssueDeps): Promise<number> {
   let closed = 0;
@@ -179,7 +229,13 @@ export async function syncIssues(changeId: string, deps: IssueDeps = defaultIssu
       if (!kind || !row.issueKey) continue;
       if (!(await deps.repo.setStatus(changeId, row.ownerAccountId, 'created', 'closed'))) continue;
       try {
-        await deps.jira.addComment(row.issueKey, closingComment(kind));
+        // The comment goes out once: a transition that failed after it is retried without a second comment.
+        if (!row.commentSent) {
+          await deps.jira.addComment(row.issueKey, closingComment(kind));
+          await deps.repo.markCommentSent(changeId, row.ownerAccountId).catch((err: unknown) => {
+            console.warn('ripple issue comment not recorded', { changeId, issueId: row.issueId, error: scrubErrorText(err instanceof Error ? err.message : String(err)) });
+          });
+        }
         const done = await deps.jira.transitionToDone(row.issueKey);
         closed++;
         console.info('ripple issue closed', { changeId, issueId: row.issueId, kind, transitioned: done });
@@ -267,15 +323,17 @@ const defaultSettingsDeps: SettingsDeps = { repo: sqlChangeIssueRepo, jira, ensu
 /**
  * Who may change the settings: Jira administrators (global ADMINISTER, checked as the app for the calling account),
  * on Ripple's settings page only. The Confluence admin check (`/wiki/rest/api/user/current?expand=operations`)
- * needs a scope Ripple does not have, and the global settings page is not limited to admins. Fails closed.
+ * needs a scope Ripple does not have, and the global settings page is not limited to admins. Fails closed: a refused
+ * (401/403) or failed check is `jira_unavailable` / `jira_error`, never "yes".
  */
-async function canEditSettings(ctx: SettingsContext, deps: SettingsDeps): Promise<boolean> {
-  if (ctx.moduleKey !== SETTINGS_MODULE || !ctx.accountId) return false;
+async function adminCheck(ctx: SettingsContext, deps: SettingsDeps): Promise<'yes' | 'no' | 'jira_unavailable' | 'jira_error'> {
+  if (ctx.moduleKey !== SETTINGS_MODULE || !ctx.accountId) return 'no';
   try {
-    return await deps.jira.isAdmin(ctx.accountId);
+    return (await deps.jira.isAdmin(ctx.accountId)) ? 'yes' : 'no';
   } catch (err) {
-    console.info('ripple settings: Jira admin check failed', { error: jiraErrorCode(err) });
-    return false;
+    const code = jiraErrorCode(err);
+    console.info('ripple settings: Jira admin check failed', { error: code });
+    return code === 'jira_unavailable' ? 'jira_unavailable' : 'jira_error';
   }
 }
 
@@ -294,7 +352,7 @@ async function settingsGuard<T>(ctx: SettingsContext, deps: SettingsDeps, what: 
 export async function getSettings(ctx: SettingsContext, deps: SettingsDeps = defaultSettingsDeps): Promise<SettingsView | ErrorReply> {
   return settingsGuard(ctx, deps, 'load the settings', async () => ({
     jiraProjectKey: (await deps.repo.getJiraSettings())?.projectKey ?? null,
-    canEdit: await canEditSettings(ctx, deps),
+    canEdit: (await adminCheck(ctx, deps)) === 'yes',
   }));
 }
 
@@ -303,7 +361,9 @@ export async function saveSettings(ctx: SettingsContext, payload: Partial<SaveSe
   return settingsGuard(ctx, deps, 'save the settings', async () => {
     const raw = payload?.jiraProjectKey;
     if (raw !== null && raw !== undefined && (typeof raw !== 'string' || raw.length > 20)) return { ok: false, errorCode: 'invalid_key' };
-    if (!(await canEditSettings(ctx, deps))) return { ok: false, errorCode: 'not_allowed' };
+    // Fails closed: a Jira that refuses the check (403) or errors never lets the save through.
+    const admin = await adminCheck(ctx, deps);
+    if (admin !== 'yes') return { ok: false, errorCode: admin === 'no' ? 'not_allowed' : admin };
     const key = (raw ?? '').trim().toUpperCase();
     if (key === '') {
       await deps.repo.saveJiraSettings(null);

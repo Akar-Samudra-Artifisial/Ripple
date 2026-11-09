@@ -22,6 +22,20 @@ export type AdfNode =
 export type AdfDoc = { type: 'doc'; version: 1; content: AdfNode[] };
 
 export const ISSUE_LABELS = ['ripple', 'ripple-update'] as const;
+/** Claims of a (change, owner) issue after which a failed one is not retried (heal, redelivered jobs). */
+export const MAX_ISSUE_ATTEMPTS = 3;
+/** The per-(change, owner) label: `ripple-c<8 hex of the change id>-<8 hex of sha256(owner account id)>`. */
+export const ISSUE_TAG = /^ripple-c[0-9a-f]{8}-[0-9a-f]{8}$/;
+
+/** The issue's unique label; `ownerHash` is the hex sha256 of the owner's account id (never the raw id). */
+export function issueTag(changeId: string, ownerHash: string): string {
+  const tag = `ripple-c${changeId.replace(/[^0-9a-fA-F]/g, '').slice(0, 8).toLowerCase()}-${ownerHash.slice(0, 8).toLowerCase()}`;
+  if (!ISSUE_TAG.test(tag)) throw new Error('invalid issue tag input');
+  return tag;
+}
+
+/** Issue body text when the source page may not be named (no fact label, no old/new value). */
+export const GENERIC_FACT_TEXT = 'An official fact changed; open the pages below to review the proposed update.';
 /** Pages listed in one issue; more are counted ("and N more"). */
 export const MAX_ISSUE_PAGES = 20;
 
@@ -102,11 +116,12 @@ export interface IssuePage {
 
 export interface IssueBodyInput {
   ownerAccountId: string;
-  facts: readonly IssueFact[];
+  /** Null when the source page is not open: the body names no fact and no value (`GENERIC_FACT_TEXT`). */
+  facts: readonly IssueFact[] | null;
   pages: readonly IssuePage[];
   /** Pages beyond the listed ones. */
   morePages: number;
-  /** Team names of the pages' spaces (Teamwork Graph); empty = no team line. */
+  /** Team names of the spaces of open pages (Teamwork Graph); empty = no team line. */
   teams: readonly string[];
   /** `YYYY-MM-DD`, or null. */
   deadline: string | null;
@@ -123,8 +138,9 @@ export function issueAdf(input: IssueBodyInput): AdfDoc {
   const due = input.deadline ? ` by ${input.deadline}` : '';
   const content: AdfNode[] = [
     para({ type: 'mention', attrs: { id: input.ownerAccountId } }, text(` an official fact changed in Confluence. Please update the pages you own${due}.`)),
-    para(text('What changed:')),
-    bullets(input.facts.map((f) => [text(`${clean(f.label, 200)}: ${clean(f.oldValue, 200)} → ${clean(f.newValue, 200)}`)])),
+    ...(input.facts === null
+      ? [para(text(GENERIC_FACT_TEXT))]
+      : [para(text('What changed:')), bullets(input.facts.map((f) => [text(`${clean(f.label, 200)}: ${clean(f.oldValue, 200)} → ${clean(f.newValue, 200)}`)]))]),
     para(text('Pages to update:')),
     bullets(
       input.pages.map((p) => {
@@ -182,12 +198,15 @@ export function issuesState(configured: boolean, rows: readonly { ownerAccountId
   return 'created';
 }
 
-/** True when an owner needs an issue that does not exist yet (no row) or whose creation failed: heal queues the job. */
-export function issuesMissing(pages: readonly RoutedPage[], proposals: readonly ProposalState[], rows: readonly { ownerAccountId: string; status: IssueStatus }[]): boolean {
-  const byOwner = new Map(rows.map((r) => [r.ownerAccountId, r.status]));
+/**
+ * True when an owner needs an issue that does not exist yet (no row) or whose creation failed fewer than
+ * `MAX_ISSUE_ATTEMPTS` times: heal queues the job. After that the Rollout shows `failed` and heal stops.
+ */
+export function issuesMissing(pages: readonly RoutedPage[], proposals: readonly ProposalState[], rows: readonly { ownerAccountId: string; status: IssueStatus; attempts?: number }[]): boolean {
+  const byOwner = new Map(rows.map((r) => [r.ownerAccountId, r]));
   return groupByOwner(pages, proposals).groups.some((g) => {
-    const status = byOwner.get(g.ownerAccountId);
-    return status === undefined || status === 'failed';
+    const row = byOwner.get(g.ownerAccountId);
+    return row === undefined || (row.status === 'failed' && (row.attempts ?? 0) < MAX_ISSUE_ATTEMPTS);
   });
 }
 
