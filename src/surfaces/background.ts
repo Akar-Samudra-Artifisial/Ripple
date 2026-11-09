@@ -3,6 +3,7 @@ import { requestMigration, runMigrations } from '../adapters/sql';
 import { scrubErrorText } from '../adapters/teamworkGraph';
 import { handlePageUpdate, runDiffJob } from './changes';
 import { runJudgeJob, runSearchJob, type ScanOutcome } from './copies';
+import { runProposeJob } from './proposals';
 import { runExtractJob } from './sources';
 import { notImplemented } from './stub';
 
@@ -60,7 +61,7 @@ export async function onPageEvent(event: PageEvent): Promise<void> {
 }
 
 interface ExtractEvent {
-  body?: { pageId?: unknown; kind?: unknown };
+  body?: { pageId?: unknown; kind?: unknown; changeId?: unknown; copyId?: unknown };
   retryContext?: { retryCount?: number };
 }
 
@@ -72,6 +73,17 @@ export async function extractFacts(event: ExtractEvent): Promise<InvocationError
   const pageId = event.body?.pageId;
   if (typeof pageId !== 'string' || !/^\d{1,32}$/.test(pageId)) {
     console.warn('ripple extract: ignoring event without a valid page id');
+    return;
+  }
+  if (event.body?.kind === 'propose') {
+    const { changeId, copyId } = event.body;
+    if (typeof changeId !== 'string' || !UUID.test(changeId) || (copyId !== undefined && (typeof copyId !== 'string' || !UUID.test(copyId)))) {
+      console.warn('ripple propose: ignoring event without a valid change id');
+      return;
+    }
+    const proposed = await runProposeJob(changeId, copyId, event.retryContext?.retryCount ?? 0);
+    if (proposed.status === 'retry') return retryLater(proposed.seconds, proposed.reason);
+    if (proposed.status === 'skipped') console.info('ripple propose skipped', { pageId, changeId, reason: proposed.reason });
     return;
   }
   if (event.body?.kind === 'diff') {

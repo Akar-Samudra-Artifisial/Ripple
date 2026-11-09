@@ -209,6 +209,35 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
       KEY idx_change_dismissals_source (source_page_id)
     )`,
   },
+  // M4: one proposed edit of a copy per confirmed change. `stale` = the copy page changed since the proposal;
+  // `needs_manual` = the text cannot be replaced safely in the storage format; `failed` = the edit could not be made.
+  {
+    name: 'v023_create_proposals',
+    statement: `CREATE TABLE IF NOT EXISTS proposals (
+      id VARCHAR(36) NOT NULL PRIMARY KEY,
+      change_id VARCHAR(36) NOT NULL,
+      copy_id VARCHAR(36) NOT NULL,
+      fact_id VARCHAR(36) NOT NULL,
+      source_page_id VARCHAR(32) NOT NULL,
+      page_id VARCHAR(32) NOT NULL,
+      page_version_at_proposal INT NULL,
+      old_sentence TEXT NULL,
+      new_sentence TEXT NULL,
+      old_value VARCHAR(512) NULL,
+      new_value VARCHAR(512) NULL,
+      status VARCHAR(16) NOT NULL,
+      method VARCHAR(8) NULL,
+      applied_version INT NULL,
+      applied_by VARCHAR(128) NULL,
+      error_code VARCHAR(32) NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      KEY idx_proposals_page_status (page_id, status),
+      KEY idx_proposals_source (source_page_id),
+      KEY idx_proposals_change (change_id)
+    )`,
+  },
+  { name: 'v024_proposals_change_copy_unique', statement: 'CREATE UNIQUE INDEX IF NOT EXISTS uq_proposals_change_copy ON proposals (change_id, copy_id)' },
 ];
 
 /** Name of the newest migration; the byline reports it so admins can confirm the schema is current. */

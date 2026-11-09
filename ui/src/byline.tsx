@@ -4,6 +4,7 @@ import type { BylineStatus } from '../../src/core/views';
 import { call } from './bridge';
 import { CHANGE_MODAL_VIEW, ChangeModalView, ChangePanel } from './changePanel';
 import { mount } from './mount';
+import { ProposalsPanel } from './proposalsPanel';
 import { SourcePanel } from './sourcePanel';
 
 const SETUP_POLL_MS = 3000;
@@ -114,6 +115,7 @@ function Byline() {
         </div>
       ) : null}
       {schema.status === 'ready' && data.pendingChange ? <ChangePanel onDecided={onDecided} /> : null}
+      {schema.status === 'ready' && data.pendingProposals > 0 ? <ProposalsPanel /> : null}
       <p>
         <strong>Owner: {ownerName}</strong> · Team: {teamNames} <span className="muted">(via Teamwork Graph)</span>
       </p>

@@ -47,6 +47,8 @@ export interface BylineStatus {
   spaceTeams: SpaceTeamsView;
   /** M3: a detected change of this source's facts waits for confirmation (open `getPendingChange`). */
   pendingChange: PendingChangeFlag | null;
+  /** M4: edit proposals waiting for a decision on this (copy) page; 0 when none or the lookup failed. */
+  pendingProposals: number;
 }
 
 export interface PendingChangeFlag {
@@ -320,8 +322,99 @@ export interface ChangeDecision {
   deadline: string | null;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// M4: edit proposals per copy (FR-8). Copy-page resolvers take the page id from the context (the copy page being
+// viewed); a proposal of another page is "gone". Writes run as the approving user.
+// ---------------------------------------------------------------------------------------------------------------
+
+export type ProposalState = 'proposed' | 'approved' | 'applied' | 'rejected' | 'stale' | 'needs_manual' | 'failed';
+
+export interface ProposalView {
+  id: string;
+  changeId: string;
+  status: ProposalState;
+  /** The copy's current sentence and the sentence Ripple proposes (null when none could be made). */
+  oldSentence: string | null;
+  newSentence: string | null;
+  oldValue: string | null;
+  newValue: string | null;
+  method: 'token' | 'llm' | null;
+  /** Enum code when `needs_manual`/`failed`/`stale` (e.g. `crosses_markup`, `version_changed`, `forbidden`). */
+  errorCode: string | null;
+  sourcePageId: string;
+  /** Null when the viewer cannot open the source page. */
+  sourceTitle: string | null;
+  appliedVersion: number | null;
+}
+
+export interface ProposalList {
+  pageId: string;
+  /** The viewer may edit this page (approve/reject buttons). */
+  canEdit: boolean;
+  proposals: ProposalView[];
+}
+
+export interface ChangeIdOnlyPayload {
+  changeId: string;
+}
+
+export interface ProposalIdPayload {
+  proposalId: string;
+}
+
+export interface ApproveProposalPayload {
+  proposalId: string;
+  /** The user's own wording; must state the new value and not the old one. */
+  editedSentence?: string;
+}
+
+export interface ProposalDecision {
+  proposalId: string;
+  /** Status after the call (`applied`, `stale`, `needs_manual`, `failed`, `rejected`, or `approved` while another call applies it). */
+  status: ProposalState;
+  errorCode: string | null;
+  /** Page version saved by Ripple when applied. */
+  version: number | null;
+}
+
+export interface ApproveAllResult {
+  applied: number;
+  stale: number;
+  needsManual: number;
+  failed: number;
+  version: number | null;
+}
+
+export interface RolloutItem {
+  proposalId: string;
+  pageId: string;
+  pageTitle: string | null;
+  pageUrl: string | null;
+  status: ProposalState;
+  errorCode: string | null;
+}
+
+/** Progress of a confirmed change over its copies (source page); pages the viewer cannot open are only counted. */
+export interface Rollout {
+  changeId: string;
+  items: RolloutItem[];
+  counts: Partial<Record<ProposalState, number>>;
+  hiddenCount: number;
+}
+
 /** Resolver name → payload and success reply. Every resolver may also answer `ErrorReply`. */
 export interface ResolverContract {
+  /** Proposals for the copy page being viewed. */
+  listProposalsForPage: { payload: undefined; reply: ProposalList };
+  /** Edit permission on the copy page; applies the edit as the user ("Updated by Ripple from <source>"). */
+  approveProposal: { payload: ApproveProposalPayload; reply: ProposalDecision };
+  rejectProposal: { payload: ProposalIdPayload; reply: ProposalDecision };
+  /** Rejects the proposal and ignores the copy (not the same fact). */
+  markNotSameFact: { payload: ProposalIdPayload; reply: ProposalDecision };
+  /** Applies every open proposal of the page in one version. */
+  approveAll: { payload: undefined; reply: ApproveAllResult };
+  /** On the source page: proposals of one of its changes. */
+  listRollout: { payload: ChangeIdOnlyPayload; reply: Rollout };
   getPendingChange: { payload: undefined; reply: PendingChangeReply };
   /** Edit permission on the source; sets the facts to their new values and records the deadline (M4 proposes edits). */
   confirmChange: { payload: ConfirmChangePayload; reply: ChangeDecision };

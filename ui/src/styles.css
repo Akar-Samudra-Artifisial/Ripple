@@ -844,3 +844,25 @@ ul {
   background: var(--ds-background-neutral, #091e420f);
   color: var(--ds-text-subtle, #44546f);
 }
+
+/* M4 proposed edits (minimal) */
+.proposals__list {
+  list-style: none;
+  padding: 0;
+  margin: var(--ds-space-100, 8px) 0 0;
+}
+.proposal {
+  border-top: 1px solid var(--ds-border, #dfe1e6);
+  padding: var(--ds-space-100, 8px) 0;
+}
+.proposal__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--ds-space-075, 6px);
+}
+.proposal__edit {
+  display: block;
+  width: 100%;
+  min-height: 3em;
+  margin: var(--ds-space-050, 4px) 0;
+}

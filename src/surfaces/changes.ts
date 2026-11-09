@@ -286,6 +286,8 @@ export interface ChangeDeps {
   graph: (cloudId: string) => GraphRequest;
   ensure: () => Promise<void>;
   now: () => Date;
+  /** M4: queues the edit proposals of a confirmed change (`extract` queue, `kind: 'propose'`). */
+  enqueuePropose?: (sourcePageId: string, changeId: string) => Promise<string>;
 }
 
 const defaultDeps: ChangeDeps = {
@@ -298,6 +300,10 @@ const defaultDeps: ChangeDeps = {
   graph: asUserGraph,
   ensure: ensureSchema,
   now: () => new Date(),
+  enqueuePropose: async (sourcePageId, changeId) => {
+    const { jobId } = await extractQueue.push({ body: { pageId: sourcePageId, kind: 'propose', changeId }, concurrency: { key: `extract-page-${sourcePageId}`, limit: 1 } });
+    return jobId;
+  },
 };
 
 export type ChangeContext = SourceContext & { cloudId?: string };
@@ -533,7 +539,16 @@ export async function confirmChange(ctx: ChangeContext, payload: Partial<Confirm
         repeat: !transitioned,
       });
     }
-    console.info('ripple change confirmed', { pageId, changeId: change.id, repeat: !transitioned, factsUpdated, copiesDrifted, pages: pages.length, spaces: spaces.length });
+    // M4: edit proposals per copy (idempotent per change and copy, so a repeated confirm queues a no-op).
+    let proposeJob: string | null = null;
+    if ((impact?.copies.length ?? 0) > 0 && deps.enqueuePropose) {
+      try {
+        proposeJob = await deps.enqueuePropose(pageId, change.id);
+      } catch (err) {
+        console.warn('ripple change: proposals not queued (confirm again to retry)', { pageId, changeId: change.id, error: errorText(err) });
+      }
+    }
+    console.info('ripple change confirmed', { pageId, changeId: change.id, repeat: !transitioned, factsUpdated, copiesDrifted, pages: pages.length, spaces: spaces.length, proposeJob });
     return { changeId: change.id, status: 'confirmed', factsUpdated, copiesDrifted, deadline: routing?.deadline ?? null };
   });
 }

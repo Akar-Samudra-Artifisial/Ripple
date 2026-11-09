@@ -72,6 +72,8 @@ describe('page_events stays bounded', () => {
     const deletes = calls.map((c) => c.statement);
     expect(deletes).toContain('DELETE FROM page_events WHERE page_id = ?');
     expect(deletes).toContain('DELETE FROM change_dismissals WHERE source_page_id = ?');
+    expect(deletes).toContain('DELETE FROM proposals WHERE source_page_id = ?');
+    expect(deletes.indexOf('DELETE FROM proposals WHERE source_page_id = ?')).toBeLessThan(deletes.indexOf('DELETE FROM changes WHERE source_page_id = ?'));
     expect(deletes.at(-1)).toBe('DELETE FROM sources WHERE page_id = ?');
   });
 });

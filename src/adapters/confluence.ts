@@ -136,6 +136,51 @@ export async function visiblePageIds(pageIds: readonly string[]): Promise<Set<st
   return visible;
 }
 
+/** A page as the current user reads it, for an edit (M4). */
+export interface UserPage {
+  title: string;
+  version: number;
+  body: string;
+}
+
+/** HTTP outcome of a user read/write; `status` only (the body may echo page text). */
+export type UserResult<T> = { ok: true; value: T } | { ok: false; status: number };
+
+/**
+ * Title, version and storage body as the current user. Resolvers only. A response without a storage body is a
+ * failure (writing back a body that was not returned would wipe the page).
+ */
+export async function getPageAsUser(pageId: string): Promise<UserResult<UserPage>> {
+  const res = await api.asUser().requestConfluence(route`/wiki/api/v2/pages/${pageId}?body-format=storage`, { headers: { Accept: 'application/json' } });
+  if (!res.ok) return { ok: false, status: res.status };
+  const page = (await res.json()) as RawPage;
+  const body = page.body?.storage?.value;
+  const version = page.version?.number;
+  if (typeof body !== 'string' || typeof version !== 'number') return { ok: false, status: 502 };
+  return { ok: true, value: { title: page.title ?? '', version, body } };
+}
+
+/**
+ * Saves `body` as the current user (they become a contributor) as version `version` with `message`; returns the saved
+ * version. Resolvers only. 409 = someone saved another version first.
+ */
+export async function updatePageAsUser(pageId: string, page: { title: string; body: string; version: number; message: string }): Promise<UserResult<number>> {
+  const res = await api.asUser().requestConfluence(route`/wiki/api/v2/pages/${pageId}`, {
+    method: 'PUT',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      id: pageId,
+      status: 'current',
+      title: page.title,
+      body: { representation: 'storage', value: page.body },
+      version: { number: page.version, message: page.message },
+    }),
+  });
+  if (!res.ok) return { ok: false, status: res.status };
+  const saved = (await res.json()) as RawPage;
+  return { ok: true, value: saved.version?.number ?? page.version };
+}
+
 /**
  * True when the current user may edit the page (`update` among its permitted operations). Runs as the user, so only
  * call it from resolvers. 401/403/404 mean "no"; other failures throw.

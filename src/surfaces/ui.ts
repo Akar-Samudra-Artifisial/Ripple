@@ -6,6 +6,8 @@ import { LATEST_MIGRATION, MIGRATIONS } from '../core/migrations';
 import { SchemaSettingUpError } from '../core/schema';
 import { confirmChange, dismissChange, getPendingChange, pendingChangeFlag, type ChangeContext } from './changes';
 import { getScanStatus, listCopies, startScan } from './copies';
+import { approveAll, approveProposal, listProposalsForPage, listRollout, markNotSameFact, pendingProposalCount, rejectProposal } from './proposals';
+import type { ApproveProposalPayload, ChangeIdOnlyPayload, ProposalIdPayload } from '../core/views';
 import type { BylineStatus, ChangeIdPayload, ConfirmChangePayload, CopyListPayload, PendingChangeFlag, FactEditPayload, FactIdPayload, OwnerView, SchemaView, SpaceTeamsView } from '../core/views';
 import { confirmFact, editFact, getSourceStatus, listFacts, markSource, rejectFact, unmarkSource, type SourceContext } from './sources';
 import { notImplemented } from './stub';
@@ -38,10 +40,19 @@ export interface BylineDeps {
   names: (accountIds: readonly string[]) => Promise<Map<string, string>>;
   /** M3 pending change of the page; must not throw (null on failure). */
   pendingChange: (pageId: string) => Promise<PendingChangeFlag | null>;
+  /** M4 proposals waiting on the page; must not throw (0 on failure). Absent = 0. */
+  pendingProposals?: (pageId: string) => Promise<number>;
   ensure: () => Promise<void>;
 }
 
-const defaultDeps: BylineDeps = { graph: asUserGraph, pageMeta: fetchPageMeta, names: (ids) => displayNames(ids), pendingChange: (id) => pendingChangeFlag(id), ensure: ensureSchema };
+const defaultDeps: BylineDeps = {
+  graph: asUserGraph,
+  pageMeta: fetchPageMeta,
+  names: (ids) => displayNames(ids),
+  pendingChange: (id) => pendingChangeFlag(id),
+  pendingProposals: (id) => pendingProposalCount(id),
+  ensure: ensureSchema,
+};
 
 /** Space id from the byline context, or from the REST v2 page when the context has none. */
 async function spaceIdOf(ctx: ResolverContext, page: () => Promise<PageMeta>): Promise<string> {
@@ -98,8 +109,10 @@ export async function bylineStatus(ctx: ResolverContext, deps: BylineDeps = defa
       spaceTeams = { spaceId: null, teams: [], dataPresent: false, errors: [errorText(err)] };
     }
   }
-  const pendingChange = schema.status === 'ready' && pageId !== undefined && String(pageId) !== '' ? await deps.pendingChange(String(pageId)) : null;
-  return { message: bylineMessage(schema), schema, owner, spaceTeams, pendingChange };
+  const onPage = schema.status === 'ready' && pageId !== undefined && String(pageId) !== '';
+  const pendingChange = onPage ? await deps.pendingChange(String(pageId)) : null;
+  const pendingProposals = onPage && deps.pendingProposals ? await deps.pendingProposals(String(pageId)) : 0;
+  return { message: bylineMessage(schema), schema, owner, spaceTeams, pendingChange, pendingProposals };
 }
 
 const resolver = new Resolver();
@@ -121,6 +134,13 @@ resolver.define('listCopies', ({ context, payload }) => listCopies(context as So
 resolver.define('getPendingChange', ({ context }) => getPendingChange(context as ChangeContext));
 resolver.define('confirmChange', ({ context, payload }) => confirmChange(context as ChangeContext, payload as Partial<ConfirmChangePayload>));
 resolver.define('dismissChange', ({ context, payload }) => dismissChange(context as ChangeContext, payload as Partial<ChangeIdPayload>));
+// M4 (FR-8): copy-page proposals; `listRollout` on the source page.
+resolver.define('listProposalsForPage', ({ context }) => listProposalsForPage(context as SourceContext));
+resolver.define('approveProposal', ({ context, payload }) => approveProposal(context as SourceContext, payload as Partial<ApproveProposalPayload>));
+resolver.define('rejectProposal', ({ context, payload }) => rejectProposal(context as SourceContext, payload as Partial<ProposalIdPayload>));
+resolver.define('markNotSameFact', ({ context, payload }) => markNotSameFact(context as SourceContext, payload as Partial<ProposalIdPayload>));
+resolver.define('approveAll', ({ context }) => approveAll(context as SourceContext));
+resolver.define('listRollout', ({ context, payload }) => listRollout(context as SourceContext, payload as Partial<ChangeIdOnlyPayload>));
 resolver.define('getSettings', () => notImplemented('settings'));
 resolver.define('getApproval', () => notImplemented('approval panel'));
 
