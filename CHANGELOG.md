@@ -5,6 +5,7 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 ## [Unreleased]
 
 ### Added
+- Catatan kecil di panel sumber bila halaman terlalu panjang dan hanya bagian awalnya yang dibaca.
 - Status sumber memuat `truncated` bila teks halaman melebihi batas baca LLM (kolom `sources.text_truncated`, migrasi v006).
 - M1 (FR-1..3): tombol "Mark as source of truth" di byline (hanya untuk pengguna dengan izin edit halaman, dicek di server), lepas status sumber, status ekstraksi yang di-poll, dan daftar fakta dengan kutipan serta aksi Confirm/Edit/Reject.
 - Ekstraksi fakta di antrean `extract` lewat Forge LLM: maksimal 30 fakta per halaman, hanya jenis yang didukung, kutipan wajib ditemukan persis di teks halaman (fakta dengan kutipan palsu dibuang), dedup kunci identitas subjek + atribut + kondisi; ekstraksi ulang mempertahankan fakta yang sudah dikonfirmasi/diedit dan tidak menghidupkan lagi fakta yang ditolak.
@@ -27,6 +28,8 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Permintaan ke `claude-sonnet-5` tidak lagi mengirim `temperature` (parameter ini ditolak model tersebut).
 
 ### Fixed
+- Panel sumber resmi tidak lagi sesaat menampilkan "No facts were found" setelah reload: status dan daftar fakta tampil bersamaan, dengan "Loading facts…" (skeleton) sampai daftar pertama datang dan error + Retry bila gagal.
+- Byline tidak lagi tertahan di "setting up" sampai popup dibuka ulang: selama setup database, status di-poll tiap 3 detik dengan progres langkah, berhenti saat siap/error/popup ditutup, dan setelah 3 menit menampilkan pesan + tombol Retry.
 - Ekstraksi ulang tidak lagi menimpa review yang masuk di tengah ekstraksi dan tidak pernah menghidupkan lagi fakta yang ditolak (UPDATE dengan guard status).
 - Halaman yang di-unmark saat LLM berjalan tidak meninggalkan fakta yatim; fakta yang terlanjur ditulis dibersihkan.
 - Gagal mengantrekan ekstraksi kini menandai sumber sebagai error (bisa "Try again") alih-alih tertahan di `extracting`.

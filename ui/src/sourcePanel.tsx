@@ -18,32 +18,47 @@ const formatDate = (iso: string | null): string | null => {
   return Number.isNaN(d.getTime()) ? null : d.toLocaleDateString(undefined, { dateStyle: 'medium' });
 };
 
-/** Source-of-truth panel in the byline popup: mark/unmark, extraction progress (polled) and fact review. */
+/**
+ * Source-of-truth panel in the byline popup: mark/unmark, extraction progress (polled) and fact review.
+ *
+ * Render states: no `status` yet → "Loading source status…" (or error + retry); `notice` → setup message (polled);
+ * no source → mark CTA; `extracting` → progress (polled); `error` → alert + "Try again"; `ready` with `facts`
+ * undefined → "Loading facts…" (or error + retry); `ready` with `facts` loaded → list, or the empty message only when
+ * the list is really empty. `facts` stays undefined until the first `listFacts` reply, so "No facts" never flashes.
+ */
 export function SourcePanel() {
   const [status, setStatus] = useState<SourceStatus>();
-  const [facts, setFacts] = useState<FactView[]>([]);
+  /** Undefined until the first `listFacts` reply for a ready source. */
+  const [facts, setFacts] = useState<FactView[]>();
   const [error, setError] = useState<string>();
   const [pending, setPending] = useState<SourceCall>();
 
   const load = useCallback(async () => {
     const s = await call<SourceStatus>('getSourceStatus');
+    // Fetch the facts before committing a `ready` status so status and list render together.
+    const list = s.source?.state === 'ready' ? (await call<FactList>('listFacts')).facts : undefined;
     setStatus(s);
-    if (s.source?.state === 'ready') setFacts((await call<FactList>('listFacts')).facts);
-    else if (!s.source) setFacts([]);
+    if (list) setFacts(list);
+    else if (!s.source) setFacts(undefined);
     setError(undefined);
     return s;
   }, []);
-
-  useEffect(() => {
+  const reload = useCallback(() => {
+    setError(undefined);
     load().catch((e: unknown) => setError(errorOf(e)));
   }, [load]);
 
+  useEffect(() => {
+    reload();
+  }, [reload]);
+
+  const polling = status?.source?.state === 'extracting' || Boolean(status?.notice);
   const extracting = status?.source?.state === 'extracting';
   useEffect(() => {
-    if (!extracting) return;
+    if (!polling) return;
     const timer = setInterval(() => load().catch((e: unknown) => setError(errorOf(e))), POLL_MS);
     return () => clearInterval(timer);
-  }, [extracting, load]);
+  }, [polling, load]);
 
   const runSource = useCallback(async (name: SourceCall) => {
     setPending(name);
@@ -51,7 +66,7 @@ export function SourcePanel() {
     try {
       const s = await call<SourceStatus>(name);
       setStatus(s);
-      if (!s.source) setFacts([]);
+      if (!s.source) setFacts(undefined);
     } catch (e) {
       setError(errorOf(e));
     } finally {
@@ -61,7 +76,7 @@ export function SourcePanel() {
 
   const runFact = useCallback(async (name: FactAction, payload: FactEditPayload | { factId: string }) => {
     const { fact } = await call<FactActionResult>(name, { ...payload });
-    setFacts((list) => list.map((f) => (f.id === fact.id ? fact : f)));
+    setFacts((list) => list?.map((f) => (f.id === fact.id ? fact : f)));
     call<SourceStatus>('getSourceStatus')
       .then(setStatus)
       .catch(() => undefined);
@@ -72,7 +87,7 @@ export function SourcePanel() {
     return (
       <section className="source" aria-label="Source of truth">
         {error ? (
-          <Alert message={`Could not load the source status: ${error}`} onRetry={() => load().catch((e: unknown) => setError(errorOf(e)))} />
+          <Alert message={`Could not load the source status: ${error}`} onRetry={reload} />
         ) : (
           <p className="muted" role="status">
             Loading source status…
@@ -133,7 +148,8 @@ export function SourcePanel() {
         {source.pageVersion !== null ? <p className="muted source__meta">Read from page version {source.pageVersion}</p> : null}
       </header>
 
-      {error ? <Alert message={error} /> : null}
+      {error && !(source.state === 'ready' && facts === undefined) ? <Alert message={error} /> : null}
+      {source.truncated ? <p className="muted source__meta">This page is long, so Ripple read only its first part. Facts further down may be missing.</p> : null}
 
       {source.state === 'extracting' ? <Extracting /> : null}
       {source.state === 'error' ? (
@@ -145,11 +161,15 @@ export function SourcePanel() {
         />
       ) : null}
 
-      {source.state === 'ready' && facts.length === 0 ? (
+      {source.state === 'ready' && facts === undefined ? (
+        error ? <Alert message={`Could not load the facts: ${error}`} onRetry={reload} /> : <FactsLoading />
+      ) : null}
+
+      {source.state === 'ready' && facts?.length === 0 ? (
         <p className="empty">No facts were found on this page. Facts are numbers, dates, lists, names and yes/no rules stated in the text.</p>
       ) : null}
 
-      {facts.length > 0 ? (
+      {facts && facts.length > 0 ? (
         <ul className="facts" aria-label="Facts on this page">
           {facts.map((f) => (
             <FactCard key={f.id} fact={f} canEdit={canEdit} onAction={runFact} />
@@ -171,6 +191,18 @@ function Alert({ message, onRetry, retryLabel = 'Try again', retryDisabled }: { 
           {retryLabel}
         </button>
       ) : null}
+    </div>
+  );
+}
+
+function FactsLoading() {
+  return (
+    <div className="facts-loading" aria-busy="true">
+      <p className="muted" role="status">
+        Loading facts…
+      </p>
+      <div className="skeleton" aria-hidden="true" />
+      <div className="skeleton" aria-hidden="true" />
     </div>
   );
 }
