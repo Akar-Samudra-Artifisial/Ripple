@@ -229,35 +229,52 @@ export async function pageLinkAsApp(pageId: string): Promise<AppPageLink | null>
   }
 }
 
+/** Why `pageOpenness` is not `open`: a read restriction, or a check that failed (`<step>_http_<status>`, …). */
+export type PageOpenness = { open: true } | { open: false; reason: string };
+
 /**
- * True when the page's title may be named to anyone (version messages): the app reads its space, and neither the
- * page nor any ancestor has a read restriction (REST v1 `restriction/byOperation/read`, as the app). Any failure
- * counts as restricted. Space permissions themselves cannot be read with the app's scopes (`read:space.permission:
- * confluence` is not granted), so a page in a space only some groups can view counts as open: see docs/PRIVACY.md.
+ * Whether the page's title may be named to anyone (version messages, Jira issues): the app reads its space, and
+ * neither the page nor any ancestor has a read restriction (REST v1 `restriction/byOperation/read`, as the app). Any
+ * failure counts as restricted (`reason` is a log-safe enum). Ancestors come from REST v1 `content/{id}?expand=
+ * ancestors` (`read:confluence-content.all`): the v2 `pages/{id}/ancestors` needs `read:content.metadata:confluence`,
+ * which Ripple does not have, so every page counted as restricted. Space permissions themselves cannot be read with
+ * the app's scopes (`read:space.permission:confluence` is not granted), so a page in a space only some groups can
+ * view counts as open: see docs/PRIVACY.md.
  */
-export async function pageIsOpen(pageId: string): Promise<boolean> {
+export async function pageOpenness(pageId: string): Promise<PageOpenness> {
+  const closed = (reason: string): PageOpenness => ({ open: false, reason });
   try {
+    if (!/^\d{1,32}$/.test(pageId)) return closed('bad_id');
     const app = api.asApp();
     const json = { headers: { Accept: 'application/json' } };
     const pageRes = await app.requestConfluence(route`/wiki/api/v2/pages/${pageId}`, json);
-    if (!pageRes.ok) return false;
+    if (!pageRes.ok) return closed(`page_http_${pageRes.status}`);
     const page = (await pageRes.json()) as RawPage;
-    if (page.spaceId === undefined) return false;
+    if (page.spaceId === undefined) return closed('page_no_space');
     const spaceRes = await app.requestConfluence(route`/wiki/api/v2/spaces/${String(page.spaceId)}`, json);
-    if (!spaceRes.ok) return false;
-    const ancRes = await app.requestConfluence(route`/wiki/api/v2/pages/${pageId}/ancestors?limit=${String(MAX_RESTRICTION_ANCESTORS + 1)}`, json);
-    if (!ancRes.ok) return false;
-    const ancestors = ((await ancRes.json()) as { results?: { id?: string | number }[] }).results ?? [];
-    if (ancestors.length > MAX_RESTRICTION_ANCESTORS) return false;
+    if (!spaceRes.ok) return closed(`space_http_${spaceRes.status}`);
+    const ancRes = await app.requestConfluence(route`/wiki/rest/api/content/${pageId}?expand=ancestors`, json);
+    if (!ancRes.ok) return closed(`ancestors_http_${ancRes.status}`);
+    const ancestors = ((await ancRes.json()) as { ancestors?: { id?: string | number }[] }).ancestors ?? [];
+    if (ancestors.length > MAX_RESTRICTION_ANCESTORS) return closed('too_deep');
     for (const id of [pageId, ...ancestors.map((a) => String(a.id ?? ''))]) {
-      if (!/^\d{1,32}$/.test(id)) return false;
+      if (!/^\d{1,32}$/.test(id)) return closed('bad_ancestor_id');
       const res = await app.requestConfluence(route`/wiki/rest/api/content/${id}/restriction/byOperation/read?expand=restrictions.user,restrictions.group`, json);
-      if (!res.ok || restrictedBy((await res.json()) as RawRestrictions)) return false;
+      if (!res.ok) return closed(`restrictions_http_${res.status}`);
+      if (restrictedBy((await res.json()) as RawRestrictions)) return closed(id === pageId ? 'restricted' : 'ancestor_restricted');
     }
-    return true;
-  } catch {
-    return false;
+    return { open: true };
+  } catch (err) {
+    const name = (err as { name?: unknown } | null)?.name;
+    return closed(typeof name === 'string' && /^[A-Z_]{1,40}$/.test(name) ? `error_${name.toLowerCase()}` : 'error');
   }
+}
+
+/** `pageOpenness` as a boolean; a failed check (not a restriction) is logged with its enum reason only. */
+export async function pageIsOpen(pageId: string): Promise<boolean> {
+  const r = await pageOpenness(pageId);
+  if (!r.open && r.reason !== 'restricted' && r.reason !== 'ancestor_restricted') console.info('ripple page open check failed', { pageId, reason: r.reason });
+  return r.open;
 }
 
 /**

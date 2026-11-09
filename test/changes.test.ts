@@ -208,6 +208,10 @@ class Store {
         return n;
       },
       confirmedChanges: async (sourcePageId) => [...this.changes.values()].filter((c) => c.sourcePageId === sourcePageId && c.status === 'confirmed').reverse(),
+      markProposed: async (id) => {
+        const c = this.changes.get(id);
+        if (c?.status === 'confirmed') c.proposedAt = '2026-11-09T10:00:00Z';
+      },
       revertFactChange: async (sourcePageId, c: FactChange, copyIds) => {
         const f = this.facts.find((x) => x.id === c.factId && x.status === 'confirmed' && x.value === c.newValue && x.previousValue === c.oldValue);
         if (!f || sourcePageId !== SOURCE_PAGE_ID) return { reverted: false, copies: 0 };
@@ -947,6 +951,18 @@ describe('change resolvers', () => {
     expect(await confirmChange(ctx, { changeId: id, version: 4 }, changeDeps())).toEqual({ changeId: id, status: 'confirmed', factsUpdated: 0, copiesDrifted: 0, deadline: '2026-11-12' });
     expect(store.audits).toHaveLength(audits);
     expect(await dismissChange(ctx, { changeId: id, version: 4 }, changeDeps())).toEqual({ error: expect.stringContaining('already decided') });
+  });
+
+  it('M5: confirm records the Jira project set at that moment (issues wanted); none set = no marker', async () => {
+    const id = await pendingId();
+    await confirmChange(ctx, { changeId: id, version: 4 }, changeDeps({ jiraProjectKey: async () => 'PLAT' }));
+    expect(store.changes.get(id)?.routing?.jiraProjectKey).toBe('PLAT');
+  });
+
+  it('M5: a change confirmed without a Jira project has no issue marker', async () => {
+    const id = await pendingId();
+    await confirmChange(ctx, { changeId: id, version: 4 }, changeDeps({ jiraProjectKey: async () => null }));
+    expect(store.changes.get(id)?.routing).not.toHaveProperty('jiraProjectKey');
   });
 
   it('confirm rejects open proposals of older changes as superseded; getLatestChange returns the confirmed change', async () => {

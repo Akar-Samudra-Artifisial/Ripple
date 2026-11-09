@@ -290,6 +290,8 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
   { name: 'v028_change_issues_claim_token', statement: 'ALTER TABLE change_issues ADD COLUMN IF NOT EXISTS claim_token VARCHAR(36) NULL' },
   { name: 'v029_change_issues_attempts', statement: 'ALTER TABLE change_issues ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0' },
   { name: 'v030_change_issues_comment_sent', statement: 'ALTER TABLE change_issues ADD COLUMN IF NOT EXISTS comment_sent TINYINT(1) NOT NULL DEFAULT 0' },
+  // M5 fix: when a full propose job of a confirmed change finished; Jira issues (and the heal for them) wait for it.
+  { name: 'v031_changes_proposed_at', statement: 'ALTER TABLE changes ADD COLUMN IF NOT EXISTS proposed_at TIMESTAMP NULL' },
 ];
 
 /** Name of the newest migration; the byline reports it so admins can confirm the schema is current. */

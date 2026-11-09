@@ -123,9 +123,25 @@ async function completeWithRetry(repo: ChangeIssueRepo, changeId: string, owner:
   }
 }
 
+/** Why a change gets no Jira issues (log-safe enum); null = it may get them. */
+export type IssueIneligible = 'change_not_confirmed' | 'issues_not_wanted' | 'proposals_pending' | 'not_latest_change';
+
 /**
- * Creates the missing issues of a confirmed change: one per owner of pages whose proposals need them. The row claim
- * makes a redelivered or concurrent job skip owners that already have (or are getting) an issue. Never throws.
+ * Only the source's newest confirmed change gets issues, only when a Jira project was set when it was confirmed
+ * (`routing.jiraProjectKey`: no retroactive issues for older changes) and only after a full propose job finished.
+ */
+export async function issueIneligibility(change: ChangeRow | undefined, changes: Pick<ChangeRepo, 'confirmedChanges'>): Promise<IssueIneligible | null> {
+  if (!change || change.status !== 'confirmed' || !change.routing) return 'change_not_confirmed';
+  if (!change.routing.jiraProjectKey) return 'issues_not_wanted';
+  if (!change.proposedAt) return 'proposals_pending';
+  const latest = (await changes.confirmedChanges(change.sourcePageId))[0];
+  return latest?.id === change.id ? null : 'not_latest_change';
+}
+
+/**
+ * Creates the missing issues of a confirmed change: one per owner of pages with open proposals (proposed /
+ * needs_manual / failed) in it. The row claim makes a redelivered or concurrent job skip owners that already have (or
+ * are getting) an issue. Never throws.
  */
 export async function createIssuesForChange(changeId: string, deps: IssueDeps = defaultIssueDeps): Promise<CreateIssuesOutcome> {
   try {
@@ -135,7 +151,11 @@ export async function createIssuesForChange(changeId: string, deps: IssueDeps = 
       return { status: 'not_configured' };
     }
     const change = await deps.changes.getChange(changeId);
-    if (!change || change.status !== 'confirmed' || !change.routing) return { status: 'skipped', reason: 'change not confirmed' };
+    const ineligible = await issueIneligibility(change, deps.changes);
+    if (ineligible || !change?.routing) {
+      console.info('ripple issues skipped', { changeId, reason: ineligible ?? 'change_not_confirmed' });
+      return { status: 'skipped', reason: ineligible ?? 'change_not_confirmed' };
+    }
     const proposals = await deps.proposals.listForChange(changeId);
     const { groups, unowned } = groupByOwner(change.routing.pages, proposals);
     const out = { created: 0, failed: 0, skipped: 0, unowned };
@@ -265,14 +285,28 @@ export async function syncOtherChanges(sourcePageId: string, exceptChangeId: str
   }
 }
 
-/** Heal: the change needs its propose job again to create missing (or failed) issues. False on any failure. */
-export async function issuesNeeded(change: ChangeRow, deps: Pick<IssueDeps, 'repo' | 'proposals'> = defaultIssueDeps): Promise<boolean> {
+/**
+ * Heal: the change needs its propose job again to create missing (or failed) issues: only an eligible change (see
+ * `issueIneligibility`) with a project still configured. False on any failure.
+ */
+export async function issuesNeeded(change: ChangeRow, deps: Pick<IssueDeps, 'repo' | 'proposals' | 'changes'> = defaultIssueDeps): Promise<boolean> {
   try {
     if (!change.routing || !(await deps.repo.getJiraSettings())) return false;
+    if ((await issueIneligibility(change, deps.changes)) !== null) return false;
     const rows = await deps.repo.listForChange(change.id);
     return issuesMissing(change.routing.pages, await deps.proposals.listForChange(change.id), rows);
   } catch {
     return false;
+  }
+}
+
+/** The configured Jira project key, recorded on a change when it is confirmed; null when none or on failure. */
+export async function jiraProjectKey(repo: Pick<ChangeIssueRepo, 'getJiraSettings'> = sqlChangeIssueRepo): Promise<string | null> {
+  try {
+    return (await repo.getJiraSettings())?.projectKey ?? null;
+  } catch (err) {
+    console.warn('ripple issues: jira settings read failed', { error: scrubErrorText(err instanceof Error ? err.message : String(err)) });
+    return null;
   }
 }
 
@@ -300,7 +334,8 @@ export async function rolloutIssues(
   const issues = rows
     .filter((r): r is ChangeIssueRow & { issueKey: string } => r.issueKey !== null && (r.status === 'created' || r.status === 'closed'))
     .map((r) => ({ ownerName: names.get(r.ownerAccountId) ?? null, issueKey: r.issueKey, issueUrl: r.issueUrl, status: r.status === 'closed' ? ('done' as const) : ('open' as const), pageCount: r.pageCount }));
-  return { issues, issuesState: issuesState(settings !== undefined, rows, expected) };
+  // A change confirmed before a project was set never gets issues: shown as "not configured", not as pending.
+  return { issues, issuesState: issuesState(settings !== undefined && !!change.routing?.jiraProjectKey, rows, expected) };
 }
 
 // ---------------------------------------------------------------------------------------------------------------

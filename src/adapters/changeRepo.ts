@@ -16,6 +16,11 @@ export interface ChangeRouting {
   pages: { pageId: string; spaceId: string | null; ownerAccountId: string | null; ownerRole: 'owner' | 'author' | null; copies: number }[];
   /** `unknown`: the teams could not be read at confirm time (no team ids recorded; resolve again before routing). */
   spaces: { spaceId: string; teamIds: string[]; teamSource: TeamSource; /** Names for the Jira issue (M5); absent on older changes. */ teams?: { id: string; name: string }[] }[];
+  /**
+   * M5: the Jira project configured when the change was confirmed. Absent = Jira issues are not wanted for this change
+   * (confirmed before a project was set): they are never created afterwards.
+   */
+  jiraProjectKey?: string;
 }
 
 export interface ChangeRow {
@@ -30,6 +35,8 @@ export interface ChangeRow {
   routing: ChangeRouting | null;
   deadlineDays: number | null;
   createdAt: string | null;
+  /** M5: when a full propose job of the change last finished (Jira issues only after that); null/absent = not yet. */
+  proposedAt?: string | null;
 }
 
 export interface CopyForChange extends CopyForImpact {
@@ -71,6 +78,8 @@ export interface ChangeRepo {
   saveDismissals(sourcePageId: string, changes: readonly FactChange[]): Promise<void>;
   /** The most recent confirmed changes of the source, newest decision first. */
   confirmedChanges(sourcePageId: string): Promise<ChangeRow[]>;
+  /** M5: a full propose job of the confirmed change finished (repeat-safe; the time moves on). */
+  markProposed(changeId: string): Promise<void>;
   /**
    * Undoes `applyFactChange` (old value and unit back, quote kept): only while the fact still holds the change's new
    * value with its old value as `previous_value`. Then the given copies drifted by that confirmation are in sync again.
@@ -96,6 +105,7 @@ interface ChangeDbRow {
   routing: unknown;
   deadline_days: number | null;
   created_at: unknown;
+  proposed_at?: unknown;
 }
 
 const json = (v: unknown): unknown => (typeof v === 'string' ? JSON.parse(v) : v);
@@ -117,9 +127,10 @@ const toChange = (r: ChangeDbRow): ChangeRow => ({
   routing: (json(r.routing) as ChangeRouting | null) ?? null,
   deadlineDays: r.deadline_days === null || r.deadline_days === undefined ? null : Number(r.deadline_days),
   createdAt: iso(r.created_at),
+  proposedAt: iso(r.proposed_at),
 });
 
-const CHANGE_COLUMNS = 'id, source_page_id, status, page_version, fact_changes, missing_fact_ids, impact, routing, deadline_days, created_at';
+const CHANGE_COLUMNS = 'id, source_page_id, status, page_version, fact_changes, missing_fact_ids, impact, routing, deadline_days, created_at, proposed_at';
 const placeholders = (n: number): string => Array.from({ length: n }, () => '?').join(', ');
 
 const DRIFT_REASON = 'The official value changed; this copy states the old value.';
@@ -278,6 +289,10 @@ export const sqlChangeRepo: ChangeRepo = {
       sourcePageId,
     );
     return rows.map(toChange);
+  },
+
+  async markProposed(changeId) {
+    await execute("UPDATE changes SET proposed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'confirmed'", changeId);
   },
 
   async revertFactChange(sourcePageId, c, copyIds, changeId) {

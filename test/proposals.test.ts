@@ -328,11 +328,17 @@ describe('runProposeJob', () => {
 
   it('M5: a full run creates the change issues afterwards; a re-propose of one page does not', async () => {
     const issued: string[] = [];
-    const d = { ...proposeDeps(), createIssues: async (id: string) => void issued.push(id) };
+    const base = proposeDeps();
+    const d = {
+      ...base,
+      changes: { ...base.changes, markProposed: async (id: string) => void issued.push(`marked ${id}`) },
+      createIssues: async (id: string) => void issued.push(id),
+    };
     await runProposeJob(CHANGE_ID, undefined, 0, d);
     await runProposeJob(CHANGE_ID, { copyPageId: PAGE_A }, 0, d);
     await runProposeJob(CHANGE_ID, cid(1), 0, d);
-    expect(issued).toEqual([CHANGE_ID]);
+    // The run is marked finished before the issues are created (the heal waits for the mark); scoped runs do neither.
+    expect(issued).toEqual([`marked ${CHANGE_ID}`, CHANGE_ID]);
   });
 
   it('needs a manual edit when the sentence is gone, split by markup or the change is not confirmed', async () => {

@@ -38,7 +38,7 @@ import type {
 import { isLlmRateLimited, LlmOutputError } from '../llm';
 import { runFactExtraction, type ChatToolFn } from '../llm/extract';
 import { pageJobKey } from '../adapters/jobKeys';
-import { issuesNeeded, jiraConfigured, syncIssuesOf, syncOtherChanges } from './changeIssues';
+import { issuesNeeded, jiraConfigured, jiraProjectKey, syncIssuesOf, syncOtherChanges } from './changeIssues';
 import { enqueuePropose } from './proposals';
 import { EXTRACT_QUEUE, type SourceContext } from './sources';
 
@@ -339,6 +339,8 @@ export interface ChangeDeps {
   syncOtherIssues?: (sourcePageId: string, changeId: string) => Promise<void>;
   /** M5: a Jira project is configured (false on failure). Absent = false. */
   jiraConfigured?: () => Promise<boolean>;
+  /** M5: the configured Jira project, recorded on the change at confirm (null on failure). Absent = none. */
+  jiraProjectKey?: () => Promise<string | null>;
 }
 
 const defaultDeps: ChangeDeps = {
@@ -356,6 +358,7 @@ const defaultDeps: ChangeDeps = {
   supersedeProposals: (sourcePageId, changeId, factIds) => sqlProposalRepo.supersedeOlder(sourcePageId, changeId, factIds),
   syncOtherIssues: (sourcePageId, changeId) => syncOtherChanges(sourcePageId, changeId),
   jiraConfigured: () => jiraConfigured(),
+  jiraProjectKey: () => jiraProjectKey(),
 };
 
 export type ChangeContext = SourceContext & { cloudId?: string; installContext?: string };
@@ -638,7 +641,9 @@ export async function confirmChange(ctx: ChangeContext, payload: Partial<Confirm
     let routing: ChangeRouting | null = change.routing;
     if (change.status === 'pending' && change.pageVersion === version) {
       const { routing: base } = await summarise(ctx, pageId, change, true, deps, true);
-      routing = { ...base, deadline: addWorkingDays(deps.now(), days) };
+      // M5: Jira issues only for changes confirmed while a project is set (never retroactively).
+      const projectKey = deps.jiraProjectKey ? await deps.jiraProjectKey() : null;
+      routing = { ...base, deadline: addWorkingDays(deps.now(), days), ...(projectKey ? { jiraProjectKey: projectKey } : {}) };
       transitioned = await deps.changes.decide(change.id, version, 'confirmed', actor, days, routing);
       if (!transitioned) {
         const now = await deps.changes.getChange(change.id);

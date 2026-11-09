@@ -90,7 +90,7 @@ export async function enqueuePropose(sourcePageId: string, changeId: string, tar
 // ---------------------------------------------------------------------------------------------------------------
 
 export interface ProposeDeps {
-  changes: Pick<ChangeRepo, 'getChange'>;
+  changes: Pick<ChangeRepo, 'getChange'> & Partial<Pick<ChangeRepo, 'markProposed'>>;
   proposals: ProposalRepo;
   facts: Pick<FactRepo, 'audit'>;
   /** Copy page with its storage body, as the app. */
@@ -237,8 +237,12 @@ export async function runProposeJob(
       await deps.facts.audit(action, null, 'proposal', saved.id, { changeId: change.id, pageId: copy.pageId, method: draft.method, errorCode: draft.errorCode, repeat: !saved.created });
     }
     console.info('ripple propose done', { changeId, copies: targets.length, ...out });
-    // M5: one Jira issue per owner, once the proposals exist (a re-propose of one page creates none).
-    if (scope === undefined && deps.createIssues) await deps.createIssues(change.id);
+    // M5: one Jira issue per owner, once the proposals exist (a re-propose of one page creates none). The mark comes
+    // first: issues (also those the heal asks for) are only created after a full run.
+    if (scope === undefined) {
+      if (deps.changes.markProposed) await deps.changes.markProposed(change.id);
+      if (deps.createIssues) await deps.createIssues(change.id);
+    }
     return { status: 'done', ...out };
   } catch (err) {
     if (err instanceof RetryLater) return { status: 'retry', seconds: backoff(retryCount), reason: err.reason };

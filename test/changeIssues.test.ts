@@ -37,6 +37,7 @@ vi.mock('@forge/api', () => {
 });
 vi.mock('@forge/sql', () => ({ sql: {}, migrationRunner: {} }));
 vi.mock('@forge/events', () => ({ Queue: class {} }));
+vi.mock('@forge/llm', () => ({ chat: vi.fn(), ForgeLlmError: class extends Error {} }));
 
 import type { ChangeIssueRepo, ChangeIssueRow, JiraSettings } from '../src/adapters/changeIssueRepo';
 import { parseJiraSettings } from '../src/adapters/changeIssueRepo';
@@ -60,6 +61,7 @@ import {
   type IssueStatus,
 } from '../src/core/changeIssues';
 import { httpsUrl } from '../ui/src/links';
+import { HEAL_EVERY_MS, healSource } from '../src/surfaces/changes';
 import { createIssuesForChange, getApproval, getSettings, issuesNeeded, saveSettings, syncIssues, syncOtherChanges, type IssueDeps } from '../src/surfaces/changeIssues';
 
 const SOURCE = '9600001';
@@ -108,9 +110,11 @@ class Store {
         { spaceId: 'S1', teamIds: ['t1'], teamSource: 'teamwork_graph', teams: [{ id: 't1', name: 'People Ops' }] },
         { spaceId: 'S2', teamIds: [], teamSource: 'none' },
       ],
+      jiraProjectKey: 'OPS',
     },
     deadlineDays: 5,
     createdAt: '2026-11-09T09:00:00Z',
+    proposedAt: '2026-11-09T09:01:00Z',
   } as unknown as ChangeRow;
   open = new Set([SOURCE, 'A']);
   created: CreateIssueInput[] = [];
@@ -539,6 +543,105 @@ describe('closing issues', () => {
     expect(await syncIssues(CHANGE, store.deps())).toBe(1);
     expect(store.comments).toHaveLength(1);
     expect(store.transitions).toEqual(['OPS-2']);
+  });
+});
+
+describe('which changes get issues (live regression, dev 8.29.0)', () => {
+  const NOW = Date.parse('2026-11-09T11:00:00Z');
+  const routing = (jiraProjectKey?: string) => ({
+    deadline: '2026-11-16',
+    pages: [
+      { pageId: 'A', spaceId: 'S1', ownerAccountId: 'owner-1', ownerRole: 'owner', copies: 1 },
+      { pageId: 'B', spaceId: 'S1', ownerAccountId: 'owner-1', ownerRole: 'owner', copies: 1 },
+      { pageId: 'E', spaceId: 'S2', ownerAccountId: 'owner-3', ownerRole: 'owner', copies: 1 },
+    ],
+    spaces: [],
+    ...(jiraProjectKey ? { jiraProjectKey } : {}),
+  });
+
+  it('old change without project → project set → heal → confirm → heal 2x: exactly one issue, for the newest change', async () => {
+    // A change confirmed (and proposed) before any Jira project was set; page E still has an open (failed) proposal.
+    const old = { ...store.change, id: OLDER, routing: routing(), createdAt: '2026-11-09T10:00:00Z', proposedAt: '2026-11-09T10:01:00Z', impact: { copies: [{ copyId: 'c1' }] } } as unknown as ChangeRow;
+    store.settings = undefined;
+    store.proposals = [
+      { id: 'o1', changeId: OLDER, pageId: 'A', factId: 'f1', status: 'proposed', errorCode: null },
+      { id: 'o2', changeId: OLDER, pageId: 'E', factId: 'f1', status: 'failed', errorCode: 'quote_not_found' },
+    ];
+    const all = new Map<string, ChangeRow>([[OLDER, old]]);
+    const order: string[] = [OLDER]; // newest decision first
+    const base = store.deps();
+    const deps: IssueDeps = {
+      ...base,
+      changes: {
+        getChange: async (id) => all.get(id),
+        confirmedChanges: async () => order.map((id) => all.get(id)).filter((c): c is ChangeRow => c?.status === 'confirmed'),
+      },
+    };
+    const jobs: string[] = [];
+    let now = NOW;
+    const heal = () => {
+      now += HEAL_EVERY_MS + 1;
+      return healSource(SOURCE, null, {
+        facts: { getSource: async () => ({ pageId: SOURCE, title: 'Travel Policy', state: 'ready', pageVersion: 13, markedAt: '', extractedAt: null, error: null }) },
+        changes: deps.changes,
+        proposalCount: async (id) => store.proposals.filter((p) => p.changeId === id).length,
+        enqueueDiff: async () => 'diff',
+        // The propose job: proposals exist already here; it marks the run done, then creates the issues.
+        enqueuePropose: async (_page, id) => {
+          jobs.push(id);
+          const c = all.get(id);
+          if (c) c.proposedAt = new Date(now).toISOString();
+          await createIssuesForChange(id, deps);
+          return 'job';
+        },
+        issuesNeeded: (c) => issuesNeeded(c, deps),
+        now: () => now,
+      });
+    };
+
+    await heal();
+    store.settings = { projectKey: 'OPS' };
+    await heal();
+    // Even a propose job of the old change (e.g. queued by the old heal) creates no issue: not wanted.
+    expect(await createIssuesForChange(OLDER, deps)).toEqual({ status: 'skipped', reason: 'issues_not_wanted' });
+    expect(store.created).toHaveLength(0);
+
+    // Confirm v13 with the project set: the routing records it; the older proposals are superseded.
+    const fresh = { ...store.change, routing: routing('OPS'), createdAt: new Date(now).toISOString(), proposedAt: null, impact: { copies: [{ copyId: 'c2' }] } } as unknown as ChangeRow;
+    all.set(CHANGE, fresh);
+    order.unshift(CHANGE);
+    Object.assign(store.proposals[0] ?? {}, { status: 'rejected', errorCode: 'superseded' });
+    store.proposals.push(
+      { id: 'n1', changeId: CHANGE, pageId: 'A', factId: 'f1', status: 'proposed', errorCode: null },
+      { id: 'n2', changeId: CHANGE, pageId: 'B', factId: 'f1', status: 'proposed', errorCode: null },
+      { id: 'n3', changeId: CHANGE, pageId: 'E', factId: 'f1', status: 'applied', errorCode: null },
+    );
+    // The propose job is still running (proposals saved, run not finished): the heal creates nothing.
+    expect(await heal()).toEqual({ diffJob: null, proposeJobs: 0 });
+    expect(await createIssuesForChange(CHANGE, deps)).toEqual({ status: 'skipped', reason: 'proposals_pending' });
+    // The job finishes.
+    fresh.proposedAt = new Date(now).toISOString();
+    expect(await createIssuesForChange(CHANGE, deps)).toMatchObject({ status: 'done', created: 1 });
+    expect(await heal()).toEqual({ diffJob: null, proposeJobs: 0 });
+    expect(await heal()).toEqual({ diffJob: null, proposeJobs: 0 });
+
+    expect(jobs).toEqual([]);
+    expect(store.created).toHaveLength(1);
+    expect(store.created[0]?.assigneeAccountId).toBe('owner-1');
+    expect([...store.rows.values()].map((r) => [r.changeId, r.ownerAccountId, r.pageCount])).toEqual([[CHANGE, 'owner-1', 2]]);
+    // The older change's open page E never gets an issue: not the newest change.
+    old.routing = routing('OPS') as unknown as ChangeRow['routing'];
+    expect(await createIssuesForChange(OLDER, deps)).toEqual({ status: 'skipped', reason: 'not_latest_change' });
+    expect(await issuesNeeded(old, deps)).toBe(false);
+  });
+
+  it('a change confirmed with the project gets its issues from the first full propose job (heal queues it when lost)', async () => {
+    store.change = { ...store.change, proposedAt: null } as ChangeRow;
+    expect(await issuesNeeded(store.change, store.deps())).toBe(false);
+    expect(await createIssuesForChange(CHANGE, store.deps())).toEqual({ status: 'skipped', reason: 'proposals_pending' });
+    store.change.proposedAt = '2026-11-09T09:05:00Z';
+    expect(await issuesNeeded(store.change, store.deps())).toBe(true);
+    expect(await createIssuesForChange(CHANGE, store.deps())).toMatchObject({ status: 'done', created: 2 });
   });
 });
 
