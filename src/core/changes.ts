@@ -68,46 +68,77 @@ export function sameValue(a: Valued, b: Valued): boolean {
   return x.numbers.length > 0 && x.numbers.length === y.numbers.length && sortedKey(x.numbers) === sortedKey(y.numbers) && unitOk && words(x.words) === words(y.words);
 }
 
-/** The same numbers (as a multiset, at least one): "over $2,000" / "2000"; a range or an extra number differs. */
+/**
+ * The same numbers in the same order (at least one): "over $2,000" / "2000". A range, an extra number or swapped
+ * numbers ("$60 … 30 days" → "$30 … 60 days") differ.
+ */
 export function sameNumbers(a: readonly number[], b: readonly number[]): boolean {
-  if (a.length === 0 || a.length !== b.length) return false;
-  const x = [...a].sort((p, q) => p - q);
-  const y = [...b].sort((p, q) => p - q);
-  return x.every((n, i) => n === y[i]);
+  return a.length > 0 && a.length === b.length && a.every((n, i) => n === b[i]);
 }
+
+/** Negation words; a sentence that gains or loses one ("required" → "not required") changed its meaning. */
+const NEGATIONS = new Set(['not', 'no', 'never', 'none', 'nor', 'without', 'tidak', 'bukan', 'tanpa', 'jangan', 'belum']);
+
+const negations = (text: string): number => normaliseKeyPart(text.replace(/n't\b/gi, ' not')).split(' ').filter((w) => NEGATIONS.has(w)).length;
+
+/** Both sentences carry the same number of negation words. */
+export const sameNegation = (a: string, b: string): boolean => negations(a) === negations(b);
+
+const allIn = (need: Iterable<string>, have: ReadonlySet<string>): boolean => [...need].every((w) => have.has(w));
 
 /** Every word of a value without digits ("economy class") still in the sentence; false when the value has no words. */
 export function valueWordsIn(value: string, quote: string): boolean {
   const need = words(value);
-  if (need.size === 0) return false;
-  const have = words(quote);
-  return [...need].every((w) => have.has(w));
+  return need.size > 0 && allIn(need, words(quote));
 }
+
+/** Words of a value besides numbers and units ("Trips over $2,000" → trips). */
+const valueWords = (value: string, unit: string | null): string[] => normaliseValue(value, unit).words.filter((w) => !/\d/.test(w));
+
+/** Same unit on both sides; a unit written on one side only is a change ("60" → "60 days"). */
+const sameUnit = (a: string | null, b: string | null): boolean => a === b;
 
 type Quoted = Valued & { quote?: string | null };
 
 /**
  * Whether a matched confirmed fact really changed. The model's free-text value is not trusted on its own: a wording
- * change without another number or unit ("2000" USD → "over $2,000", "economy class" → "economy class for flights
- * under 6 hours") is no change. No change when the value is the same (`sameValue`), the sentence is the same
- * (whitespace/punctuation ignored), the sentence states the same numbers and unit, a value without digits still
- * appears word for word in the new sentence, or the value states the same numbers (unit not written is tolerated).
+ * change without another number or unit ("2000" USD → "Trips over $2,000", "economy class" → "economy class for
+ * flights under 6 hours") is no change. No change when:
+ * - the sentence is the same (whitespace/punctuation ignored);
+ * - the value is the same (`sameValue`, a unit on one side only counts as a change);
+ * - the sentence has the same words, negations, numbers in the same order and unit (only formatting changed);
+ * - a value without digits: its words are still in the new sentence and no negation was added or removed;
+ * - a value with digits: the same numbers in order, the same unit, no negation added or removed, and the words
+ *   around the numbers are in the other version's sentence (so "15 January" → "15 February" is a change).
  * Dates and facts without a stored sentence keep the strict `sameValue`.
  */
 export function factChanged(old: Quoted, now: Valued & { quote: string }): boolean {
-  if (sameValue(old, now)) return false;
   const oldQuote = old.quote ?? '';
-  if (oldQuote.trim() === '') return true;
+  if (oldQuote.trim() === '') return !sameValue(old, now);
   if (sameText(oldQuote, now.quote)) return false;
-  if (parseDate(old.value) !== undefined || parseDate(now.value) !== undefined) return true;
-  if (!/\d/.test(old.value)) return !valueWordsIn(old.value, now.quote);
-  const q0 = normaliseValue(oldQuote);
-  const q1 = normaliseValue(now.quote);
-  if (sameNumbers(q0.numbers, q1.numbers) && q0.unit === q1.unit) return false;
+  const negationOk = sameNegation(oldQuote, now.quote);
   const x = normaliseValue(old.value, old.unit);
   const y = normaliseValue(now.value, now.unit);
-  const unitOk = x.unit === y.unit || x.unit === null || y.unit === null;
-  return !(sameNumbers(x.numbers, y.numbers) && unitOk);
+  // A unit the model left out of the value is taken from its sentence ("60" in "… $60 per day" is USD).
+  const unitOld = x.unit ?? normaliseValue(oldQuote).unit;
+  const unitNow = y.unit ?? normaliseValue(now.quote).unit;
+  const q0 = normaliseValue(oldQuote);
+  const q1 = normaliseValue(now.quote);
+  // The value's number sits at the same place in both sentences ("$60 … 30 days" → "$30 … 60 days" moved it, even
+  // when the model repeats "60").
+  const p0 = x.numbers[0] === undefined ? -1 : q0.numbers.indexOf(x.numbers[0]);
+  const p1 = y.numbers[0] === undefined ? -1 : q1.numbers.indexOf(y.numbers[0]);
+  const placeOk = p0 === p1;
+  // Same value: only a number found in both sentences at another place blocks it (not found = no evidence).
+  if (negationOk && (placeOk || p0 < 0 || p1 < 0) && sameValue(old, now) && sameUnit(unitOld, unitNow)) return false;
+  if (parseDate(old.value) !== undefined || parseDate(now.value) !== undefined) return !sameValue(old, now);
+  if (!negationOk) return true;
+  if (!/\d/.test(old.value)) return !valueWordsIn(old.value, now.quote);
+  const w0 = words(oldQuote);
+  const w1 = words(now.quote);
+  if (sameNumbers(q0.numbers, q1.numbers) && sameUnit(q0.unit, q1.unit) && w0.size === w1.size && allIn(w0, w1)) return false;
+  const wordsOk = allIn(valueWords(old.value, old.unit), w1) && allIn(valueWords(now.value, now.unit), w0);
+  return !(sameNumbers(x.numbers, y.numbers) && sameUnit(unitOld, unitNow) && wordsOk && placeOk && p0 >= 0);
 }
 
 /**
@@ -149,16 +180,24 @@ export function planDiff(
 }
 
 /**
- * A confirmed change that only reworded the value (the rule `factChanged` now applies; the old sentence is not
- * stored with the change, so the new sentence and both values decide): a value without digits still in the new
- * sentence, or the same numbers with a compatible unit. Dates never count as wording only.
+ * A confirmed change that only reworded the value, judged conservatively because the old sentence is not stored with
+ * the change (undoing a real confirmation is worse than keeping a wording-only one). All of:
+ * - no date on either side, and no negation word in the new value or sentence;
+ * - every word of the old value is in the new value and in the new sentence ("economy class" → "economy class for
+ *   flights under 6 hours");
+ * - values with digits: the same numbers in the same order and the same unit, also when only one side writes one
+ *   ("60" → "60 days" is a real change).
  */
 export function wordingOnlyChange(c: Pick<FactChange, 'oldValue' | 'oldUnit' | 'newValue' | 'newUnit' | 'newQuote'>): boolean {
   if (parseDate(c.oldValue) !== undefined || parseDate(c.newValue) !== undefined) return false;
-  if (!/\d/.test(c.oldValue)) return valueWordsIn(c.oldValue, c.newQuote);
+  if (negations(c.newValue) > 0 || negations(c.newQuote) > 0 || negations(c.oldValue) > 0) return false;
+  const oldWords = /\d/.test(c.oldValue) ? valueWords(c.oldValue, c.oldUnit) : [...words(c.oldValue)];
+  const newValueWords = new Set([...words(c.newValue), ...valueWords(c.newValue, c.newUnit)]);
+  if (!allIn(oldWords, newValueWords) || !allIn(oldWords, words(c.newQuote))) return false;
+  if (!/\d/.test(c.oldValue)) return oldWords.length > 0;
   const x = normaliseValue(c.oldValue, c.oldUnit);
   const y = normaliseValue(c.newValue, c.newUnit);
-  return sameNumbers(x.numbers, y.numbers) && (x.unit === y.unit || x.unit === null || y.unit === null);
+  return sameNumbers(x.numbers, y.numbers) && sameUnit(x.unit, y.unit);
 }
 
 export interface WordingRevert {
@@ -201,6 +240,8 @@ export interface KnownFact extends StoredFact {
 
 /** Quotes this similar (word Jaccard, numbers ignored) are the same sentence with another value. */
 export const QUOTE_MATCH = 0.75;
+/** Subject/attribute/condition word similarity above which a proposed fact of the same sentence is the same fact. */
+const DUPLICATE_KEY_MATCH = 0.5;
 
 const words = (text: string): Set<string> =>
   new Set(
@@ -298,10 +339,20 @@ export function matchFacts(known: readonly KnownFact[], extracted: readonly Extr
     if (k) return [{ ...fact, subject: k.subject, attribute: k.attribute, condition: k.condition, identityKey: k.originKey ?? k.identityKey }];
     return takenKeys.has(e.identityKey) ? [] : [fact];
   });
-  // Sentences of confirmed facts read in this version (stored and current wording).
-  const confirmedQuotes = [...assigned].filter(([, k]) => k.status === 'confirmed').flatMap(([i, k]) => [k.quote, extracted[i]?.quote ?? '']);
+  // Confirmed facts read in this version (stored and current wording). A proposed fact duplicates one only when it
+  // has its sentence AND is the same fact: the same value (stored or read now), or the same condition with similar
+  // subject/attribute words. Sibling facts of one sentence (domestic $60 / international $90) stay.
+  const confirmedRead = [...assigned].filter(([, k]) => k.status === 'confirmed').map(([i, k]) => ({ k, e: extracted[i] }));
+  const sameFact = (p: KnownFact, k: KnownFact, e: ExtractedFact | undefined): boolean =>
+    sameValue(p, k) || (e !== undefined && sameValue(p, e)) || (sameText(p.condition, k.condition) && jaccard(keyWords(p), keyWords(k)) >= DUPLICATE_KEY_MATCH);
   const duplicates = known
-    .filter((k) => k.status === 'proposed' && !k.edited && !taken.has(k.id) && confirmedQuotes.some((q) => quoteSimilarity(q, k.quote) >= QUOTE_MATCH))
+    .filter(
+      (p) =>
+        p.status === 'proposed' &&
+        !p.edited &&
+        !taken.has(p.id) &&
+        confirmedRead.some(({ k, e }) => (quoteSimilarity(k.quote, p.quote) >= QUOTE_MATCH || (e !== undefined && quoteSimilarity(e.quote, p.quote) >= QUOTE_MATCH)) && sameFact(p, k, e)),
+    )
     .map((k) => k.id)
     .sort();
   return { facts, byId, byQuote, byKey, duplicates };

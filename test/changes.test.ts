@@ -17,7 +17,7 @@ import type { Message } from '@forge/llm';
 import { dismissalKey, valueHash, type ChangeRepo, type ChangeRouting, type ChangeRow, type CopyForChange } from '../src/adapters/changeRepo';
 import type { SourcePage } from '../src/adapters/confluence';
 import type { FactRepo, PageVersionInfo } from '../src/adapters/repo';
-import { addWorkingDays, computeImpact, factChanged, matchFacts, planDiff, type ChangeImpact, type FactChange, type KnownFact } from '../src/core/changes';
+import { addWorkingDays, computeImpact, factChanged, matchFacts, planDiff, wordingOnlyChange, type ChangeImpact, type FactChange, type KnownFact } from '../src/core/changes';
 import { identityKey, type ExtractedFact, type MergePlan, type StoredFact } from '../src/core/facts';
 import type { ChangeDecision, CopyStatus, ErrorReply, FactView, PendingChangeReply, SourceView } from '../src/core/views';
 import type { ChatToolFn } from '../src/llm/extract';
@@ -503,11 +503,11 @@ describe('diff matching does not depend on the model wording (live bug on 950272
 
   it('undoes a confirmed wording-only change (old value back, its drifted copies in sync), keeps the real one and the audit', async () => {
     // Live state after confirming v4: approval and flight class hold the reworded values, domestic $75.
-    const set = (id: string, value: string, unit: string | null, previousValue: string) => {
+    const set = (id: string, value: string, unit: string | null, previousValue: string, quote?: string) => {
       const f = store.facts.find((x) => x.id === id);
-      if (f) Object.assign(f, { value, unit, previousValue, pageVersion: 4 });
+      if (f) Object.assign(f, { value, unit, previousValue, pageVersion: 4, ...(quote ? { quote } : {}) });
     };
-    set('tp-1', '75', 'USD', '60');
+    set('tp-1', '75', 'USD', '60', TRAVEL_POLICY_FACTS[0]?.quote.replace('$60', '$75'));
     set('tp-3', 'Trips over $2,000', null, '2000');
     set('tp-5', 'economy class for flights under 6 hours', null, 'economy class');
     const fc = (factId: string, oldValue: string, oldUnit: string | null, newValue: string, newUnit: string | null, newQuote: string): FactChange => ({ factId, oldValue, oldUnit, newValue, newUnit, newQuote, version: 4, versionAt: null });
@@ -545,6 +545,40 @@ describe('diff matching does not depend on the model wording (live bug on 950272
     // Guarded: a later version does not undo anything twice.
     await runDiffJob(SOURCE_PAGE_ID, 0, tpDeps(6, '$75', rewordedValues('$75')));
     expect(store.audits.filter((a) => a.action === 'change.fact_reverted')).toHaveLength(2);
+  });
+
+  it('removes a proposed duplicate of a confirmed fact, but never a proposed sibling fact of the same sentence', () => {
+    const quote = 'Domestic travel is $60 per day and international travel is $90 per day.';
+    const k = (id: string, status: 'confirmed' | 'proposed', subject: string, condition: string, value: string): KnownFact => ({
+      id,
+      identityKey: `${subject}|amount|${condition}`.toLowerCase(),
+      originKey: null,
+      status,
+      edited: false,
+      value,
+      unit: null,
+      subject,
+      attribute: 'Amount',
+      condition,
+      quote,
+    });
+    const known = [
+      k('dom', 'confirmed', 'Per diem', 'Domestic', '$60'),
+      // Sibling: other condition and value.
+      k('intl', 'proposed', 'Per diem', 'International', '$90'),
+      // Duplicate reads of the domestic fact: other wording, same condition / same value.
+      k('dup-key', 'proposed', 'Per diem rules', 'Domestic', '$75'),
+      k('dup-value', 'proposed', 'Daily allowance', 'Home trips', '$60'),
+    ];
+    const read: ExtractedFact = { type: 'number', subject: 'Per diem', attribute: 'Amount', value: '$60', unit: null, condition: 'Domestic', quote, identityKey: 'per diem|amount|domestic', existingFactId: 'dom' };
+    expect(matchFacts(known, [read], new Set(['dom'])).duplicates).toEqual(['dup-key', 'dup-value']);
+  });
+
+  it('a failing undo of wording-only confirmations does not block the diff', async () => {
+    const changes = { ...store.changeRepo(), confirmedChanges: async () => Promise.reject(new Error('SQL timeout')) };
+    const r = await runDiffJob(SOURCE_PAGE_ID, 0, { ...tpDeps(2, '$75', rewordedValues('$75')), changes });
+    expect(r).toMatchObject({ status: 'done', changed: 1 });
+    expect(console.warn).toHaveBeenCalledWith('ripple diff: undoing wording-only confirmations failed', { pageId: SOURCE_PAGE_ID, error: 'SQL timeout' });
   });
 
   it('keeps several facts of one sentence apart (same quote): value, then wording decide', () => {
@@ -629,6 +663,41 @@ describe('planDiff / computeImpact / addWorkingDays', () => {
     expect(factChanged({ value: '2000', unit: 'USD' }, { value: '$2,000 per booking', unit: null, quote: approval })).toBe(true);
   });
 
+  it('factChanged after review: number order, other words, negation and a unit on one side are changes', () => {
+    // Swapped numbers, even when the model repeats the old value.
+    const both = { value: '60', unit: 'USD', quote: 'The per diem is $60 and claims are due within 30 days.' };
+    const swapped = 'The per diem is $30 and claims are due within 60 days.';
+    expect(factChanged(both, { value: '60', unit: 'USD', quote: swapped })).toBe(true);
+    expect(factChanged(both, { value: '30', unit: 'USD', quote: swapped })).toBe(true);
+    // Same day number, other month (no year: not a date).
+    expect(factChanged({ value: '15 January', unit: null, quote: 'Claims close on 15 January.' }, { value: '15 February', unit: null, quote: 'Claims close on 15 February.' })).toBe(true);
+    // Negation added to a sentence of a value without digits.
+    const approval = { value: 'required', unit: null, quote: 'Manager approval is required for trips abroad.' };
+    expect(factChanged(approval, { value: 'not required', unit: null, quote: 'Manager approval is not required for trips abroad.' })).toBe(true);
+    expect(factChanged(approval, { value: 'required', unit: null, quote: "Manager approval isn't required for trips abroad." })).toBe(true);
+    expect(factChanged(approval, { value: 'approval required', unit: null, quote: 'For trips abroad, manager approval is required.' })).toBe(false);
+    // A unit on one side only.
+    expect(factChanged({ value: '60', unit: null, quote: 'Claims close 60 after the trip.' }, { value: '60 days', unit: null, quote: 'Claims close 60 days after the trip.' })).toBe(true);
+    // Formatting and reordered context stay no change.
+    const perDiem = { value: '60', unit: 'USD', quote: 'The per diem for domestic travel is $60 per day.' };
+    expect(factChanged(perDiem, { value: '$60', unit: null, quote: 'For domestic travel, the per diem is $60 per day.' })).toBe(false);
+    expect(factChanged(perDiem, { value: '60', unit: null, quote: 'For domestic travel the per diem is $60 per day.' })).toBe(false);
+  });
+
+  it('wordingOnlyChange (undo) is conservative: a unit on one side, a negation or other words keep the confirmation', () => {
+    const c = (oldValue: string, oldUnit: string | null, newValue: string, newUnit: string | null, newQuote: string) => wordingOnlyChange({ oldValue, oldUnit, newValue, newUnit, newQuote });
+    // Live cases: undone.
+    expect(c('2000', 'USD', 'Trips over $2,000', null, 'Trips over $2,000 require manager approval before booking.')).toBe(true);
+    expect(c('economy class', null, 'economy class for flights under 6 hours', null, 'Book economy class for flights under 6 hours.')).toBe(true);
+    // Real changes: kept.
+    expect(c('60', null, '60 days', null, 'Claims close 60 days after the trip.')).toBe(false);
+    expect(c('60', 'USD', '60', null, 'The per diem is 60 per day.')).toBe(false);
+    expect(c('required', null, 'not required', null, 'Manager approval is not required.')).toBe(false);
+    expect(c('15 January', null, '15 February', null, 'Claims close on 15 February.')).toBe(false);
+    expect(c('60', 'USD', '75', 'USD', 'The per diem is $75 per day.')).toBe(false);
+    expect(c('economy class', null, 'business class', null, 'Book business class.')).toBe(false);
+  });
+
   it('counts working days (Mon–Fri)', () => {
     expect(addWorkingDays(new Date('2026-11-06T15:00:00Z'), 5)).toBe('2026-11-13'); // Friday → next Friday
     expect(addWorkingDays(new Date('2026-11-09T09:00:00Z'), 5)).toBe('2026-11-16'); // Monday → next Monday
@@ -689,6 +758,29 @@ describe('change resolvers', () => {
     expect(r.change?.pages.map((p) => p.spaceId)).toEqual(['6979587']);
     expect(r.change?.spaces).toEqual([{ spaceId: '6979587', teams: [{ id: 'Accord Team', name: 'Accord Team' }], teamSource: 'teamwork_graph' }]);
     expect(asked).toEqual(['ari:cloud:confluence:cloud-1:space/6979587']);
+  });
+
+  it('a failed team read is "unknown", not "no team"; confirm reads it again and records unknown without team ids', async () => {
+    const failed = { body: { errors: [{ message: 'User is not permitted to query this organization' }], data: null } };
+    const id = await pendingId();
+    const r = (await getPendingChange(ctx, changeDeps({ graph: () => async () => failed }))) as PendingChangeReply;
+    expect(r.change?.spaces).toEqual([{ spaceId: 'S-9600001', teams: [], teamSource: 'unknown' }]);
+    const thrown = (await getPendingChange(ctx, changeDeps({ graph: () => async () => Promise.reject(new Error('HTTP 503')) }))) as PendingChangeReply;
+    expect(thrown.change?.spaces[0]?.teamSource).toBe('unknown');
+    // Confirm: the first read fails, the second one finds the team.
+    let calls = 0;
+    const flaky = () => async () => (++calls === 1 ? failed : { body: teams });
+    await confirmChange(ctx, { changeId: id, version: 4 }, changeDeps({ graph: flaky }));
+    expect(calls).toBe(2);
+    expect(store.changes.get(id)?.routing?.spaces).toEqual([{ spaceId: 'S-9600001', teamIds: ['team-1'], teamSource: 'teamwork_graph' }]);
+  });
+
+  it('confirm with teams still unreadable records them as unknown', async () => {
+    const id = await pendingId();
+    const failed = { body: { errors: [{ message: 'denied' }], data: null } };
+    await confirmChange(ctx, { changeId: id, version: 4 }, changeDeps({ graph: () => async () => failed }));
+    expect(store.changes.get(id)?.routing?.spaces).toEqual([{ spaceId: 'S-9600001', teamIds: [], teamSource: 'unknown' }]);
+    expect(store.audits.find((a) => a.action === 'change.confirmed')?.detail).toMatchObject({ teamSource: { unknown: 1 } });
   });
 
   it('getPendingChange hides pages the viewer cannot open (count only) and reports no teams as "none"', async () => {

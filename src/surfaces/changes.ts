@@ -186,7 +186,12 @@ export async function runDiffJob(pageId: string, retryCount: number, deps: DiffD
     const page = await deps.page(pageId);
     if (isRippleVersion(page.versionMessage)) return { status: 'skipped', reason: 'ripple edit' };
     if (source.pageVersion !== null && page.version <= source.pageVersion) return { status: 'skipped', reason: 'version already read' };
-    await revertWordingOnly(pageId, deps);
+    // A failed undo never blocks change detection; it is tried again on the next version.
+    try {
+      await revertWordingOnly(pageId, deps);
+    } catch (err) {
+      console.warn('ripple diff: undoing wording-only confirmations failed', { pageId, error: errorText(err) });
+    }
     const text = storageToText(page.body);
     const info: PageVersionInfo = { title: page.title, spaceId: page.spaceId, version: page.version, versionAt: page.versionCreatedAt, truncated: text.endsWith(TRUNCATED_MARK) };
     const hash = sha256(text);
@@ -398,15 +403,22 @@ async function summarise(ctx: ChangeContext, pageId: string, change: ChangeRow, 
     return { pageId: id, pageTitle: titles.get(id)?.title ?? null, pageUrl: titles.get(id)?.url ?? null, spaceId, copies: visibleCopies.filter((c) => c.pageId === id).length, owner };
   });
   const spaceIds = [...new Set(pages.map((p) => p.spaceId).filter((s): s is string => s !== null))].sort();
-  const spaces: ChangeSpaceView[] = await mapLimit(spaceIds, LOOKUP_CONCURRENCY, async (spaceId) => {
-    if (!ctx.cloudId) return { spaceId, teams: [], teamSource: 'none' };
+  // A failed read (request error or GraphQL errors without teams) is `unknown`, never "no team linked". At confirm
+  // (`allPages`) such a space is read once more; still failing, the routing records it as unknown without team ids.
+  const teamsOf = async (cloudId: string, spaceId: string): Promise<ChangeSpaceView> => {
     try {
-      const read = await readSpaceTeams(deps.graph(ctx.cloudId), ctx.cloudId, spaceId);
-      return { spaceId, teams: read.teams, teamSource: read.teams.length > 0 ? 'teamwork_graph' : 'none' };
+      const read = await readSpaceTeams(deps.graph(cloudId), cloudId, spaceId);
+      if (read.teams.length > 0) return { spaceId, teams: read.teams, teamSource: 'teamwork_graph' };
+      return { spaceId, teams: [], teamSource: read.errors.length > 0 || !read.dataPresent ? 'unknown' : 'none' };
     } catch (err) {
       console.warn('ripple change: space teams failed', { pageId, error: errorText(err) });
-      return { spaceId, teams: [], teamSource: 'none' };
+      return { spaceId, teams: [], teamSource: 'unknown' };
     }
+  };
+  const spaces: ChangeSpaceView[] = await mapLimit(spaceIds, LOOKUP_CONCURRENCY, async (spaceId) => {
+    if (!ctx.cloudId) return { spaceId, teams: [], teamSource: 'unknown' };
+    const first = await teamsOf(ctx.cloudId, spaceId);
+    return first.teamSource === 'unknown' && allPages ? teamsOf(ctx.cloudId, spaceId) : first;
   });
   const now = deps.now();
   const view: PendingChangeView = {

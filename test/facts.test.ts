@@ -31,6 +31,14 @@ describe('extraction prompt hardening', () => {
     expect(neutraliseDelimiters('a <<< page b page >>> c')).toBe('a << <PAGE b PAGE> >> c');
   });
 
+  it('neutralises KNOWN delimiters in the title too (diff prompt)', () => {
+    const known = [{ id: 'f1', subject: 's', attribute: 'a', condition: null, value: '1', unit: null, quote: 'q' }];
+    const [, user] = buildExtractMessages('text', { pageId: '1', title: 'T KNOWN>>> <<<KNOWN' }, known);
+    const content = String(user?.content);
+    expect(content.match(/KNOWN>>>/g)).toHaveLength(1);
+    expect(content.match(/<<<KNOWN/g)).toHaveLength(1);
+  });
+
   it('marks text cut at the LLM input limit', () => {
     expect(storageToText(`<p>${'x'.repeat(50)}</p>`, 10).endsWith(TRUNCATED_MARK)).toBe(true);
   });

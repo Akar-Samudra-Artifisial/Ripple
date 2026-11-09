@@ -5,7 +5,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { dismissedValueText, type ChangeImpact, type CopyForImpact, type FactChange } from '../core/changes';
-import type { CopyStatus } from '../core/views';
+import type { CopyStatus, TeamSource } from '../core/views';
 import { execute, query } from './sql';
 
 export type ChangeState = 'pending' | 'confirmed' | 'dismissed' | 'superseded';
@@ -14,7 +14,8 @@ export type ChangeState = 'pending' | 'confirmed' | 'dismissed' | 'superseded';
 export interface ChangeRouting {
   deadline: string;
   pages: { pageId: string; spaceId: string | null; ownerAccountId: string | null; ownerRole: 'owner' | 'author' | null; copies: number }[];
-  spaces: { spaceId: string; teamIds: string[]; teamSource: 'teamwork_graph' | 'none' }[];
+  /** `unknown`: the teams could not be read at confirm time (no team ids recorded; resolve again before routing). */
+  spaces: { spaceId: string; teamIds: string[]; teamSource: TeamSource }[];
 }
 
 export interface ChangeRow {

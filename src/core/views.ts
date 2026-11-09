@@ -253,11 +253,16 @@ export interface ChangePageView {
   owner: OwnerView;
 }
 
+export type TeamSource = 'teamwork_graph' | 'none' | 'unknown';
+
 export interface ChangeSpaceView {
   spaceId: string;
   teams: TeamView[];
-  /** Where the teams came from; `none` = Teamwork Graph had no team for the space (or could not be read). */
-  teamSource: 'teamwork_graph' | 'none';
+  /**
+   * Where the teams came from; `none` = Teamwork Graph answered that no team is linked; `unknown` = the read failed
+   * (an error such as a missing permission), so whether a team is linked is not known.
+   */
+  teamSource: TeamSource;
 }
 
 export interface PendingChangeView {

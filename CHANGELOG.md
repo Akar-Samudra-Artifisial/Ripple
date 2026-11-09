@@ -44,6 +44,15 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Halaman arsip/draft tidak lagi menjadi kandidat salinan. Pengecualian space lewat pengaturan belum ada.
 
 ### Fixed
+- Aturan perubahan M3 diperketat setelah review:
+  - Angka dibandingkan sesuai urutan dan posisinya di kalimat.
+  - Kata lain di sekitar angka ("15 January" → "15 February"), negasi yang ditambah atau dihapus ("required" → "not required"), dan satuan yang hanya ada di satu sisi ("60" → "60 days") dihitung sebagai perubahan.
+  - Pemulihan otomatis hanya membatalkan konfirmasi yang lolos aturan wording-only yang ketat ini. Kegagalannya dicatat sebagai warning dan tidak menghentikan diff.
+- Fakta proposed hanya dihapus sebagai duplikat bila nilainya sama, atau kondisinya sama dengan kata subject/attribute yang mirip. Fakta saudara di kalimat yang sama (domestik/internasional) tidak ikut terhapus.
+- Tim space yang gagal dibaca dari Teamwork Graph sekarang berstatus `unknown`:
+  - modal menampilkan "Team unavailable, try again", bukan "No team linked";
+  - saat confirm, tim dibaca ulang sekali; bila tetap gagal, routing mencatatnya sebagai `unknown` tanpa id tim.
+- Byline menampilkan pesan generik, bukan teks error Teamwork Graph. Judul halaman di prompt diff juga menetralkan penanda `KNOWN`.
 - Diff M3 tidak lagi melaporkan perubahan palsu karena wording nilai dari LLM ("2000" USD → "Trips over $2,000", "economy class" → "economy class for flights under 6 hours"):
   - Fakta confirmed hanya berubah bila token nilai di kalimat kutipan berubah. Tidak dianggap berubah bila kalimatnya sama (whitespace/tanda baca diabaikan), angka dan satuan di kalimat sama, atau angka nilainya sama.
   - Fakta tanpa angka dibandingkan lewat kalimat. Rentang, angka tambahan, satuan lain, dan tanggal tetap dihitung sebagai perubahan.

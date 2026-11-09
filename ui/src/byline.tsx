@@ -79,7 +79,8 @@ function Byline() {
   }
   const { schema, spaceTeams, owner } = data;
   const ownerName = owner.displayName ?? (owner.accountId ? 'Unknown user' : 'none');
-  const teamNames = spaceTeams.teams.length > 0 ? spaceTeams.teams.map((t) => t.name).join(', ') : 'none';
+  const teamsUnknown = spaceTeams.teams.length === 0 && spaceTeams.errors.length > 0;
+  const teamNames = spaceTeams.teams.length > 0 ? spaceTeams.teams.map((t) => t.name).join(', ') : teamsUnknown ? 'unavailable' : 'none';
   return (
     <>
       <h1 className={schema.status === 'error' ? 'shell__title error' : 'shell__title'}>{data.message}</h1>
@@ -117,10 +118,12 @@ function Byline() {
         <strong>Owner: {ownerName}</strong> · Team: {teamNames} <span className="muted">(via Teamwork Graph)</span>
       </p>
       {owner.errors.length > 0 ? <p className="error">{owner.errors.join(' | ')}</p> : null}
-      {spaceTeams.teams.length === 0 ? (
+      {/* Teamwork Graph error texts stay in the logs; the page shows a generic message. */}
+      {teamsUnknown ? (
+        <p className="muted">Team unavailable, try again.</p>
+      ) : spaceTeams.teams.length === 0 ? (
         <p className="muted">{spaceTeams.dataPresent ? 'No team is linked to this space.' : 'Teamwork Graph returned no data.'}</p>
       ) : null}
-      {spaceTeams.errors.length > 0 ? <p className="error">{spaceTeams.errors.join(' | ')}</p> : null}
       {schema.status === 'ready' ? <SourcePanel key={revision} /> : null}
     </>
   );

@@ -256,6 +256,8 @@ function ChangeReview({ mode, onDecided }: ChangeReviewProps) {
                       <span className="change__team">{g.space.teams.map((t) => t.name).join(', ')}</span>
                       <span className="badge badge--twg">via Teamwork Graph</span>
                     </>
+                  ) : g.space?.teamSource === 'unknown' ? (
+                    <span className="muted change__team">Team unavailable, try again</span>
                   ) : (
                     <span className="muted change__team">No team linked</span>
                   )}

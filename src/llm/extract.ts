@@ -115,7 +115,7 @@ export function buildExtractMessages(pageText: string, ctx: ExtractContext, know
     { role: 'system', content: known.length > 0 ? `${EXTRACT_SYSTEM_PROMPT}${EXTRACT_DIFF_RULES}` : EXTRACT_SYSTEM_PROMPT },
     {
       role: 'user',
-      content: `Page title: ${neutraliseDelimiters(sanitiseTitle(ctx.title))}\nPage ID: ${ctx.pageId}${knownBlock}\n<<<PAGE\n${neutraliseKnown(pageText)}\nPAGE>>>`,
+      content: `Page title: ${neutraliseKnown(sanitiseTitle(ctx.title))}\nPage ID: ${ctx.pageId}${knownBlock}\n<<<PAGE\n${neutraliseKnown(pageText)}\nPAGE>>>`,
     },
   ];
 }
