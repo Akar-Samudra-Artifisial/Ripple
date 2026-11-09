@@ -20,17 +20,21 @@ import { pageIsOpen, pageOpenness } from '../src/adapters/confluence';
 
 const PAGE = '9502721';
 const PARENT = '9500001';
+const HOME = '9400001';
 const none = { status: 200, body: { restrictions: { user: { size: 0, results: [] }, group: { size: 0, results: [] } } } };
-const restrict = (path: string) => `/wiki/rest/api/content/${path}/restriction/byOperation/read?expand=restrictions.user,restrictions.group`;
+const restrict = (id: string) => `/wiki/rest/api/content/${id}/restriction/byOperation/read?expand=restrictions.user,restrictions.group`;
+const v2 = (id: string) => `/wiki/api/v2/pages/${id}`;
 
-/** An open page in space 42 under one parent page, as the live site answers. */
+/** An open page in space 42: page → parent → space homepage (no parent), as REST v2 answers. */
 function openSite(): void {
   replies = {
-    [`/wiki/api/v2/pages/${PAGE}`]: { status: 200, body: { id: PAGE, spaceId: '42' } },
+    [v2(PAGE)]: { status: 200, body: { id: PAGE, spaceId: '42', parentId: PARENT, parentType: 'page' } },
+    [v2(PARENT)]: { status: 200, body: { id: PARENT, spaceId: '42', parentId: HOME, parentType: 'page' } },
+    [v2(HOME)]: { status: 200, body: { id: HOME, spaceId: '42', parentId: null, parentType: null } },
     '/wiki/api/v2/spaces/42': { status: 200, body: { id: '42' } },
-    [`/wiki/rest/api/content/${PAGE}?expand=ancestors`]: { status: 200, body: { id: PAGE, ancestors: [{ id: PARENT }] } },
     [restrict(PAGE)]: none,
     [restrict(PARENT)]: none,
+    [restrict(HOME)]: none,
   };
 }
 
@@ -41,11 +45,10 @@ beforeEach(() => {
 });
 
 describe('pageOpenness (Jira issue titles / version messages)', () => {
-  it('an unrestricted page in a readable space is open; ancestors come from REST v1 (no v2 ancestors scope)', async () => {
+  it('walks up through REST v2 parentId and checks every level; no ancestors endpoint (v1 gone, v2 lacks scope)', async () => {
     expect(await pageOpenness(PAGE)).toEqual({ open: true });
-    expect(paths).toContain(`/wiki/rest/api/content/${PAGE}?expand=ancestors`);
-    expect(paths.some((p) => p.includes('/wiki/api/v2/pages/') && p.includes('/ancestors'))).toBe(false);
-    expect(paths).toContain(restrict(PARENT));
+    expect(paths).toEqual([v2(PAGE), '/wiki/api/v2/spaces/42', restrict(PAGE), v2(PARENT), restrict(PARENT), v2(HOME), restrict(HOME)]);
+    expect(paths.some((p) => p.includes('ancestors'))).toBe(false);
     expect(await pageIsOpen(PAGE)).toBe(true);
     expect(console.info).not.toHaveBeenCalled();
   });
@@ -54,26 +57,40 @@ describe('pageOpenness (Jira issue titles / version messages)', () => {
     replies[restrict(PAGE)] = { status: 200, body: { restrictions: { user: { size: 1, results: [{}] } } } };
     expect(await pageOpenness(PAGE)).toEqual({ open: false, reason: 'restricted' });
     openSite();
-    replies[restrict(PARENT)] = { status: 200, body: { restrictions: { group: { results: [{}] } } } };
+    replies[restrict(HOME)] = { status: 200, body: { restrictions: { group: { results: [{}] } } } };
     expect(await pageOpenness(PAGE)).toEqual({ open: false, reason: 'ancestor_restricted' });
     expect(await pageIsOpen(PAGE)).toBe(false);
     expect(console.info).not.toHaveBeenCalled();
   });
 
-  it('a failing step is closed with an enum reason, logged without any body', async () => {
-    replies[`/wiki/rest/api/content/${PAGE}?expand=ancestors`] = { status: 403, body: { message: 'secret detail' } };
-    expect(await pageOpenness(PAGE)).toEqual({ open: false, reason: 'ancestors_http_403' });
+  it('410 / 404 and other failing steps are closed with an enum reason, logged without any body', async () => {
+    replies[restrict(PAGE)] = { status: 410, body: { message: 'secret detail' } };
+    expect(await pageOpenness(PAGE)).toEqual({ open: false, reason: 'restrictions_http_410' });
     expect(await pageIsOpen(PAGE)).toBe(false);
-    expect(console.info).toHaveBeenCalledWith('ripple page open check failed', { pageId: PAGE, reason: 'ancestors_http_403' });
+    expect(console.info).toHaveBeenCalledWith('ripple page open check failed', { pageId: PAGE, reason: 'restrictions_http_410' });
+    openSite();
+    delete replies[v2(PARENT)];
+    expect(await pageOpenness(PAGE)).toEqual({ open: false, reason: 'parent_http_404' });
+    openSite();
+    replies[v2(PAGE)] = { status: 404, body: {} };
+    expect(await pageOpenness(PAGE)).toEqual({ open: false, reason: 'page_http_404' });
     openSite();
     replies['/wiki/api/v2/spaces/42'] = { status: 404, body: {} };
     expect(await pageOpenness(PAGE)).toEqual({ open: false, reason: 'space_http_404' });
-    openSite();
-    replies[restrict(PARENT)] = { status: 401, body: {} };
-    expect(await pageOpenness(PAGE)).toEqual({ open: false, reason: 'restrictions_http_401' });
-    openSite();
-    replies[`/wiki/rest/api/content/${PAGE}?expand=ancestors`] = { status: 200, body: { ancestors: Array.from({ length: 21 }, (_, i) => ({ id: String(i + 1) })) } };
-    expect(await pageOpenness(PAGE)).toEqual({ open: false, reason: 'too_deep' });
     expect(await pageOpenness('x1')).toEqual({ open: false, reason: 'bad_id' });
+  });
+
+  it('a folder (or other non-page) parent and a tree deeper than 20 levels count as restricted', async () => {
+    replies[v2(PARENT)] = { status: 200, body: { id: PARENT, spaceId: '42', parentId: '777', parentType: 'folder' } };
+    expect(await pageOpenness(PAGE)).toEqual({ open: false, reason: 'parent_not_page' });
+    // A chain of 25 pages: 1 → 2 → … → 25.
+    replies = { '/wiki/api/v2/spaces/42': { status: 200, body: {} } };
+    for (let i = 1; i <= 25; i++) {
+      replies[v2(String(i))] = { status: 200, body: { id: String(i), spaceId: '42', parentId: String(i + 1), parentType: 'page' } };
+      replies[restrict(String(i))] = none;
+    }
+    paths.length = 0;
+    expect(await pageOpenness('1')).toEqual({ open: false, reason: 'too_deep' });
+    expect(paths.filter((p) => p.startsWith('/wiki/api/v2/pages/'))).toHaveLength(21);
   });
 });

@@ -235,35 +235,42 @@ export type PageOpenness = { open: true } | { open: false; reason: string };
 /**
  * Whether the page's title may be named to anyone (version messages, Jira issues): the app reads its space, and
  * neither the page nor any ancestor has a read restriction (REST v1 `restriction/byOperation/read`, as the app). Any
- * failure counts as restricted (`reason` is a log-safe enum). Ancestors come from REST v1 `content/{id}?expand=
- * ancestors` (`read:confluence-content.all`): the v2 `pages/{id}/ancestors` needs `read:content.metadata:confluence`,
- * which Ripple does not have, so every page counted as restricted. Space permissions themselves cannot be read with
- * the app's scopes (`read:space.permission:confluence` is not granted), so a page in a space only some groups can
- * view counts as open: see docs/PRIVACY.md.
+ * failure counts as restricted (`reason` is a log-safe enum). Ancestors are walked up through `parentId` of REST v2
+ * `GET pages/{id}` (`read:page:confluence`, at most `MAX_RESTRICTION_ANCESTORS` levels): the v2 `pages/{id}/ancestors`
+ * needs `read:content.metadata:confluence` (not granted) and v1 `content/{id}?expand=ancestors` is gone (HTTP 410). A
+ * parent that is not a page (folder, whiteboard, …) cannot be read with the app's scopes and counts as restricted.
+ * Restrictions have no v2 API; the v1 `restriction/byOperation/read` is used. Space permissions themselves cannot be
+ * read with the app's scopes (`read:space.permission:confluence` is not granted), so a page in a space only some groups
+ * can view counts as open: see docs/PRIVACY.md.
  */
 export async function pageOpenness(pageId: string): Promise<PageOpenness> {
   const closed = (reason: string): PageOpenness => ({ open: false, reason });
+  const ID = /^\d{1,32}$/;
   try {
-    if (!/^\d{1,32}$/.test(pageId)) return closed('bad_id');
+    if (!ID.test(pageId)) return closed('bad_id');
     const app = api.asApp();
     const json = { headers: { Accept: 'application/json' } };
-    const pageRes = await app.requestConfluence(route`/wiki/api/v2/pages/${pageId}`, json);
-    if (!pageRes.ok) return closed(`page_http_${pageRes.status}`);
-    const page = (await pageRes.json()) as RawPage;
-    if (page.spaceId === undefined) return closed('page_no_space');
-    const spaceRes = await app.requestConfluence(route`/wiki/api/v2/spaces/${String(page.spaceId)}`, json);
-    if (!spaceRes.ok) return closed(`space_http_${spaceRes.status}`);
-    const ancRes = await app.requestConfluence(route`/wiki/rest/api/content/${pageId}?expand=ancestors`, json);
-    if (!ancRes.ok) return closed(`ancestors_http_${ancRes.status}`);
-    const ancestors = ((await ancRes.json()) as { ancestors?: { id?: string | number }[] }).ancestors ?? [];
-    if (ancestors.length > MAX_RESTRICTION_ANCESTORS) return closed('too_deep');
-    for (const id of [pageId, ...ancestors.map((a) => String(a.id ?? ''))]) {
-      if (!/^\d{1,32}$/.test(id)) return closed('bad_ancestor_id');
+    let id = pageId;
+    for (let depth = 0; ; depth++) {
+      const step = depth === 0 ? 'page' : 'parent';
+      const pageRes = await app.requestConfluence(route`/wiki/api/v2/pages/${id}`, json);
+      if (!pageRes.ok) return closed(`${step}_http_${pageRes.status}`);
+      const page = (await pageRes.json()) as RawPage & { parentId?: string | number | null; parentType?: string | null };
+      if (depth === 0) {
+        if (page.spaceId === undefined) return closed('page_no_space');
+        const spaceRes = await app.requestConfluence(route`/wiki/api/v2/spaces/${String(page.spaceId)}`, json);
+        if (!spaceRes.ok) return closed(`space_http_${spaceRes.status}`);
+      }
       const res = await app.requestConfluence(route`/wiki/rest/api/content/${id}/restriction/byOperation/read?expand=restrictions.user,restrictions.group`, json);
       if (!res.ok) return closed(`restrictions_http_${res.status}`);
-      if (restrictedBy((await res.json()) as RawRestrictions)) return closed(id === pageId ? 'restricted' : 'ancestor_restricted');
+      if (restrictedBy((await res.json()) as RawRestrictions)) return closed(depth === 0 ? 'restricted' : 'ancestor_restricted');
+      if (page.parentId === undefined || page.parentId === null || page.parentId === '') return { open: true };
+      if (page.parentType !== undefined && page.parentType !== null && page.parentType !== 'page') return closed('parent_not_page');
+      const parent = String(page.parentId);
+      if (!ID.test(parent)) return closed('bad_ancestor_id');
+      if (depth + 1 > MAX_RESTRICTION_ANCESTORS) return closed('too_deep');
+      id = parent;
     }
-    return { open: true };
   } catch (err) {
     const name = (err as { name?: unknown } | null)?.name;
     return closed(typeof name === 'string' && /^[A-Z_]{1,40}$/.test(name) ? `error_${name.toLowerCase()}` : 'error');
