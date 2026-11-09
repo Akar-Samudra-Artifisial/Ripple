@@ -38,6 +38,9 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 - Halaman arsip/draft tidak lagi menjadi kandidat salinan. Pengecualian space lewat pengaturan belum ada.
 
 ### Fixed
+- Salinan dengan nilai sama kembali In sync walaupun judge ragu (`reason_code` value_matches, nilai sama, kondisi tidak berbeda), bukan "not sure this is the same fact".
+- Satu kalimat tidak lagi menghasilkan kartu Tidak pasti untuk fakta saudara (atribut sama, kondisi lain yang juga ada di sumber, mis. per diem domestik vs internasional): kode baru `sibling_fact` di prompt judge, kondisi yang cocok dengan fakta saudara diabaikan, dan per kutipan di halaman yang sama hanya satu kartu per kelompok saudara (yang cocok/menyimpang menang; bila semuanya Tidak pasti, fakta dengan nilai resmi terdekat). Kondisi yang tidak ada di sumber (mis. pelatihan) tetap Tidak pasti.
+- Log `ripple judge page` mengisi `reasonCode` di setiap fakta (`no_mention` bila tidak ada mention yang dinilai).
 - Penilaian drift lebih tepat: prompt judge kini memuat contoh few-shot fiktif (nilai beda = fakta sama/drift, kondisi beda = unsure, topik lain = bukan fakta sama, kalimat "raised from" = historis) dan tidak lagi menjawab "no" hanya karena nilai berbeda. Judge mengisi `reason_code` (enum tetap; nilai lain menjadi `other`). Jawaban "no" dengan `value_differs` tetap dinilai menyimpang, dan `different_condition` selalu tersimpan sebagai Tidak pasti. Log `ripple judge page` menambah `reasonCode` saja, tanpa teks bebas dari LLM.
 - Salinan yang menyimpang (nilai berbeda) kini ditemukan berdasarkan kata subjek/sinonim tanpa nilai: tiap subjek dan sinonim menjadi kelompok kata (berpasangan bila tiga kata, mis. "Expense claim deadline" → expense+claim, expense+deadline, claim+deadline), batas 200 kandidat per fakta tetap.
 - Salinan dengan kondisi lain (mis. per diem pelatihan eksternal $40) kini Tidak pasti walaupun judge menjawab "bukan fakta yang sama", bukan hilang diam-diam.

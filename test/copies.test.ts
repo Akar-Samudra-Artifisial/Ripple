@@ -31,6 +31,7 @@ import {
   normaliseValue,
   parseJudgement,
   parseReasonCode,
+  settleSiblings,
   parseTermSuggestions,
   strongest,
   type Judgement,
@@ -249,7 +250,12 @@ const MENTIONS = COPY_PAGES.flatMap((p) => p.judge);
 const FACT_LINE = /^(\d+)\. (.+?) \| .+? \| official value: .+? \| condition: (.+)$/gm;
 
 /** Fake LLM: synonyms for the terms call; for a chunk, the fixture mentions whose quote is in it (numbered as in the prompt). */
-function fakeLlm(calls: { tool: string; chunk?: string }[], override?: (chunk: string) => unknown, tweak?: (m: JudgeMention) => JudgeMention): ChatToolFn {
+function fakeLlm(
+  calls: { tool: string; chunk?: string }[],
+  override?: (chunk: string) => unknown,
+  tweak?: (m: JudgeMention) => JudgeMention,
+  extra: readonly JudgeMention[] = [],
+): ChatToolFn {
   return (async (messages: Message[], tool: ToolSpec) => {
     const user = String(messages[1]?.content ?? '');
     if (tool.name === 'record_search_terms') {
@@ -265,7 +271,8 @@ function fakeLlm(calls: { tool: string; chunk?: string }[], override?: (chunk: s
       const key = KEYS.find((k) => FACT_KEYS[k].subject === m[2] && FACT_KEYS[k].condition === condition);
       if (key) numbers.set(key, Number(m[1]));
     }
-    const mentions = MENTIONS.filter((x) => chunk.includes(x.quote) && numbers.has(x.fact))
+    const mentions = [...MENTIONS, ...extra]
+      .filter((x) => chunk.includes(x.quote) && numbers.has(x.fact))
       .map((x) => (tweak ? tweak(x) : x))
       .map(({ fact: k, ...rest }) => ({ fact: numbers.get(k), ...rest }));
     return { args: { mentions }, model: 'claude-sonnet-5' };
@@ -511,6 +518,9 @@ describe('parseJudgement', () => {
       expect(status({ reason_code: 'value_differs' })?.decision?.status).toBe('drifted');
       expect(status({ same_fact: 'no', reason_code: 'value_differs' })?.decision?.status).toBe('drifted');
       expect(status({ same_fact: 'no', reason_code: 'value_matches', stated_value: '$60', quote: 'Per diem for domestic travel: $60 per day.' }, 'Per diem for domestic travel: $60 per day.')?.decision?.status).toBe('in_sync');
+      // value_matches with "unsure" (New joiner FAQ, live): equal value and same condition → in sync; without the code → unsure.
+      expect(status({ same_fact: 'unsure', reason_code: 'value_matches', stated_value: '$60', quote: 'Per diem for domestic travel: $60 per day.' }, 'Per diem for domestic travel: $60 per day.')?.decision?.status).toBe('in_sync');
+      expect(status({ same_fact: 'unsure', reason_code: 'ambiguous', stated_value: '$60', quote: 'Per diem for domestic travel: $60 per day.' }, 'Per diem for domestic travel: $60 per day.')?.decision?.status).toBe('unsure');
     });
 
     it('(b) same topic, other condition → unsure, never dropped', () => {
@@ -521,6 +531,27 @@ describe('parseJudgement', () => {
         // Condition not named by the judge: the reason code alone keeps it unsure.
         expect(status({ ...training, same_fact: sameFact, stated_condition: null, reason_code: 'different_condition' }, text)?.decision?.status, `${sameFact} / no condition`).toBe('unsure');
       }
+    });
+
+    it('a sentence naming a sibling fact\'s condition is no copy of this fact (sibling_fact), a condition the source lacks is unsure', () => {
+      const intl = (over: Partial<Judgement>) => judgeOutcome(fact('international'), judgement('international', { statedValue: '$75', quote: 'q', ...over }), [fact('domestic')]);
+      expect(intl({ sameFact: 'unsure', statedCondition: 'domestic travel', reasonCode: 'different_condition' })).toEqual({ decision: null, reason: 'sibling_fact' });
+      expect(intl({ sameFact: 'no', statedCondition: null, reasonCode: 'sibling_fact' })).toEqual({ decision: null, reason: 'sibling_fact' });
+      expect(intl({ sameFact: 'no', statedCondition: 'External training', reasonCode: 'different_condition' }).decision?.status).toBe('unsure');
+    });
+
+    it('settleSiblings: one sentence gives one card per sibling group', () => {
+      const m = (k: FactKey, status: CopyStatus | null, statedValue: string, quote = 'Per diem: $75 per day.') => ({
+        fact: fact(k),
+        judgement: judgement(k, { statedValue, quote }),
+        decision: status ? { status, reason: 'r' } : null,
+      });
+      const settled = (items: ReturnType<typeof m>[]) => settleSiblings(items, FACTS).map((i) => i.decision?.status ?? i.reason);
+      expect(settled([m('domestic', 'drifted', '$75'), m('international', 'unsure', '$75')])).toEqual(['drifted', 'sibling_fact']);
+      // Both unsure (training $40): the nearest official value wins (domestic 60 vs international 90).
+      expect(settled([m('international', 'unsure', '$40'), m('domestic', 'unsure', '$40')])).toEqual(['sibling_fact', 'unsure']);
+      // Other quotes and unrelated facts are untouched.
+      expect(settled([m('domestic', 'drifted', '$75'), m('international', 'unsure', '$75', 'Abroad: $75.'), m('claims', 'unsure', '$75')])).toEqual(['drifted', 'unsure', 'unsure']);
     });
 
     it('(c) another topic → not a copy', () => {
@@ -668,6 +699,43 @@ describe('copy scan (search + judge consumers)', () => {
       expect([...codes].every((c) => /^[a-z_+]+$/.test(c ?? ''))).toBe(true);
       expect(codes).toContain('value_differs');
       expect(codes).toContain('different_condition');
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it('live run of 3de69c9: value_matches stays in sync, sibling facts get no unsure card, only the training per diem is unsure', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    try {
+      const page = (title: string) => COPY_PAGES.find((p) => p.title === title) as (typeof COPY_PAGES)[number];
+      const quoteOf = (title: string, k: FactKey) => page(title).judge.find((m) => m.fact === k)?.quote ?? '';
+      const offsite = page('Engineering offsite checklist');
+      const training = COPY_PAGES.find((p) => p.kind === 'trap' && p.expect.domestic === 'unsure') as (typeof COPY_PAGES)[number];
+      const offsiteQuote = quoteOf(offsite.title, 'domestic');
+      const trainingQuote = quoteOf(training.title, 'domestic');
+      // What the live judge also answered: the same sentence for the sibling (international) per diem.
+      const extra: JudgeMention[] = [
+        { fact: 'international', same_fact: 'unsure', mention: 'current', stated_value: '$75', stated_unit: 'per day', stated_condition: null, quote: offsiteQuote, reason_code: 'different_condition' },
+        { fact: 'international', same_fact: 'no', mention: 'current', stated_value: '$40', stated_unit: 'per day', stated_condition: 'External training', quote: trainingQuote, reason_code: 'different_condition' },
+      ];
+      const live = (m: JudgeMention): JudgeMention => {
+        if (extra.includes(m)) return m;
+        const status = COPY_PAGES.find((p) => p.judge.includes(m))?.expect[m.fact];
+        // New joiner FAQ claims (30 days): the judge said value_matches but left same_fact at "unsure".
+        if (status === 'in_sync' && m.fact === 'claims') return { ...m, same_fact: 'unsure', reason_code: 'value_matches' };
+        if (status === 'unsure') return { ...m, same_fact: 'no', reason_code: 'different_condition' };
+        if (status === 'historical') return { ...m, reason_code: 'historical' };
+        return { ...m, reason_code: status === 'drifted' ? 'value_differs' : 'value_matches' };
+      };
+      await fullScan(jobDeps({ llm: fakeLlm(llmCalls, undefined, live, extra) }));
+      for (const p of COPY_PAGES)
+        for (const k of KEYS) expect(scans.statusOf(k, p.id), `${p.title} / ${k}`).toBe(p.expect[k] ?? null);
+      const logs = info.mock.calls.filter((c) => c[0] === 'ripple judge page').map((c) => c[1] as { pageId: string; facts: { factId: string; outcome: string; reasonCode: string }[] });
+      const offsiteLog = logs.find((l) => l.pageId === offsite.id);
+      expect(offsiteLog?.facts).toContainEqual({ factId: factId('international'), outcome: 'sibling_fact', reasonCode: 'different_condition' });
+      // Every fact entry has an enum reason code, also without any judged mention.
+      for (const l of logs) for (const f of l.facts) expect(f.reasonCode).toMatch(/^[a-z_+]+$/);
+      expect(logs.some((l) => l.facts.some((f) => f.outcome === 'no_match' && f.reasonCode === 'no_mention'))).toBe(true);
     } finally {
       info.mockRestore();
     }

@@ -101,11 +101,13 @@ Rules:
 3. same_fact: "yes" when subject, attribute and condition match, WHATEVER the value (a different value is still the same fact; that is what Ripple checks). "unsure" when the topic matches but the condition differs or is unclear. "no" only for a different subject or attribute. Never "no" just because the value differs.
 4. mention: "historical" for past or changed values ("previously", "until 2025", "raised from $50 to $60", changelogs); "example" for illustrations; otherwise "current".
 5. quote: one full sentence, list item or table row copied verbatim from the excerpt, containing the stated value. If you cannot quote it, leave the mention out.
-6. reason_code: value_matches (same fact, same value), value_differs (same fact, other value), different_condition (same topic, other condition), different_subject (other subject or attribute), historical (past value), ambiguous (cannot tell), no_mention.
+6. reason_code: value_matches (same fact, same value), value_differs (same fact, other value), different_condition (same topic, a condition none of the listed facts has), sibling_fact (the sentence is about ANOTHER listed fact with the same subject and attribute but its own condition), different_subject (other subject or attribute), historical (past value), ambiguous (cannot tell), no_mention.
+   When facts differ only by condition, a sentence belongs to the one whose condition it names: report it for that fact only; for the others leave it out or use sibling_fact.
 7. Return an empty list when the excerpt states none of the facts.
 Examples (made up; not from your excerpt):
 - Fact "Parking fee | Amount per day | official value: 8 EUR | condition: (always)". Excerpt "Parking costs 12 EUR per day." → same_fact "yes", mention "current", stated_value "12 EUR", reason_code "value_differs".
 - Fact "Meal allowance | Amount per day | official value: 30 USD | condition: Business trips". Excerpt "During onsite workshops the meal allowance is $20 per day." → same_fact "unsure", stated_condition "Onsite workshops", reason_code "different_condition".
+- Facts "1. Meal allowance | Amount per day | official value: 30 USD | condition: Business trips" and "2. Meal allowance | Amount per day | official value: 50 USD | condition: Trips abroad". Excerpt "For business trips the meal allowance is 35 USD." → fact 1: same_fact "yes", reason_code "value_differs"; fact 2: leave it out (or same_fact "no", reason_code "sibling_fact").
 - Fact "Meal allowance | Amount per day | official value: 30 USD | condition: Business trips". Excerpt "The gym subsidy is $30 per month." → leave it out, or same_fact "no" with reason_code "different_subject".
 - Fact "Laptop refresh | Interval | official value: 3 years | condition: (always)". Excerpt "In 2024 the refresh interval was raised from 2 to 3 years." with stated_value "2 years" → mention "historical", reason_code "historical".`;
 

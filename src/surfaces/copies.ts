@@ -25,9 +25,11 @@ import {
   MAX_COPY_PAGE_CHARS,
   parseJudgement,
   parseTermSuggestions,
+  settleSiblings,
   siblingsOf,
   strongest,
   type Chunk,
+  type PageMention,
   type ScanFact,
 } from '../core/copies';
 import { storageToText } from '../core/pageText';
@@ -483,33 +485,36 @@ async function judgePage(scan: ScanRow, page: PendingPage, facts: readonly ScanF
   const chunked = new Set(chunks.flatMap((c) => c.factIds));
   const outcomes = new Map<string, string[]>(pageFacts.map((f) => [f.id, chunked.has(f.id) ? [] : ['no_chunk']]));
   const reasonCodes = new Map<string, string[]>();
+  const mentions: PageMention[] = [];
   for (const r of results) {
     dropped += r.dropped;
     for (const j of r.judgements) {
       const fact = byId.get(j.factId);
       if (!fact) continue;
-      const { decision, reason } = judgeOutcome(fact, j, siblingsOf(fact, facts));
-      outcomes.get(fact.id)?.push(decision ? decision.status : (reason ?? 'not_copy'));
-      // Enum value only (anything else was parsed to "other"): never the judge's free text.
-      reasonCodes.set(fact.id, [...(reasonCodes.get(fact.id) ?? []), j.reasonCode ?? 'other']);
-      if (!decision) continue;
-      const list = found.get(fact.id) ?? [];
-      list.push({
-        factId: fact.id,
-        pageId: page.pageId,
-        pageTitle: title,
-        pageUrl: page.url,
-        pageVersion: copyPage.version || null,
-        status: decision.status,
-        statedValue: j.statedValue,
-        statedUnit: j.statedUnit,
-        statedCondition: j.statedCondition,
-        mention: j.mention,
-        quote: j.quote,
-        reason: decision.reason,
-      });
-      found.set(fact.id, list);
+      mentions.push({ fact, judgement: j, ...judgeOutcome(fact, j, siblingsOf(fact, facts)) });
     }
+  }
+  for (const { fact, judgement: j, decision, reason } of settleSiblings(mentions, facts)) {
+    outcomes.get(fact.id)?.push(decision ? decision.status : (reason ?? 'not_copy'));
+    // Enum value only (anything else was parsed to "other"): never the judge's free text.
+    reasonCodes.set(fact.id, [...(reasonCodes.get(fact.id) ?? []), j.reasonCode ?? 'other']);
+    if (!decision) continue;
+    const list = found.get(fact.id) ?? [];
+    list.push({
+      factId: fact.id,
+      pageId: page.pageId,
+      pageTitle: title,
+      pageUrl: page.url,
+      pageVersion: copyPage.version || null,
+      status: decision.status,
+      statedValue: j.statedValue,
+      statedUnit: j.statedUnit,
+      statedCondition: j.statedCondition,
+      mention: j.mention,
+      quote: j.quote,
+      reason: decision.reason,
+    });
+    found.set(fact.id, list);
   }
   const copies = [...found.values()].map((list) => strongest(list)).filter((c): c is CopyInput => c !== undefined);
   console.info('ripple judge page', {
@@ -519,7 +524,8 @@ async function judgePage(scan: ScanRow, page: PendingPage, facts: readonly ScanF
     facts: [...outcomes].map(([factId, list]) => ({
       factId,
       outcome: list.length > 0 ? list.join('+') : 'no_match',
-      ...(reasonCodes.has(factId) ? { reasonCode: reasonCodes.get(factId)?.join('+') } : {}),
+      // No judged mention (no chunk or nothing reported) is "no_mention", so every entry has an enum reason code.
+      reasonCode: reasonCodes.get(factId)?.join('+') ?? 'no_mention',
     })),
     dropped,
     dropReasons,

@@ -421,7 +421,7 @@ export interface Judgement {
 }
 
 /** Fixed reason codes of the judge's `reason_code` field; the only judge wording ever logged. */
-export const JUDGE_REASON_CODES = ['value_differs', 'value_matches', 'different_condition', 'different_subject', 'historical', 'no_mention', 'ambiguous'] as const;
+export const JUDGE_REASON_CODES = ['value_differs', 'value_matches', 'different_condition', 'sibling_fact', 'different_subject', 'historical', 'no_mention', 'ambiguous'] as const;
 export type ReasonCode = (typeof JUDGE_REASON_CODES)[number] | 'other';
 
 export const parseReasonCode = (v: unknown): ReasonCode => JUDGE_REASON_CODES.find((x) => x === v) ?? 'other';
@@ -585,7 +585,18 @@ export function decideStatus(fact: ScanFact, j: Judgement, siblings: readonly Sc
 }
 
 /** Why a judged mention is not a copy (for logs). */
-export type NotCopyReason = 'not_same_fact' | 'example' | 'value_not_comparable';
+export type NotCopyReason = 'not_same_fact' | 'example' | 'value_not_comparable' | 'sibling_fact';
+
+/**
+ * True when the mention belongs to another fact of the same source with the same subject and attribute (a sibling,
+ * e.g. the domestic per diem when judging the international one): the stated condition is the sibling's, not this
+ * fact's. Sibling mentions are no copy of this fact; only a condition the source does not cover is "different".
+ */
+function isSiblingMention(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[]): boolean {
+  if (j.reasonCode === 'sibling_fact') return true;
+  if (!j.statedCondition || sameCondition(fact, j.statedCondition)) return false;
+  return siblings.some((s) => s.id !== fact.id && s.condition !== null && sameCondition(s, j.statedCondition));
+}
 
 /**
  * `decideStatus` plus the reason when the mention is not a copy. The judge is told to answer "no" for a different
@@ -594,6 +605,7 @@ export type NotCopyReason = 'not_same_fact' | 'example' | 'value_not_comparable'
  */
 export function judgeOutcome(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[] = []): { decision: CopyDecision | null; reason?: NotCopyReason } {
   if (j.mention === 'example') return { decision: null, reason: 'example' };
+  if (isSiblingMention(fact, j, siblings)) return { decision: null, reason: 'sibling_fact' };
   if (j.sameFact === 'no') {
     const otherCondition = j.mention === 'current' && (j.reasonCode === 'different_condition' || (j.statedCondition !== null && !sameCondition(fact, j.statedCondition)));
     if (!otherCondition || compareValues({ value: fact.value, unit: fact.unit }, { value: j.statedValue, unit: j.statedUnit }) === 'unknown') {
@@ -613,7 +625,10 @@ function statusOf(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[]): 
   }
   const cmp = compareValues({ value: fact.value, unit: fact.unit }, { value: j.statedValue, unit: j.statedUnit });
   if (cmp === 'unknown') return null;
-  if (j.sameFact === 'unsure') return { status: 'unsure', reason: 'Ripple is not sure this is the same fact.' };
+  // The judge's own "value_matches" with an equal value and no other condition is in sync, also when it (or the
+  // quote check) left same_fact at "unsure": an equal value cannot be drift.
+  const matches = cmp === 'same' && j.reasonCode === 'value_matches' && j.mention === 'current';
+  if (j.sameFact === 'unsure' && !matches) return { status: 'unsure', reason: 'Ripple is not sure this is the same fact.' };
   if (cmp === 'same') return { status: 'in_sync', reason: 'Same value as the source.' };
   const stated = valueLabel(j.statedValue, j.statedUnit);
   const official = valueLabel(fact.value, fact.unit);
@@ -621,6 +636,62 @@ function statusOf(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[]): 
   const sibling = siblings.find((s) => s.id !== fact.id && compareValues({ value: s.value, unit: s.unit }, { value: j.statedValue, unit: j.statedUnit }) === 'same');
   if (sibling && !j.statedCondition) return { status: 'unsure', reason: `Value matches the fact for "${sibling.condition ?? 'another case'}".` };
   return { status: 'drifted', reason: `Value differs: ${stated} vs ${official} on the source.` };
+}
+
+/** One judged mention on a page with its outcome (see `settleSiblings`). */
+export interface PageMention {
+  fact: ScanFact;
+  judgement: Judgement;
+  decision: CopyDecision | null;
+  reason?: NotCopyReason;
+}
+
+const firstNumber = (v: string): number | undefined => numbersIn(v)[0];
+
+/**
+ * Page-level guard against one sentence becoming cards for several sibling facts (same subject and attribute, other
+ * condition), per quote:
+ * - an `unsure` for a fact whose sibling got in sync / drifted / historical from the same quote is dropped (the
+ *   sentence is about the sibling: "$75 for domestic trips" is no unsure international copy);
+ * - several `unsure` for sibling facts from the same quote ("$40 for external training" for both per diems) keep one:
+ *   the fact whose official value is nearest to the stated one (first fact on a tie).
+ * Dropped mentions get reason `sibling_fact`. Mentions of unrelated facts are untouched.
+ */
+export function settleSiblings(items: readonly PageMention[], facts: readonly ScanFact[]): PageMention[] {
+  const out = items.map((i) => ({ ...i }));
+  const drop = (i: PageMention) => {
+    i.decision = null;
+    i.reason = 'sibling_fact';
+  };
+  const byQuote = new Map<string, PageMention[]>();
+  for (const i of out) {
+    const key = normaliseKeyPart(i.judgement.quote);
+    byQuote.set(key, [...(byQuote.get(key) ?? []), i]);
+  }
+  for (const group of byQuote.values()) {
+    const siblingIds = (i: PageMention) => new Set(siblingsOf(i.fact, facts).map((s) => s.id).filter((id) => id !== i.fact.id));
+    for (const u of group) {
+      if (u.decision?.status !== 'unsure') continue;
+      const ids = siblingIds(u);
+      if (group.some((o) => o !== u && ids.has(o.fact.id) && o.decision && o.decision.status !== 'unsure')) drop(u);
+    }
+    const unsure = group.filter((i) => i.decision?.status === 'unsure');
+    for (const u of unsure) {
+      if (!u.decision) continue;
+      const ids = siblingIds(u);
+      const rivals = unsure.filter((o) => o !== u && o.decision && ids.has(o.fact.id));
+      if (rivals.length === 0) continue;
+      const stated = firstNumber(u.judgement.statedValue);
+      const dist = (i: PageMention) => {
+        const a = firstNumber(i.fact.value);
+        return stated === undefined || a === undefined ? Number.POSITIVE_INFINITY : Math.abs(a - stated);
+      };
+      const order = (i: PageMention) => facts.findIndex((f) => f.id === i.fact.id);
+      const best = [u, ...rivals].reduce((b, i) => (dist(i) < dist(b) || (dist(i) === dist(b) && order(i) < order(b)) ? i : b));
+      for (const i of [u, ...rivals]) if (i !== best) drop(i);
+    }
+  }
+  return out;
 }
 
 const RANK: Record<CopyStatus, number> = { drifted: 5, in_sync: 4, unsure: 3, historical: 2, updated: 1, ignored: 0 };
