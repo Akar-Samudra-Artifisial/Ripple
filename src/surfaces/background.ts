@@ -1,11 +1,11 @@
 import { InvocationError, InvocationErrorCode } from '@forge/events';
 import { requestMigration, runMigrations } from '../adapters/sql';
+import { runJudgeJob, runSearchJob, type ScanOutcome } from './copies';
 import { runExtractJob } from './sources';
 import { notImplemented } from './stub';
 
 export { EXTRACT_QUEUE } from './sources';
-export const SEARCH_QUEUE = 'search';
-export const JUDGE_QUEUE = 'judge';
+export { JUDGE_QUEUE, SEARCH_QUEUE } from './copies';
 export const DEMO_QUEUE = 'demo-seed';
 
 const SCHEMA_RETRY_SECONDS = 60;
@@ -62,13 +62,29 @@ export async function extractFacts(event: ExtractEvent): Promise<InvocationError
   if (outcome.status === 'skipped') console.info('ripple extract skipped', { pageId, reason: outcome.reason });
 }
 
-export async function searchCopies(): Promise<void> {
-  notImplemented(`${SEARCH_QUEUE} consumer`);
+interface ScanEvent {
+  body?: { scanId?: unknown };
+  retryContext?: { retryCount?: number };
 }
 
-export async function judgeCandidates(): Promise<void> {
-  notImplemented(`${JUDGE_QUEUE} consumer`);
+const UUID = /^[0-9a-f-]{36}$/i;
+
+async function runScanConsumer(what: string, event: ScanEvent, run: (scanId: string, retryCount: number) => Promise<ScanOutcome>): Promise<InvocationError | void> {
+  const scanId = event.body?.scanId;
+  if (typeof scanId !== 'string' || !UUID.test(scanId)) {
+    console.warn(`ripple ${what}: ignoring event without a valid scan id`);
+    return;
+  }
+  const outcome = await run(scanId, event.retryContext?.retryCount ?? 0);
+  if (outcome.status === 'retry') return retryLater(outcome.seconds, outcome.reason);
+  if (outcome.status === 'skipped') console.info(`ripple ${what} skipped`, { scanId, reason: outcome.reason });
 }
+
+/** Consumer for `search`: CQL candidates of a scan (body `{ scanId }`), see `runSearchJob`. */
+export const searchCopies = (event: ScanEvent): Promise<InvocationError | void> => runScanConsumer('search', event, (id, n) => runSearchJob(id, n));
+
+/** Consumer for `judge`: judges the scan's candidate pages in batches (body `{ scanId }`), see `runJudgeJob`. */
+export const judgeCandidates = (event: ScanEvent): Promise<InvocationError | void> => runScanConsumer('judge', event, (id, n) => runJudgeJob(id, n));
 
 export async function demoJob(): Promise<void> {
   notImplemented(`${DEMO_QUEUE} consumer`);

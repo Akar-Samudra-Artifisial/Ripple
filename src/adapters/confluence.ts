@@ -24,8 +24,9 @@ export class ConfluenceRetryableError extends Error {
   constructor(
     readonly pageId: string,
     readonly status: number,
+    resource = 'REST v2 page',
   ) {
-    super(`Confluence REST v2 page ${pageId} failed: HTTP ${status} (will retry)`);
+    super(`Confluence ${resource} ${pageId} failed: HTTP ${status} (will retry)`);
     this.name = 'ConfluenceRetryableError';
   }
 }
@@ -53,6 +54,70 @@ export async function getSourcePage(pageId: string): Promise<SourcePage> {
     versionCreatedAt: page.version?.createdAt ?? null,
     body: page.body?.storage?.value ?? '',
   };
+}
+
+/** A page found by CQL. */
+export interface SearchHit {
+  pageId: string;
+  title: string;
+  /** Relative web link (`/spaces/…/pages/…`), when Confluence returns one. */
+  url: string | null;
+}
+
+interface RawSearch {
+  results?: { content?: { id?: string | number; type?: string; title?: string; _links?: { webui?: string } }; url?: string; title?: string }[];
+  _links?: { next?: string };
+}
+
+const SEARCH_PAGE_SIZE = 50;
+
+type Requester = ReturnType<typeof api.asApp>;
+
+/** CQL search (`GET /wiki/rest/api/search`), following cursors until `max` distinct pages. Never logs the CQL. */
+async function cqlSearch(requester: Requester, cql: string, max: number): Promise<SearchHit[]> {
+  const hits = new Map<string, SearchHit>();
+  let cursor: string | undefined;
+  while (hits.size < max) {
+    const limit = Math.min(SEARCH_PAGE_SIZE, max - hits.size);
+    const path =
+      cursor === undefined
+        ? route`/wiki/rest/api/search?cql=${cql}&limit=${String(limit)}&excerpt=none`
+        : route`/wiki/rest/api/search?cql=${cql}&limit=${String(limit)}&excerpt=none&cursor=${cursor}`;
+    const res = await requester.requestConfluence(path, { headers: { Accept: 'application/json' } });
+    if (res.status === 429 || res.status >= 500) throw new ConfluenceRetryableError('search', res.status, 'CQL');
+    // The body may echo the CQL (built from page text), so only the status goes into the error.
+    if (!res.ok) throw new Error(`Confluence CQL search failed: HTTP ${res.status}`);
+    const body = (await res.json()) as RawSearch;
+    const results = body.results ?? [];
+    for (const r of results) {
+      const c = r.content;
+      if (!c || c.type !== 'page' || c.id === undefined || hits.size >= max) continue;
+      const pageId = String(c.id);
+      if (!hits.has(pageId)) hits.set(pageId, { pageId, title: c.title ?? r.title ?? '', url: c._links?.webui ?? r.url ?? null });
+    }
+    const next = body._links?.next;
+    cursor = next ? (new URLSearchParams(next.split('?')[1] ?? '').get('cursor') ?? undefined) : undefined;
+    if (results.length === 0 || !cursor) break;
+  }
+  return [...hits.values()];
+}
+
+/** Candidate pages as the app (queue consumers have no user); results are filtered per viewer when shown. */
+export const searchPagesAsApp = (cql: string, max: number): Promise<SearchHit[]> => cqlSearch(api.asApp(), cql, max);
+
+/**
+ * The subset of `pageIds` the current user can see (CQL as the user only returns pages they may read). Resolvers
+ * only. Ids are validated digits, so the CQL cannot be injected.
+ */
+export async function visiblePageIds(pageIds: readonly string[]): Promise<Set<string>> {
+  const ids = [...new Set(pageIds)].filter((id) => /^\d{1,32}$/.test(id));
+  const visible = new Set<string>();
+  for (let i = 0; i < ids.length; i += SEARCH_PAGE_SIZE) {
+    const batch = ids.slice(i, i + SEARCH_PAGE_SIZE);
+    const hits = await cqlSearch(api.asUser(), `type = page AND id in (${batch.join(',')})`, batch.length);
+    for (const h of hits) visible.add(h.pageId);
+  }
+  return visible;
 }
 
 /**

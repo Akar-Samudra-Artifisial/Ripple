@@ -5,6 +5,12 @@ Semua perubahan penting dicatat di sini. Format mengikuti Keep a Changelog, vers
 ## [Unreleased]
 
 ### Added
+- M2 (FR-4..6): tab "Copies" di panel sumber dengan tombol "Find copies"/"Rescan", progres pemindaian yang di-poll, ringkasan jumlah drifted/unsure/in sync, filter status, dan kartu salinan (halaman, nilai yang tertulis vs nilai sumber, kutipan verbatim, alasan).
+- Pemindaian salinan di antrean `search` dan `judge`: CQL per fakta terkonfirmasi (maks. 200 kandidat per fakta, halaman sumber dan label `ripple-ignore` dikecualikan, sinonim subjek dari LLM), hanya potongan teks yang menyebut fakta yang dinilai LLM, kutipan wajib ditemukan persis di halaman salinan, dan nilai dinormalisasi sebelum dibandingkan ("$60", "60 USD", "sixty dollars").
+- Status salinan Sesuai/Menyimpang/Tidak pasti/Historis: penyebutan historis ("previously", "until 2025", changelog) dan fakta dengan kondisi lain (mis. per diem training $40) tidak pernah dinilai menyimpang; salinan yang diabaikan/diperbarui tetap dipertahankan saat rescan.
+- Pemindaian bisa dilanjutkan dari batch terakhir (kursor fakta dan kandidat tertunda di Forge SQL), retry otomatis saat rate limit LLM/SQL atau Confluence 429/5xx, dan pemindaian macet >15 menit dilanjutkan lewat tombol "Resume scan".
+- Daftar salinan hanya menampilkan halaman yang boleh dibuka pengguna (dicek sebagai pengguna); sisanya hanya dihitung.
+- Tabel Forge SQL `scan_jobs`, `scan_hits`, dan `copies` (migrasi v007–v009); melepas status sumber juga menghapus salinan dan pemindaiannya.
 - Catatan kecil di panel sumber bila halaman terlalu panjang dan hanya bagian awalnya yang dibaca.
 - Status sumber memuat `truncated` bila teks halaman melebihi batas baca LLM (kolom `sources.text_truncated`, migrasi v006).
 - M1 (FR-1..3): tombol "Mark as source of truth" di byline (hanya untuk pengguna dengan izin edit halaman, dicek di server), lepas status sumber, status ekstraksi yang di-poll, dan daftar fakta dengan kutipan serta aksi Confirm/Edit/Reject.

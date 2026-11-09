@@ -46,14 +46,18 @@ describe('migrations', () => {
       if (/^\s*ALTER\s+TABLE/i.test(m.statement)) expect(m.statement.match(/\bADD\b/gi) ?? []).toHaveLength(1);
       expect(m.statement.trim()).not.toMatch(/;\s*\S/); // one statement per migration
     }
-    expect(names).toEqual(['v001_create_settings', 'v002_create_audit', 'v003_create_sources', 'v004_create_facts', 'v005_facts_origin_key', 'v006_sources_text_truncated']);
-    expect(LATEST_MIGRATION).toBe('v006_sources_text_truncated');
+    expect(names).toEqual(['v001_create_settings', 'v002_create_audit', 'v003_create_sources', 'v004_create_facts', 'v005_facts_origin_key', 'v006_sources_text_truncated',
+      'v007_create_scan_jobs',
+      'v008_create_scan_hits',
+      'v009_create_copies',
+    ]);
+    expect(LATEST_MIGRATION).toBe('v009_create_copies');
   });
 });
 
 describe('schemaView', () => {
   it('reports ready, setting up and errors', async () => {
-    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 6, total: 6, latest: LATEST_MIGRATION });
+    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 9, total: 9, latest: LATEST_MIGRATION });
     expect(
       await schemaView(async () => {
         throw new SchemaSettingUpError(1, 4);

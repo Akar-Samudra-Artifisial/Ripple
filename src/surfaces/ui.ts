@@ -4,7 +4,8 @@ import { displayNames } from '../adapters/confluenceUsers';
 import { asUserGraph, fetchPageMeta, ownersFromPage, readSpaceTeams, scrubErrorText, type GraphRequest, type PageMeta } from '../adapters/teamworkGraph';
 import { LATEST_MIGRATION, MIGRATIONS } from '../core/migrations';
 import { SchemaSettingUpError } from '../core/schema';
-import type { BylineStatus, FactEditPayload, FactIdPayload, OwnerView, SchemaView, SpaceTeamsView } from '../core/views';
+import { getScanStatus, listCopies, startScan } from './copies';
+import type { BylineStatus, CopyListPayload, FactEditPayload, FactIdPayload, OwnerView, SchemaView, SpaceTeamsView } from '../core/views';
 import { confirmFact, editFact, getSourceStatus, listFacts, markSource, rejectFact, unmarkSource, type SourceContext } from './sources';
 import { notImplemented } from './stub';
 
@@ -108,6 +109,10 @@ resolver.define('listFacts', ({ context }) => listFacts(context as SourceContext
 resolver.define('confirmFact', ({ context, payload }) => confirmFact(context as SourceContext, payload as Partial<FactIdPayload>));
 resolver.define('rejectFact', ({ context, payload }) => rejectFact(context as SourceContext, payload as Partial<FactIdPayload>));
 resolver.define('editFact', ({ context, payload }) => editFact(context as SourceContext, payload as Partial<FactEditPayload>));
+// M2 (FR-4..6).
+resolver.define('getScanStatus', ({ context }) => getScanStatus(context as SourceContext));
+resolver.define('startScan', ({ context }) => startScan(context as SourceContext));
+resolver.define('listCopies', ({ context, payload }) => listCopies(context as SourceContext, payload as Partial<CopyListPayload>));
 resolver.define('getSettings', () => notImplemented('settings'));
 resolver.define('getApproval', () => notImplemented('approval panel'));
 

@@ -158,7 +158,10 @@ export const sqlRepo: FactRepo = {
   },
 
   async unmarkSource(pageId) {
-    // Facts first: a retry after a failure in between still finds the source row and finishes the job.
+    // Copies, scans and facts first: a retry after a failure in between still finds the source row and finishes.
+    await execute('DELETE FROM copies WHERE source_page_id = ?', pageId);
+    await execute('DELETE FROM scan_hits WHERE scan_id IN (SELECT id FROM scan_jobs WHERE source_page_id = ?)', pageId);
+    await execute('DELETE FROM scan_jobs WHERE source_page_id = ?', pageId);
     await execute('DELETE FROM facts WHERE source_page_id = ?', pageId);
     await execute('DELETE FROM sources WHERE page_id = ?', pageId);
   },

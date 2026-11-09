@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import type { FactActionResult, FactEditPayload, FactList, FactStatus, FactType, FactView, SourceStatus } from '../../src/core/views';
 import { call } from './bridge';
+import { CopiesTab } from './copiesTab';
 
 const POLL_MS = 3000;
 const errorOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
@@ -32,6 +33,7 @@ export function SourcePanel() {
   const [facts, setFacts] = useState<FactView[]>();
   const [error, setError] = useState<string>();
   const [pending, setPending] = useState<SourceCall>();
+  const [tab, setTab] = useState<'facts' | 'copies'>('facts');
 
   const load = useCallback(async () => {
     const s = await call<SourceStatus>('getSourceStatus');
@@ -161,6 +163,20 @@ export function SourcePanel() {
         />
       ) : null}
 
+      {source.state === 'ready' ? (
+        <div className="actions" role="tablist" aria-label="Source views">
+          {(['facts', 'copies'] as const).map((t) => (
+            <button key={t} type="button" role="tab" aria-selected={tab === t} className={`button ${tab === t ? 'button--primary' : 'button--subtle'}`} onClick={() => setTab(t)}>
+              {t === 'facts' ? 'Facts' : 'Copies'}
+            </button>
+          ))}
+        </div>
+      ) : null}
+
+      {source.state === 'ready' && tab === 'copies' ? <CopiesTab canEdit={canEdit} confirmed={counts.confirmed} /> : null}
+
+      {tab === 'copies' && source.state === 'ready' ? null : (
+        <>
       {source.state === 'ready' && facts === undefined ? (
         error ? <Alert message={`Could not load the facts: ${error}`} onRetry={reload} /> : <FactsLoading />
       ) : null}
@@ -176,6 +192,8 @@ export function SourcePanel() {
           ))}
         </ul>
       ) : null}
+        </>
+      )}
 
       {canEdit ? <SourceActions extracting={extracting} pending={pending} onRun={runSource} /> : null}
     </section>

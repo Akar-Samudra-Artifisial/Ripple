@@ -79,6 +79,65 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
   { name: 'v005_facts_origin_key', statement: 'ALTER TABLE facts ADD COLUMN IF NOT EXISTS origin_key VARCHAR(400) NULL' },
   // Page text was longer than the LLM input limit, so facts past the cut were not read.
   { name: 'v006_sources_text_truncated', statement: 'ALTER TABLE sources ADD COLUMN IF NOT EXISTS text_truncated TINYINT(1) NOT NULL DEFAULT 0' },
+  // Copy scans (FR-4..6, NFR-6): one row per scan of a source; `fact_cursor` and the `scan_hits` rows let the
+  // `search` and `judge` consumers resume from the last finished batch. `terms` = search terms per fact (JSON).
+  {
+    name: 'v007_create_scan_jobs',
+    statement: `CREATE TABLE IF NOT EXISTS scan_jobs (
+      id VARCHAR(36) PRIMARY KEY,
+      source_page_id VARCHAR(32) NOT NULL,
+      status VARCHAR(16) NOT NULL,
+      facts_total INT NOT NULL DEFAULT 0,
+      fact_cursor INT NOT NULL DEFAULT 0,
+      terms JSON NULL,
+      candidates INT NOT NULL DEFAULT 0,
+      pages_judged INT NOT NULL DEFAULT 0,
+      requested_by VARCHAR(128) NULL,
+      error VARCHAR(255) NULL,
+      started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      finished_at TIMESTAMP NULL,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      KEY idx_scan_jobs_source (source_page_id, started_at)
+    )`,
+  },
+  // Candidate pages of a scan per fact (CQL hit, at most 200 per fact). `status` pending → done once judged.
+  {
+    name: 'v008_create_scan_hits',
+    statement: `CREATE TABLE IF NOT EXISTS scan_hits (
+      scan_id VARCHAR(36) NOT NULL,
+      fact_id VARCHAR(36) NOT NULL,
+      page_id VARCHAR(32) NOT NULL,
+      title VARCHAR(255) NULL,
+      page_url VARCHAR(500) NULL,
+      status VARCHAR(16) NOT NULL DEFAULT 'pending',
+      PRIMARY KEY (scan_id, fact_id, page_id),
+      KEY idx_scan_hits_pending (scan_id, status, page_id)
+    )`,
+  },
+  // Copies of a fact on another page (one row per fact and page), with the judged status and a verified quote.
+  {
+    name: 'v009_create_copies',
+    statement: `CREATE TABLE IF NOT EXISTS copies (
+      id VARCHAR(36) PRIMARY KEY,
+      source_page_id VARCHAR(32) NOT NULL,
+      fact_id VARCHAR(36) NOT NULL,
+      page_id VARCHAR(32) NOT NULL,
+      page_title VARCHAR(255) NULL,
+      page_url VARCHAR(500) NULL,
+      page_version INT NULL,
+      status VARCHAR(16) NOT NULL,
+      stated_value VARCHAR(300) NULL,
+      stated_unit VARCHAR(40) NULL,
+      stated_condition VARCHAR(160) NULL,
+      mention VARCHAR(16) NOT NULL,
+      quote TEXT NOT NULL,
+      reason VARCHAR(255) NOT NULL,
+      scan_id VARCHAR(36) NOT NULL,
+      judged_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_copies_fact_page (fact_id, page_id),
+      KEY idx_copies_source_status (source_page_id, status)
+    )`,
+  },
 ];
 
 /** Name of the newest migration; the byline reports it so admins can confirm the schema is current. */

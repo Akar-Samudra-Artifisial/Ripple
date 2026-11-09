@@ -139,8 +139,87 @@ export interface ErrorReply {
   error: string;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// M2: copies of the source's facts on other pages (FR-4..6). Search and judging run in the `search` and `judge`
+// queue consumers; the UI starts a scan and polls `getScanStatus`.
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * PRD "Status salinan": `in_sync` Sesuai, `drifted` Menyimpang, `unsure` Tidak pasti (e.g. another condition),
+ * `ignored` Diabaikan (owner: not the same fact), `updated` Diperbarui. `historical` = the page mentions the fact as
+ * past/changelog text; never drift, listed only on request.
+ */
+export type CopyStatus = 'in_sync' | 'drifted' | 'unsure' | 'historical' | 'ignored' | 'updated';
+export const COPY_STATUSES: readonly CopyStatus[] = ['in_sync', 'drifted', 'unsure', 'historical', 'ignored', 'updated'];
+
+/** `searching`: CQL per fact; `judging`: candidate pages are read and judged in batches; `done`/`error` are final. */
+export type ScanState = 'searching' | 'judging' | 'done' | 'error';
+
+export interface ScanView {
+  id: string;
+  state: ScanState;
+  /** No progress for 15 minutes while running; `startScan` resumes it from the last batch. */
+  stalled: boolean;
+  factsTotal: number;
+  factsSearched: number;
+  /** Distinct candidate pages found by CQL (at most 200 per fact). */
+  candidates: number;
+  pagesJudged: number;
+  startedAt: string;
+  finishedAt: string | null;
+  error: string | null;
+}
+
+export type CopyCounts = Record<CopyStatus, number>;
+
+/** Reply of `getScanStatus` and `startScan`. Counts cover all copies, also those on pages the viewer cannot open. */
+export interface ScanStatus {
+  pageId: string;
+  canEdit: boolean;
+  scan: ScanView | null;
+  counts: CopyCounts;
+}
+
+export interface CopyView {
+  id: string;
+  factId: string;
+  /** "Travel per diem · Amount per day · Domestic travel". */
+  factLabel: string;
+  officialValue: string;
+  officialUnit: string | null;
+  pageId: string;
+  pageTitle: string;
+  /** Relative Confluence link (`/spaces/…/pages/…`); prefix with the site URL. */
+  pageUrl: string | null;
+  status: CopyStatus;
+  statedValue: string | null;
+  statedUnit: string | null;
+  statedCondition: string | null;
+  /** Verbatim sentence from the copy page, verified against its text. */
+  quote: string;
+  /** Short reason for the status, e.g. "Value differs: 45 days vs 30 days". */
+  reason: string;
+  judgedAt: string | null;
+}
+
+/** `listCopies` payload; `status` omitted = everything except `historical`. */
+export interface CopyListPayload {
+  status?: CopyStatus;
+}
+
+/** Reply of `listCopies`: only pages the viewer may open; the rest are counted in `hiddenCount` (NFR-3). */
+export interface CopyList {
+  pageId: string;
+  copies: CopyView[];
+  hiddenCount: number;
+}
+
 /** Resolver name → payload and success reply. Every resolver may also answer `ErrorReply`. */
 export interface ResolverContract {
+  getScanStatus: { payload: undefined; reply: ScanStatus };
+  /** Starts a scan (edit permission; source ready with ≥1 confirmed fact), or resumes a stalled one. */
+  startScan: { payload: undefined; reply: ScanStatus };
+  listCopies: { payload: CopyListPayload; reply: CopyList };
   getBylineStatus: { payload: undefined; reply: BylineStatus };
   getSourceStatus: { payload: undefined; reply: SourceStatus };
   markSource: { payload: undefined; reply: SourceStatus };
