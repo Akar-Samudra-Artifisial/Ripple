@@ -207,7 +207,7 @@ export function SourcePanel() {
         </TabPanel>
       ) : source.state === 'ready' && tab === 'rollout' && rolloutId ? (
         <TabPanel idPrefix={tabsId} id="rollout">
-          <RolloutTab changeId={rolloutId} onGone={dropRollout} />
+          <RolloutTab changeId={rolloutId} canEdit={canEdit} onGone={dropRollout} />
         </TabPanel>
       ) : (
         <FactsList facts={facts} ready={source.state === 'ready'} error={error} canEdit={canEdit} onRetry={reload} onAction={runFact} tabsId={tabsId} />
