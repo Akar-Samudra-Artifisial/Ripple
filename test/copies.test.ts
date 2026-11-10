@@ -1032,6 +1032,31 @@ describe('M2 review: judging rules', () => {
     expect(decideStatus(claims, same)?.status).toBe('drifted');
   });
 
+  it('rehearsal: the Expense Claims FAQ sentence (45 days) is drift even when the judge says unsure + value_differs', () => {
+    const claims = fact('claims');
+    const quote = 'Expense claims must be submitted within 45 days after the trip ends.';
+    for (const statedCondition of [null, 'after the trip ends', 'submitted after the trip ends', 'submitted within 45 days after the trip ends']) {
+      for (const [statedValue, statedUnit] of [['45 days', 'days'], ['45', 'days after the trip ends']] as const) {
+        const j = judgement('claims', { sameFact: 'unsure', reasonCode: 'value_differs', statedValue, statedUnit, statedCondition, quote });
+        expect(decideStatus(claims, j)?.status, `${statedCondition} / ${statedValue}`).toBe('drifted');
+      }
+    }
+    // Words the source sentence does not use still narrow the fact.
+    const training = judgement('claims', { sameFact: 'unsure', reasonCode: 'value_differs', statedValue: '45 days', statedUnit: 'days', statedCondition: 'External training', quote: 'External training claims must be submitted within 45 days after the trip ends.' });
+    expect(decideStatus(claims, training)?.status).toBe('unsure');
+    expect(sameCondition(claims, 'filed by contractors')).toBe(false);
+  });
+
+  it('rehearsal: a past mention tied to another condition or subject is not a copy; a plain past value stays historical', () => {
+    const approval = fact('approval');
+    for (const reasonCode of ['different_condition', 'different_subject'] as const) {
+      const r = judgeOutcome(approval, judgement('approval', { sameFact: 'unsure', mention: 'historical', reasonCode, statedValue: '$1,000', quote: 'Until 2019, trips over $1,000 for contractors needed VP approval.' }));
+      expect(r).toEqual({ decision: null, reason: 'not_same_fact' });
+    }
+    const past = judgeOutcome(approval, judgement('approval', { mention: 'historical', reasonCode: 'historical', statedValue: '$1,500', quote: 'The approval limit was $1,500 until 2025.' }));
+    expect(past.decision?.status).toBe('historical');
+  });
+
   it('W2: extra numbers next to the official one are accepted; dates are parsed or unknown', () => {
     const domestic = { value: '60', unit: 'USD' };
     expect(compareValues(domestic, { value: '$60 per day (max 3 days)', unit: null })).toBe('same');

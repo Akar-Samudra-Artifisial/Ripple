@@ -231,6 +231,7 @@ export async function runProposeJob(
         continue;
       }
       if (saved.created) out.created++;
+      if (draft.status !== 'proposed') console.warn('ripple propose: copy not proposed', { changeId: change.id, copyId: copy.id, pageId: copy.pageId, status: draft.status, errorCode: draft.errorCode, method: draft.method });
       if (draft.status === 'proposed') out.proposed++;
       else if (draft.status === 'needs_manual') out.needsManual++;
       else out.failed++;

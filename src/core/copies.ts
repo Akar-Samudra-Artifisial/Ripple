@@ -582,7 +582,8 @@ export function sameCondition(fact: ScanFact, statedCondition: string | null): b
   const distinctive = fact.condition ? distinctiveWords(fact.condition, fact) : [];
   // No condition, or one that is only the fact's own value ("Trips over $2,000"): the copy may not add new words.
   if (distinctive.length === 0) {
-    const known = new Set(normaliseKeyPart(`${fact.subject} ${fact.attribute} ${fact.value} ${fact.unit ?? ''} ${fact.condition ?? ''}`).split(' '));
+    // The fact's own source sentence counts as known: "submitted after the trip ends" repeats it, it does not narrow it.
+    const known = new Set(normaliseKeyPart(`${fact.subject} ${fact.attribute} ${fact.value} ${fact.unit ?? ''} ${fact.condition ?? ''} ${fact.quote ?? ''}`).split(' '));
     const extra = normaliseKeyPart(statedCondition)
       .split(' ')
       .filter((w) => w.length >= 3 && !STOPWORDS.has(w) && !CONDITION_FILLER.has(w) && !/^\d/.test(w) && !stems(w).some((x) => known.has(x)));
@@ -632,6 +633,8 @@ export function judgeOutcome(fact: ScanFact, judged: Judgement, siblings: readon
   if (isSiblingMention(fact, judged, siblings)) return { decision: null, reason: 'sibling_fact' };
   // "sibling_fact" without any sibling in the source: the judge is unsure which fact it is (never dropped, never drift).
   const j: Judgement = judged.reasonCode === 'sibling_fact' && judged.mention === 'current' ? { ...judged, sameFact: 'unsure', reasonCode: 'ambiguous' } : judged;
+  // A past mention the judge ties to another condition or subject is history of something else, not of this fact.
+  if (j.mention === 'historical' && (j.reasonCode === 'different_condition' || j.reasonCode === 'different_subject')) return { decision: null, reason: 'not_same_fact' };
   if (j.sameFact === 'no') {
     // Only the judge's explicit "different_condition" keeps a "no" as unsure; a stated condition alone does not
     // (with different_subject / ambiguous / other the sentence is about something else).

@@ -298,6 +298,15 @@ describe('replaceValueToken / validateRewrite', () => {
     expect(validateRewrite(S3, GOOD_LLM[S3] as string, { value: 'sixty dollars', unit: null }, n, true)).toBe(true);
     expect(validateRewrite(S4, GOOD_LLM[S4] as string, { value: 'sixty USD', unit: null }, n, true)).toBe(false);
     expect(validateRewrite(S1, 'Domestic trips get a per diem of $60 or $75 per day.', o, n, true)).toBe(false);
+    // Rehearsal: the judge stated the copy's value as "$60 per day" (rate inside the value) → the token swap is valid.
+    const d9 = 'No. Meals on domestic trips are covered by the per diem of $60 per day.';
+    const d9New = 'No. Meals on domestic trips are covered by the per diem of $75 per day.';
+    for (const stated of [{ value: '$60 per day', unit: null }, { value: '$60 per day', unit: 'per day' }, { value: '$60', unit: 'per day' }]) {
+      expect(replaceValueToken(d9, stated, n)).toBe(d9New);
+      expect(validateRewrite(d9, d9New, stated, n, true)).toBe(true);
+      expect(validateRewrite(d9, 'No. Meals on international trips are covered by the per diem of $75 per day.', stated, n, true)).toBe(false);
+      expect(validateRewrite(d9, 'Yes. Meals on domestic trips are covered by the per diem of $75 per day.', stated, n, true)).toBe(false);
+    }
     expect(validateRewrite(S1, 'Domestic trips do not get a per diem of $75 per day.', o, n, true)).toBe(false);
     expect(validateRewrite(S1, 'From May, domestic trips pay $75 daily.', o, n, false)).toBe(true);
     expect(validateRewrite(S1, 'From May, domestic trips pay $60 daily.', o, n, false)).toBe(false);

@@ -150,7 +150,11 @@ export function validateRewrite(oldSentence: string, newSentence: string, oldVal
   if (!sameMultiset(without(unitTokens(s), valueUnits), without(unitTokens(oldSentence), valueUnits))) return false;
   const valuePeriodChanged = ratePeriod(`${oldValue.value} ${oldValue.unit ?? ''}`) !== ratePeriod(`${newValue.value} ${newValue.unit ?? ''}`);
   if (!valuePeriodChanged && ratePeriod(s) !== ratePeriod(oldSentence)) return false;
-  const a = without(plainWords(oldSentence), valueWordList(oldValue));
-  const b = without(plainWords(s), valueWordList(newValue));
+  // The value's own words. When value plus unit carry the same words on both sides ("$60 per day" stated as one
+  // value, "$75" with unit "per day"), exactly that list is removed from both sentences, so no other word can change.
+  const unitWords = (v: ValueText): string[] => [...new Set(plainWords(`${v.value} ${v.unit ?? ''}`))];
+  const [oldWords, newWords] = sameMultiset(unitWords(oldValue), unitWords(newValue)) ? [unitWords(oldValue), unitWords(newValue)] : [valueWordList(oldValue), valueWordList(newValue)];
+  const a = without(plainWords(oldSentence), oldWords);
+  const b = without(plainWords(s), newWords);
   return a.length === b.length && a.every((w, i) => w === b[i]);
 }

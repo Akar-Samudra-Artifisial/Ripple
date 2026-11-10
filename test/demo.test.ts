@@ -256,7 +256,7 @@ describe('Nimbus Labs demo content', () => {
     // The 4 drifts stay as agreed.
     const drifts = NIMBUS_PAGES.flatMap((p) => p.mentions.filter((m) => m.status === 'drifted').map((m) => m.quote));
     expect(drifts).toEqual([
-      'Expense claims must be filed within 45 days after the trip ends.',
+      'Expense claims must be submitted within 45 days after the trip ends.',
       'International travel: the per diem is $100 per day.',
       'For domestic customer visits the per diem is $65 per day.',
       'Trips over $2,500 need manager approval before booking.',
