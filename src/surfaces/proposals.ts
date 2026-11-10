@@ -35,6 +35,7 @@ import { MAX_COPY_PAGE_CHARS, valueLabel } from '../core/copies';
 import { quoteInText } from '../core/facts';
 import { storageToText } from '../core/pageText';
 import { MANUAL_CODES, MAX_SENTENCE_CHARS, replaceValueToken, validateRewrite, type ProposalErrorCode, type ProposalMethod, type ValueText } from '../core/proposals';
+import { deadlineState, itemOverdue } from '../core/reminders';
 import { isSqlRateLimited, SchemaSettingUpError } from '../core/schema';
 import { replaceSentence, sentenceCount } from '../core/storageEdit';
 import type {
@@ -272,6 +273,8 @@ export interface ProposalDeps {
   syncIssues?: (changeIds: readonly string[]) => Promise<void>;
   /** M5: issue rows and settings for the Rollout. Absent = not configured. */
   issues?: Pick<ChangeIssueRepo, 'listForChange' | 'getJiraSettings'>;
+  /** M7: today, for the deadline state of the Rollout. Absent = the clock. */
+  now?: () => Date;
   ensure: () => Promise<void>;
 }
 
@@ -710,6 +713,9 @@ export async function listRollout(ctx: SourceContext, payload: Partial<ChangeIdO
         console.warn('ripple rollout: owner names failed', { changeId, owners: ownerIds.length, error: errorText(err) });
       }
     }
+    const now = deps.now?.() ?? new Date();
+    const deadline = change.routing?.deadline ?? null;
+    const state = deadlineState(deadline, now);
     const items: RolloutItem[] = shown.map((p) => {
       const accountId = ownerOf.get(p.pageId) ?? null;
       return {
@@ -720,6 +726,7 @@ export async function listRollout(ctx: SourceContext, payload: Partial<ChangeIdO
         status: p.status,
         errorCode: p.errorCode,
         owner: { accountId, displayName: accountId ? (names.get(accountId) ?? null) : null },
+        overdue: itemOverdue(p.status, state),
       };
     });
     const counts: Rollout['counts'] = {};
@@ -727,13 +734,14 @@ export async function listRollout(ctx: SourceContext, payload: Partial<ChangeIdO
     let issues: Pick<Rollout, 'issues' | 'issuesState'> = { issues: [], issuesState: 'not_configured' };
     if (deps.issues) {
       try {
-        issues = await rolloutIssues(change, rows, names, deps.issues);
+        issues = await rolloutIssues(change, rows, names, deps.issues, now);
       } catch (err) {
         console.warn('ripple rollout: issues failed', { changeId, error: errorText(err) });
         issues = { issues: [], issuesState: 'pending' };
       }
     }
-    return { changeId, items, counts, hiddenCount: rows.length - shown.length, ...issues };
+    const lateCount = items.filter((i) => i.overdue === 'late').length;
+    return { changeId, items, counts, hiddenCount: rows.length - shown.length, deadline, deadlineState: state, lateCount, ...issues };
   });
 }
 

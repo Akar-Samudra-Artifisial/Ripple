@@ -5,6 +5,7 @@ import { sqlErrorInfo } from '../core/schema';
 import { enqueueDiff, handlePageUpdate, runDiffJob } from './changes';
 import { runJudgeJob, runSearchJob, type ScanOutcome } from './copies';
 import { runProposeJob } from './proposals';
+import { runReminderSweep } from './reminders';
 import { runExtractJob } from './sources';
 import { notImplemented } from './stub';
 
@@ -186,7 +187,10 @@ export async function demoJob(): Promise<void> {
   notImplemented(`${DEMO_QUEUE} consumer`);
 }
 
-/** Weekly trigger: reminders for overdue updates and periodic re-scan (P1). */
+/**
+ * Scheduled sweep (`weekly-sweep-trigger`, daily since M7; the key keeps its name): automatic reminders for update
+ * tasks that are due or late. Never throws. The periodic re-scan (P1) is not built.
+ */
 export async function weeklySweep(): Promise<void> {
-  notImplemented('weekly sweep');
+  await runReminderSweep();
 }

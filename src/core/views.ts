@@ -405,7 +405,12 @@ export interface RolloutItem {
   errorCode: string | null;
   /** Owner (or author) of the copy page as the viewer can read it; display name null when unknown. */
   owner: { accountId: string | null; displayName: string | null };
+  /** M7: open proposal past the deadline (`due`) or 3+ working days past it (`late`, "Late" badge); null otherwise. */
+  overdue: 'due' | 'late' | null;
 }
+
+/** M7: `due` from the deadline day, `late` from 3 working days after it (PRD "Tenggat dan pengingat"). */
+export type DeadlineState = 'on_track' | 'due' | 'late';
 
 /** Reply of `getLatestChange`: the most recently confirmed change of the viewed source, or null. */
 export interface LatestChangeReply {
@@ -419,6 +424,11 @@ export interface Rollout {
   items: RolloutItem[];
   counts: Partial<Record<ProposalState, number>>;
   hiddenCount: number;
+  /** M7: deadline of the change (`YYYY-MM-DD`, UTC) and its state today; null without a deadline. */
+  deadline: string | null;
+  deadlineState: DeadlineState | null;
+  /** M7: open proposals the viewer can see that are late. */
+  lateCount: number;
   /** M5: Jira update tasks of this change (one per copy-page owner). */
   issues: RolloutIssue[];
   /**
@@ -438,6 +448,31 @@ export interface RolloutIssue {
   /** `done`: Ripple closed it (every page of the owner updated, declined, superseded or reverted). */
   status: 'open' | 'done';
   pageCount: number;
+  /** M7: open pages of the owner (proposals not applied or rejected). */
+  openPages: number;
+  /** M7: the owner's open pages are past the deadline (`due`) or late; null when on track or done. */
+  overdue: 'due' | 'late' | null;
+  /** M7: last reminder (ISO date-time) and reminders so far (manual and automatic). */
+  remindedAt: string | null;
+  reminderCount: number;
+  /** M7: "Remind" can send now (open task with open pages, no reminder in the last 20 hours). */
+  canRemind: boolean;
+}
+
+/** M7 `remindOwners` payload: one owner's task (`issueKey`) or every open task of the change. */
+export interface RemindOwnersPayload {
+  changeId: string;
+  issueKey?: string;
+}
+
+/** M7 `remindOwners` reply. `skipped`: nothing open, or reminded in the last 20 hours. */
+export interface RemindOwnersResult {
+  changeId: string;
+  reminded: number;
+  skipped: number;
+  failed: number;
+  /** Jira error code of the first failure, else null. */
+  errorCode: string | null;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -565,6 +600,8 @@ export interface ResolverContract {
   approveAll: { payload: undefined; reply: ApproveAllResult };
   /** On the source page: proposals of one of its changes, with its Jira update tasks. */
   listRollout: { payload: ChangeIdOnlyPayload; reply: Rollout };
+  /** M7, on the source page (edit permission): reminder comment on the owners' open Jira tasks; 1 per 20 h each. */
+  remindOwners: { payload: RemindOwnersPayload; reply: RemindOwnersResult };
   /** Ripple settings page (Confluence global settings). */
   getSettings: { payload: undefined; reply: SettingsView };
   /** Jira administrators only; the project must exist and be visible to the app. */

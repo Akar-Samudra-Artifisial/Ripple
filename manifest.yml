@@ -51,7 +51,7 @@ modules:
   scheduledTrigger:
     - key: weekly-sweep-trigger
       function: weekly-sweep
-      interval: week
+      interval: day
   consumer:
     - key: extract-consumer
       queue: extract

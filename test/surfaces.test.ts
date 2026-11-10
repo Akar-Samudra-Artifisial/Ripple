@@ -96,14 +96,17 @@ describe('migrations', () => {
       'v029_change_issues_attempts',
       'v030_change_issues_comment_sent',
       'v031_changes_proposed_at',
+      'v032_change_issues_reminded_at',
+      'v033_change_issues_reminder_count',
+      'v034_change_issues_auto_reminders',
     ]);
-    expect(LATEST_MIGRATION).toBe('v031_changes_proposed_at');
+    expect(LATEST_MIGRATION).toBe('v034_change_issues_auto_reminders');
   });
 });
 
 describe('schemaView', () => {
   it('reports ready, setting up and errors', async () => {
-    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 31, total: 31, latest: LATEST_MIGRATION });
+    expect(await schemaView(async () => undefined)).toEqual({ status: 'ready', applied: 34, total: 34, latest: LATEST_MIGRATION });
     expect(
       await schemaView(async () => {
         throw new SchemaSettingUpError(1, 4);

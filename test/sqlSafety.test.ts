@@ -24,7 +24,7 @@ vi.mock('@forge/sql', () => ({
   },
 }));
 
-import { sqlChangeIssueRepo } from '../src/adapters/changeIssueRepo';
+import { sqlChangeIssueRepo, sqlReminderRepo } from '../src/adapters/changeIssueRepo';
 import { sqlChangeRepo } from '../src/adapters/changeRepo';
 import { MIGRATIONS } from '../src/core/migrations';
 import { sqlProposalRepo } from '../src/adapters/proposalRepo';
@@ -190,6 +190,38 @@ describe('migration identifiers (TiDB rejects unquoted reserved words with ER_PA
     expect(definedIdentifiers(bad)).toEqual(['t', 'id', 'delayed', 'idx_t']);
     expect(definedIdentifiers(bad).filter((n) => RESERVED.has(n))).toEqual(['delayed']);
     for (const m of MIGRATIONS.filter((x) => /^CREATE TABLE/i.test(x.statement.trim()))) expect(definedIdentifiers(m.statement).length, m.name).toBeGreaterThan(2);
+  });
+});
+
+describe('change_issues reminders (M7)', () => {
+  it('claims a reminder with status, cooldown and stage guards; bound values, inline interval', async () => {
+    affected = () => 1;
+    expect(await sqlReminderRepo.claimReminder('ch-1', 'acc-1', null)).toBe(true);
+    expect(calls[0]?.statement).toContain('reminded_at = CURRENT_TIMESTAMP, reminder_count = reminder_count + 1');
+    expect(calls[0]?.statement).toContain("status = 'created' AND issue_key IS NOT NULL");
+    expect(calls[0]?.statement).toContain('(reminded_at IS NULL OR reminded_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 20 HOUR))');
+    expect(calls[0]?.statement).not.toContain('auto_reminders');
+    expect(calls[0]?.params).toEqual(['ch-1', 'acc-1']);
+    expect(await sqlReminderRepo.claimReminder('ch-1', 'acc-1', 2)).toBe(true);
+    expect(calls[1]?.statement).toContain(', auto_reminders = ?');
+    expect(calls[1]?.statement).toMatch(/AND auto_reminders < \?$/);
+    expect(calls[1]?.params).toEqual([2, 'ch-1', 'acc-1', 2]);
+    affected = () => 0;
+    expect(await sqlReminderRepo.claimReminder('ch-1', 'acc-1', null)).toBe(false);
+  });
+
+  it('releases only its own claim and lists open tasks with an inline LIMIT', async () => {
+    await sqlReminderRepo.releaseReminder('ch-1', 'acc-1', { reminderCount: 0, autoReminders: 0 });
+    expect(calls[0]?.statement).toContain('reminded_at = NULL');
+    expect(calls[0]?.statement).toMatch(/AND reminder_count = \?$/);
+    expect(calls[0]?.params).toEqual([0, 0, 'ch-1', 'acc-1', 1]);
+    await sqlReminderRepo.releaseReminder('ch-1', 'acc-1', { reminderCount: 2, autoReminders: 1 });
+    expect(calls[1]?.statement).toContain('DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 21 HOUR)');
+    expect(calls[1]?.params).toEqual([2, 1, 'ch-1', 'acc-1', 3]);
+    await sqlReminderRepo.listOpenIssues();
+    expect(calls[2]?.statement).toContain('reminded_at, reminder_count, auto_reminders');
+    expect(calls[2]?.statement).toMatch(/WHERE status = 'created' AND issue_key IS NOT NULL ORDER BY created_at, change_id LIMIT 200$/);
+    expect(calls[2]?.params).toEqual([]);
   });
 });
 

@@ -5,6 +5,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { MAX_ISSUE_ATTEMPTS, type IssueStatus } from '../core/changeIssues';
+import { REMINDER_COOLDOWN_HOURS } from '../core/reminders';
 import { execute, query } from './sql';
 
 /** A `creating` claim older than this belongs to a job that died; another job may take it over. */
@@ -24,6 +25,10 @@ export interface ChangeIssueRow {
   attempts: number;
   /** The closing comment was posted (not posted again when the transition is retried). */
   commentSent: boolean;
+  /** M7: last reminder (ISO date-time), reminders so far, automatic stage sent (0 none, 1 at deadline, 2 late). */
+  remindedAt?: string | null;
+  reminderCount?: number;
+  autoReminders?: number;
 }
 
 export interface CreatedIssueRef {
@@ -70,9 +75,12 @@ interface IssueDbRow {
   status: string;
   attempts: number | string | null;
   comment_sent: number | boolean | null;
+  reminded_at?: unknown;
+  reminder_count?: number | string | null;
+  auto_reminders?: number | string | null;
 }
 
-const COLUMNS = 'change_id, owner_account_id, source_page_id, issue_id, issue_key, issue_url, assignee_set, page_count, status, attempts, comment_sent';
+const COLUMNS = 'change_id, owner_account_id, source_page_id, issue_id, issue_key, issue_url, assignee_set, page_count, status, attempts, comment_sent, reminded_at, reminder_count, auto_reminders';
 const flag = (v: number | boolean | null): boolean => v === true || Number(v) === 1;
 const STATUSES: readonly IssueStatus[] = ['creating', 'created', 'failed', 'closed'];
 
@@ -88,7 +96,16 @@ const toRow = (r: IssueDbRow): ChangeIssueRow => ({
   status: (STATUSES as readonly string[]).includes(r.status) ? (r.status as IssueStatus) : 'failed',
   attempts: Number(r.attempts ?? 0) || 0,
   commentSent: flag(r.comment_sent),
+  remindedAt: isoOf(r.reminded_at),
+  reminderCount: Number(r.reminder_count ?? 0) || 0,
+  autoReminders: Number(r.auto_reminders ?? 0) || 0,
 });
+
+function isoOf(v: unknown): string | null {
+  if (v === null || v === undefined || v === '') return null;
+  const d = v instanceof Date ? v : new Date(String(v));
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
 
 const SETTINGS_KEY = 'jira';
 export const PROJECT_KEY = /^[A-Z][A-Z0-9_]{1,9}$/;
@@ -180,5 +197,59 @@ export const sqlChangeIssueRepo: ChangeIssueRepo = {
       return;
     }
     await execute('INSERT INTO settings (k, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = VALUES(v)', SETTINGS_KEY, JSON.stringify({ projectKey: settings.projectKey }));
+  },
+};
+
+/** M7: open update tasks read by one reminder sweep. */
+export const SWEEP_ISSUES_READ = 200;
+
+/** M7: reminder bookkeeping on `change_issues` (separate from `ChangeIssueRepo`, which the M5 fakes implement). */
+export interface ReminderRepo {
+  /**
+   * Claims a reminder for the owner's open task: true for one caller only, when the task is `created` and was not
+   * reminded in the last `REMINDER_COOLDOWN_HOURS`. `autoStage` (automatic reminders) also needs a lower stage sent so
+   * far and records it; null = manual.
+   */
+  claimReminder(changeId: string, ownerAccountId: string, autoStage: number | null): Promise<boolean>;
+  /**
+   * The reminder could not be posted: the claim is undone (count and stage back to `previous`, the cooldown no longer
+   * blocks), only while no other reminder was claimed since.
+   */
+  releaseReminder(changeId: string, ownerAccountId: string, previous: { reminderCount: number; autoReminders: number }): Promise<void>;
+  /** `created` tasks with an issue key, oldest first, at most `SWEEP_ISSUES_READ`. */
+  listOpenIssues(): Promise<ChangeIssueRow[]>;
+}
+
+export const sqlReminderRepo: ReminderRepo = {
+  async claimReminder(changeId, ownerAccountId, autoStage) {
+    const stage = autoStage === null ? null : Math.max(1, Math.min(9, Math.trunc(autoStage)));
+    const n = await execute(
+      `UPDATE change_issues SET reminded_at = CURRENT_TIMESTAMP, reminder_count = reminder_count + 1${stage === null ? '' : ', auto_reminders = ?'}
+       WHERE change_id = ? AND owner_account_id = ? AND status = 'created' AND issue_key IS NOT NULL
+         AND (reminded_at IS NULL OR reminded_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL ${REMINDER_COOLDOWN_HOURS} HOUR))${stage === null ? '' : ' AND auto_reminders < ?'}`,
+      ...(stage === null ? [changeId, ownerAccountId] : [stage, changeId, ownerAccountId, stage]),
+    );
+    return n > 0;
+  },
+
+  async releaseReminder(changeId, ownerAccountId, previous) {
+    // No reminder before: reminded_at back to NULL; else just past the cooldown (the failed one was never posted, so a
+    // retry may go out now).
+    const count = Math.max(0, Math.trunc(previous.reminderCount));
+    await execute(
+      `UPDATE change_issues SET reminded_at = ${count === 0 ? 'NULL' : `DATE_SUB(CURRENT_TIMESTAMP, INTERVAL ${REMINDER_COOLDOWN_HOURS + 1} HOUR)`},
+         reminder_count = ?, auto_reminders = ?
+       WHERE change_id = ? AND owner_account_id = ? AND reminder_count = ?`,
+      count,
+      Math.max(0, Math.trunc(previous.autoReminders)),
+      changeId,
+      ownerAccountId,
+      count + 1,
+    );
+  },
+
+  async listOpenIssues() {
+    const rows = await query<IssueDbRow>(`SELECT ${COLUMNS} FROM change_issues WHERE status = 'created' AND issue_key IS NOT NULL ORDER BY created_at, change_id LIMIT ${SWEEP_ISSUES_READ}`);
+    return rows.map(toRow);
   },
 };

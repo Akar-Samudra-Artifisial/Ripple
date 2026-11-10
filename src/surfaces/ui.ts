@@ -12,7 +12,8 @@ import type { ApproveProposalPayload, ChangeIdOnlyPayload, ProposalIdPayload } f
 import type { BylineStatus, ChangeIdPayload, ConfirmChangePayload, CopyListPayload, PendingChangeFlag, FactEditPayload, FactIdPayload, OwnerView, SchemaView, SpaceTeamsView } from '../core/views';
 import { confirmFact, editFact, getSourceStatus, listFacts, markSource, rejectFact, unmarkSource, type SourceContext } from './sources';
 import { getApproval, getSettings, saveSettings, type ApprovalContext, type SettingsContext } from './changeIssues';
-import type { CheckDemoOwnersPayload, LoadDemoPayload, SaveSettingsPayload } from '../core/views';
+import type { CheckDemoOwnersPayload, LoadDemoPayload, RemindOwnersPayload, SaveSettingsPayload } from '../core/views';
+import { remindOwners } from './reminders';
 import { checkDemoOwners, getDemoStatus, loadDemoData, removeDemoData } from './demo';
 
 export type ResolverContext = {
@@ -164,6 +165,8 @@ resolver.define('rejectProposal', ({ context, payload }) => rejectProposal(conte
 resolver.define('markNotSameFact', ({ context, payload }) => markNotSameFact(context as SourceContext, payload as Partial<ProposalIdPayload>));
 resolver.define('approveAll', ({ context }) => approveAll(context as SourceContext));
 resolver.define('listRollout', ({ context, payload }) => listRollout(context as SourceContext, payload as Partial<ChangeIdOnlyPayload>));
+// M7: "Remind" on the Rollout (edit permission on the source; one reminder per task per 20 hours).
+resolver.define('remindOwners', ({ context, payload }) => remindOwners(context as SourceContext, payload as Partial<RemindOwnersPayload>));
 // M5: Jira project for update tasks (Confluence global settings) and the read-only Jira issue panel.
 resolver.define('getSettings', ({ context }) => getSettings(context as SettingsContext));
 resolver.define('saveSettings', ({ context, payload }) => saveSettings(context as SettingsContext, payload as Partial<SaveSettingsPayload>));

@@ -13,9 +13,10 @@ import { sqlFactSearch, type FactSearchRepo, type FoundFact } from '../adapters/
 import { sqlScanRepo, type ScanRepo } from '../adapters/scanRepo';
 import { ensureSchema } from '../adapters/sql';
 import { scrubErrorText } from '../adapters/teamworkGraph';
+import { deadlineState, itemOverdue } from '../core/reminders';
 import { SchemaSettingUpError } from '../core/schema';
 import { valueLabel } from '../core/valueLabel';
-import type { CopyStatus, CopyView, ProposalState } from '../core/views';
+import type { CopyStatus, CopyView, DeadlineState, ProposalState } from '../core/views';
 import { notImplemented, type NotImplemented } from './stub';
 
 export const ACTIONS = ['get-fact', 'find-copies', 'list-out-of-date', 'propose-updates', 'rollout-status'] as const;
@@ -108,7 +109,7 @@ export interface OutOfDateAnswer {
 export interface RolloutAnswer {
   status: 'found' | 'not_found' | 'error';
   message: string;
-  rollouts: { fact: ActionFact; deadline: string | null; counts: Partial<Record<ProposalState, number>>; hiddenCount: number }[];
+  rollouts: { fact: ActionFact; deadline: string | null; deadlineState: DeadlineState | null; lateCount: number; counts: Partial<Record<ProposalState, number>>; hiddenCount: number }[];
 }
 
 export interface ActionDeps {
@@ -120,6 +121,8 @@ export interface ActionDeps {
   visible: (pageIds: readonly string[]) => Promise<Set<string>>;
   /** Absolute links as the app; only called for pages the user can read. */
   link: (pageId: string) => Promise<AppPageLink | null>;
+  /** Today, for the deadline state. Absent = the clock. */
+  now?: () => Date;
   ensure: () => Promise<void>;
 }
 
@@ -278,8 +281,12 @@ export async function rolloutStatus(payload: ActionPayload | undefined, deps: Ac
     const rows = await deps.proposals.listForChange(change.id);
     const seen = rows.length > 0 ? await deps.visible([...new Set(rows.map((r) => r.pageId))]) : new Set<string>();
     const counts: Partial<Record<ProposalState, number>> = {};
-    for (const r of rows.filter((x) => seen.has(x.pageId))) counts[r.status] = (counts[r.status] ?? 0) + 1;
-    rollouts.push({ fact: l.view, deadline: change.routing?.deadline ?? null, counts, hiddenCount: rows.filter((x) => !seen.has(x.pageId)).length });
+    const shown = rows.filter((x) => seen.has(x.pageId));
+    for (const r of shown) counts[r.status] = (counts[r.status] ?? 0) + 1;
+    const deadline = change.routing?.deadline ?? null;
+    const state = deadlineState(deadline, deps.now?.() ?? new Date());
+    const lateCount = shown.filter((r) => itemOverdue(r.status, state) === 'late').length;
+    rollouts.push({ fact: l.view, deadline, deadlineState: state, lateCount, counts, hiddenCount: rows.length - shown.length });
   }
   console.info('ripple fact keeper', { action: 'rollout-status', words, facts: found.length, rollouts: rollouts.length });
   if (found.length === 0) return { status: 'not_found', message: NOT_FOUND, rollouts: [] };

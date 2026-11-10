@@ -479,7 +479,7 @@ describe('proposal resolvers', () => {
       ],
     };
     const rollout = (await listRollout(ctx(SOURCE), { changeId: CHANGE_ID }, deps({ issues }))) as Rollout;
-    expect(rollout.issues).toEqual([{ ownerName: null, issueKey: 'OPS-1', issueUrl: 'https://x/browse/OPS-1', status: 'done', pageCount: 1 }]);
+    expect(rollout.issues).toEqual([{ ownerName: null, issueKey: 'OPS-1', issueUrl: 'https://x/browse/OPS-1', status: 'done', pageCount: 1, openPages: 0, overdue: null, remindedAt: null, reminderCount: 0, canRemind: false }]);
   });
 });
 

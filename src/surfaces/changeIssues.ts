@@ -30,6 +30,7 @@ import {
   type IssuesState,
 } from '../core/changeIssues';
 import { valueLabel } from '../core/copies';
+import { deadlineState, isOpenProposal, REMINDER_COOLDOWN_HOURS } from '../core/reminders';
 import { SchemaSettingUpError } from '../core/schema';
 import { adminErrorCode, type AdminCheck, type ApprovalView, type ErrorReply, type RolloutIssue, type SaveSettingsPayload, type SaveSettingsResult, type SettingsView } from '../core/views';
 
@@ -67,7 +68,8 @@ export const defaultIssueDeps: IssueDeps = {
 
 export type CreateIssuesOutcome = { status: 'not_configured' } | { status: 'skipped'; reason: string } | { status: 'done'; created: number; failed: number; skipped: number; unowned: number };
 
-const owned = (change: ChangeRow, owner: string): Set<string> => new Set((change.routing?.pages ?? []).filter((p) => p.ownerAccountId === owner).map((p) => p.pageId));
+/** Copy pages of the change routed to this owner. */
+export const owned = (change: ChangeRow, owner: string): Set<string> => new Set((change.routing?.pages ?? []).filter((p) => p.ownerAccountId === owner).map((p) => p.pageId));
 
 /** Fact lines for the proposals on these pages (label from the stored fact, values as the change states them). */
 async function factLines(deps: IssueDeps, change: ChangeRow, rows: readonly ProposalRow[]): Promise<IssueFact[]> {
@@ -340,12 +342,31 @@ export async function rolloutIssues(
   proposals: readonly ProposalRow[],
   names: ReadonlyMap<string, string>,
   repo: Pick<ChangeIssueRepo, 'listForChange' | 'getJiraSettings'> = sqlChangeIssueRepo,
+  now: Date = new Date(),
 ): Promise<{ issues: RolloutIssue[]; issuesState: IssuesState }> {
   const [rows, settings] = await Promise.all([repo.listForChange(change.id), repo.getJiraSettings()]);
   const expected = groupByOwner(change.routing?.pages ?? [], proposals).groups.map((g) => g.ownerAccountId);
+  const state = deadlineState(change.routing?.deadline, now);
   const issues = rows
     .filter((r): r is ChangeIssueRow & { issueKey: string } => r.issueKey !== null && (r.status === 'created' || r.status === 'closed'))
-    .map((r) => ({ ownerName: names.get(r.ownerAccountId) ?? null, issueKey: r.issueKey, issueUrl: r.issueUrl, status: r.status === 'closed' ? ('done' as const) : ('open' as const), pageCount: r.pageCount }));
+    .map((r): RolloutIssue => {
+      const pages = owned(change, r.ownerAccountId);
+      const openPages = r.status === 'created' ? new Set(proposals.filter((p) => pages.has(p.pageId) && isOpenProposal(p.status)).map((p) => p.pageId)).size : 0;
+      const remindedAt = r.remindedAt ?? null;
+      const cooled = remindedAt === null || now.getTime() - new Date(remindedAt).getTime() >= REMINDER_COOLDOWN_HOURS * 3600 * 1000;
+      return {
+        ownerName: names.get(r.ownerAccountId) ?? null,
+        issueKey: r.issueKey,
+        issueUrl: r.issueUrl,
+        status: r.status === 'closed' ? 'done' : 'open',
+        pageCount: r.pageCount,
+        openPages,
+        overdue: openPages > 0 && (state === 'due' || state === 'late') ? state : null,
+        remindedAt,
+        reminderCount: r.reminderCount ?? 0,
+        canRemind: r.status === 'created' && openPages > 0 && cooled,
+      };
+    });
   // A change confirmed before a project was set never gets issues: shown as "not configured", not as pending.
   return { issues, issuesState: issuesState(settings !== undefined && !!change.routing?.jiraProjectKey, rows, expected) };
 }

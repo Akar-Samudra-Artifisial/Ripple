@@ -292,6 +292,11 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
   { name: 'v030_change_issues_comment_sent', statement: 'ALTER TABLE change_issues ADD COLUMN IF NOT EXISTS comment_sent TINYINT(1) NOT NULL DEFAULT 0' },
   // M5 fix: when a full propose job of a confirmed change finished; Jira issues (and the heal for them) wait for it.
   { name: 'v031_changes_proposed_at', statement: 'ALTER TABLE changes ADD COLUMN IF NOT EXISTS proposed_at TIMESTAMP NULL' },
+  // M7: reminders on the owner's update task: when the last one went out, how many so far (manual and automatic) and
+  // which automatic stage was sent (1 = at the deadline, 2 = late), so the daily sweep sends each stage once.
+  { name: 'v032_change_issues_reminded_at', statement: 'ALTER TABLE change_issues ADD COLUMN IF NOT EXISTS reminded_at TIMESTAMP NULL' },
+  { name: 'v033_change_issues_reminder_count', statement: 'ALTER TABLE change_issues ADD COLUMN IF NOT EXISTS reminder_count INT NOT NULL DEFAULT 0' },
+  { name: 'v034_change_issues_auto_reminders', statement: 'ALTER TABLE change_issues ADD COLUMN IF NOT EXISTS auto_reminders INT NOT NULL DEFAULT 0' },
 ];
 
 /** Name of the newest migration; the byline reports it so admins can confirm the schema is current. */

@@ -94,6 +94,7 @@ beforeEach(() => {
     },
     visible: vi.fn(async (ids: readonly string[]) => new Set(ids.filter((id) => READABLE.has(id)))),
     link: vi.fn(async (id: string) => ({ title: 'Travel Policy', url: `https://site.atlassian.net/wiki/spaces/NLHR/pages/${id}/Travel+Policy`, idUrl: `https://site.atlassian.net/wiki/pages/viewpage.action?pageId=${id}` })),
+    now: () => new Date('2026-11-25T09:00:00Z'),
     ensure: vi.fn(async () => undefined),
   };
 });
@@ -157,7 +158,7 @@ describe('M7 Rovo Fact Keeper', () => {
 
   it('rollout-status counts only readable pages and gives the deadline', async () => {
     const r = await run('rollout-status', { topic: 'domestic per diem' });
-    expect(r).toMatchObject({ status: 'found', rollouts: [{ deadline: '2026-11-20', counts: { applied: 1, proposed: 1 }, hiddenCount: 1 }] });
+    expect(r).toMatchObject({ status: 'found', rollouts: [{ deadline: '2026-11-20', deadlineState: 'late', lateCount: 1, counts: { applied: 1, proposed: 1 }, hiddenCount: 1 }] });
     expect(await run('rollout-status', { topic: 'international per diem' })).toMatchObject({ status: 'not_found' });
   });
 
