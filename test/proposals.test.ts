@@ -306,6 +306,9 @@ describe('replaceValueToken / validateRewrite', () => {
       expect(validateRewrite(d9, d9New, stated, n, true)).toBe(true);
       expect(validateRewrite(d9, 'No. Meals on international trips are covered by the per diem of $75 per day.', stated, n, true)).toBe(false);
       expect(validateRewrite(d9, 'Yes. Meals on domestic trips are covered by the per diem of $75 per day.', stated, n, true)).toBe(false);
+      // A model rewrite that changes any other word ("per" → "each", "covered" → "paid") is still rejected.
+      expect(validateRewrite(d9, 'No. Meals on domestic trips are covered by the per diem of $75 each day.', stated, n, true)).toBe(false);
+      expect(validateRewrite(d9, 'No. Meals on domestic trips are paid by the per diem of $75 per day.', stated, n, true)).toBe(false);
     }
     expect(validateRewrite(S1, 'Domestic trips do not get a per diem of $75 per day.', o, n, true)).toBe(false);
     expect(validateRewrite(S1, 'From May, domestic trips pay $75 daily.', o, n, false)).toBe(true);

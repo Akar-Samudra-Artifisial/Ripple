@@ -1044,14 +1044,33 @@ describe('M2 review: judging rules', () => {
     // Words the source sentence does not use still narrow the fact.
     const training = judgement('claims', { sameFact: 'unsure', reasonCode: 'value_differs', statedValue: '45 days', statedUnit: 'days', statedCondition: 'External training', quote: 'External training claims must be submitted within 45 days after the trip ends.' });
     expect(decideStatus(claims, training)?.status).toBe('unsure');
-    expect(sameCondition(claims, 'filed by contractors')).toBe(false);
+    expect(sameCondition(claims, 'filed by contractors', [])).toBe(false);
+  });
+
+  it('review: the source sentence counts only without siblings (multi-clause sentence, sibling condition)', () => {
+    const quote = 'Domestic travel is $60 per day and international travel is $90 per day.';
+    const general: ScanFact = { id: 'g', type: fact('domestic').type, subject: 'Per diem', attribute: 'Daily amount', value: '$60', unit: 'per day', condition: null, previousValue: null, quote };
+    const intl: ScanFact = { ...general, id: 'i', value: '$90', condition: 'international travel' };
+    for (const [statedValue, statedCondition] of [['$100', 'international travel'], ['$45', 'international travel'], ['$100', 'international trips']] as const) {
+      const j: Judgement = { factId: 'g', sameFact: 'unsure', mention: 'current', reasonCode: 'value_differs', statedValue, statedUnit: 'per day', statedCondition, quote: `The per diem for international travel is ${statedValue} per day.` };
+      expect(sameCondition(general, statedCondition, [intl])).toBe(false);
+      expect(decideStatus(general, j, [intl])?.status, `${statedValue} ${statedCondition}`).not.toBe('drifted');
+      // No sibling list (page-level checks) → the sentence is not used either.
+      expect(sameCondition(general, statedCondition)).toBe(false);
+    }
+    // The claims fact has no siblings: C9 stays drift.
+    const claims = fact('claims');
+    const c9 = judgement('claims', { sameFact: 'unsure', reasonCode: 'value_differs', statedValue: '45 days', statedUnit: 'days', statedCondition: 'submitted after the trip ends', quote: 'Expense claims must be submitted within 45 days after the trip ends.' });
+    expect(decideStatus(claims, c9, siblingsOf(claims, FACTS))?.status).toBe('drifted');
   });
 
   it('rehearsal: a past mention tied to another condition or subject is not a copy; a plain past value stays historical', () => {
     const approval = fact('approval');
     for (const reasonCode of ['different_condition', 'different_subject'] as const) {
-      const r = judgeOutcome(approval, judgement('approval', { sameFact: 'unsure', mention: 'historical', reasonCode, statedValue: '$1,000', quote: 'Until 2019, trips over $1,000 for contractors needed VP approval.' }));
-      expect(r).toEqual({ decision: null, reason: 'not_same_fact' });
+      for (const sameFact of ['yes', 'unsure', 'no'] as const) {
+        const r = judgeOutcome(approval, judgement('approval', { sameFact, mention: 'historical', reasonCode, statedValue: '$1,000', quote: 'Until 2019, trips over $1,000 for contractors needed VP approval.' }));
+        expect(r, `${reasonCode} ${sameFact}`).toEqual({ decision: null, reason: 'not_same_fact' });
+      }
     }
     const past = judgeOutcome(approval, judgement('approval', { mention: 'historical', reasonCode: 'historical', statedValue: '$1,500', quote: 'The approval limit was $1,500 until 2025.' }));
     expect(past.decision?.status).toBe('historical');

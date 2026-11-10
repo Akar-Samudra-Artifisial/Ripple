@@ -575,15 +575,18 @@ const stems = (w: string): string[] => [w, w.replace(/s$/, ''), `${w}s`];
 /**
  * Same condition, or the copy states none. When both are stated: false when they share no distinctive word. When
  * the source fact has no condition: false when the copy narrows it to something new ("External training"), using
- * only words that are not already part of the fact.
+ * only words that are not already part of the fact. Words of the fact's own source sentence count as part of it only
+ * when `siblings` (same subject and attribute, see `siblingsOf`) is given and empty: a multi-clause sentence ("Domestic
+ * … $60 and international … $90") would otherwise make a sibling's condition look like this fact's.
  */
-export function sameCondition(fact: ScanFact, statedCondition: string | null): boolean {
+export function sameCondition(fact: ScanFact, statedCondition: string | null, siblings?: readonly ScanFact[]): boolean {
   if (!statedCondition) return true;
   const distinctive = fact.condition ? distinctiveWords(fact.condition, fact) : [];
   // No condition, or one that is only the fact's own value ("Trips over $2,000"): the copy may not add new words.
   if (distinctive.length === 0) {
-    // The fact's own source sentence counts as known: "submitted after the trip ends" repeats it, it does not narrow it.
-    const known = new Set(normaliseKeyPart(`${fact.subject} ${fact.attribute} ${fact.value} ${fact.unit ?? ''} ${fact.condition ?? ''} ${fact.quote ?? ''}`).split(' '));
+    // Without siblings the fact's own source sentence is known too: "submitted after the trip ends" repeats it.
+    const ownSentence = siblings !== undefined && !siblings.some((s) => s.id !== fact.id) ? (fact.quote ?? '') : '';
+    const known = new Set(normaliseKeyPart(`${fact.subject} ${fact.attribute} ${fact.value} ${fact.unit ?? ''} ${fact.condition ?? ''} ${ownSentence}`).split(' '));
     const extra = normaliseKeyPart(statedCondition)
       .split(' ')
       .filter((w) => w.length >= 3 && !STOPWORDS.has(w) && !CONDITION_FILLER.has(w) && !/^\d/.test(w) && !stems(w).some((x) => known.has(x)));
@@ -619,7 +622,7 @@ export type NotCopyReason = 'not_same_fact' | 'example' | 'value_not_comparable'
 function isSiblingMention(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[]): boolean {
   // The judge's own "sibling_fact" counts only when the source really has a sibling (see `judgeOutcome` otherwise).
   if (j.reasonCode === 'sibling_fact') return siblings.some((s) => s.id !== fact.id);
-  if (!j.statedCondition || sameCondition(fact, j.statedCondition)) return false;
+  if (!j.statedCondition || sameCondition(fact, j.statedCondition, siblings)) return false;
   return siblings.some((s) => s.id !== fact.id && s.condition !== null && sameCondition(s, j.statedCondition));
 }
 
@@ -643,7 +646,7 @@ export function judgeOutcome(fact: ScanFact, judged: Judgement, siblings: readon
       return { decision: null, reason: 'not_same_fact' };
     }
     // Same topic, another condition: unsure, also when the judge named no condition.
-    if (sameCondition(fact, j.statedCondition)) return { decision: { status: 'unsure', reason: 'Same topic under a different condition; please check.' } };
+    if (sameCondition(fact, j.statedCondition, siblings)) return { decision: { status: 'unsure', reason: 'Same topic under a different condition; please check.' } };
   }
   const decision = statusOf(fact, j, siblings);
   return decision ? { decision } : { decision: null, reason: 'value_not_comparable' };
@@ -717,7 +720,7 @@ function safeValueDiffers(fact: ScanFact, j: Judgement): boolean {
 
 function statusOf(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[]): CopyDecision | null {
   if (j.mention === 'historical') return { status: 'historical', reason: 'Past value (historical mention); not checked.' };
-  if (!sameCondition(fact, j.statedCondition)) {
+  if (!sameCondition(fact, j.statedCondition, siblings)) {
     return { status: 'unsure', reason: fact.condition ? `Different condition: "${j.statedCondition}" vs "${fact.condition}".` : `Only for "${j.statedCondition}"; the source has no condition.` };
   }
   const cmp = compareValues({ value: fact.value, unit: fact.unit }, { value: j.statedValue, unit: j.statedUnit });
