@@ -1,6 +1,6 @@
 # Ripple Privacy Policy
 
-Draft (M0). Ripple is an Atlassian Forge app for Confluence (required) and Jira (optional), built for Atlassian
+Draft (M7). Ripple is an Atlassian Forge app for Confluence (required) and Jira (optional), built for Atlassian
 Codegeist 2026.
 
 ## Where the app runs
@@ -55,5 +55,21 @@ and an audit trail of who confirmed, approved or rejected what and when.
   A page whose parent is a folder (or another non-page) also counts as restricted: reading folders needs
   `read:folder:confluence`, which Ripple does not request. Each check has a time budget; when it runs out the page
   counts as restricted too.
-- **Teamwork Graph, read-only** (`read:graph:*`): page owners/contributors and the team linked to a space, used to
-  route update tasks. Nothing is written to the graph.
+- **Teamwork Graph, read-only** (`read:graph:*`): the team linked to a space (`atlassianTeamsBySpace`), read as the
+  viewing user and shown with update tasks. Page owners come from Confluence REST, not from the graph. Nothing is
+  written to the graph.
+
+## Reminders
+
+When a Jira project is set, Ripple reminds copy owners on their update task: when the source page's editor presses
+"Remind owners", and automatically from a daily check when the deadline arrives and again when the updates are late.
+A reminder is a Jira comment posted as the app that @mentions the owner (account id) and says how many pages are
+still open and the deadline. Ripple stores per task when the last reminder went out and how many were sent. It does
+not escalate to anyone else.
+
+## Rovo agent (Fact Keeper)
+
+The Fact Keeper agent answers from confirmed facts of source pages the asking user can read (searched as that
+user), and lists copies only on pages they can read. Its actions only read: it does not edit pages or create Jira
+issues, and for proposing updates it points to the source page in Confluence. Ripple stores nothing extra for the
+agent; its logs carry the action, ids and counts only.

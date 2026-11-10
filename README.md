@@ -5,8 +5,21 @@ Ripple extracts its facts, finds every page that restates them, and when a fact 
 one Jira task with ready-made edits to approve. Built on Forge (Confluence, Jira, Forge SQL, Forge LLM, Teamwork
 Graph, Rovo).
 
-Status: **M0** — foundation only. The byline shows "Ripple is ready", the database setup progress and the space's
-owning team via Teamwork Graph; every other module is declared and answers "not implemented".
+Status: **M7** on `development`. Built:
+
+- Fact extraction on the source page, confirmed by its owner.
+- Copy scan in Confluence (CQL) with a Forge LLM judge: in sync, out of date, unsure or historical.
+- Change detection on page update, confirmed in a dialog.
+- Routing: page owner from Confluence REST v2 (`ownerId`/`authorId`, names from users bulk), the space's team from
+  Teamwork Graph `atlassianTeamsBySpace` (as the user).
+- Proposed edits (deterministic value replacement, Forge LLM fallback), approved and applied as the user.
+- One Jira issue per owner per change (project set in Settings), moved to Done when the owner's pages are handled.
+- Rollout with deadline, Late badge, "Remind owners" and automatic reminders (daily check) as Jira comments.
+- Rovo agent Fact Keeper (read-only actions; only sources the user can read).
+- Settings (Jira admins): Jira project, Nimbus Labs demo data (load / remove).
+
+Not built: page owners/contributors from Teamwork Graph, escalation to space admins, edits by the Rovo agent,
+copies in Jira / JSM.
 
 ## Permissions
 
