@@ -200,56 +200,92 @@ export const sqlChangeIssueRepo: ChangeIssueRepo = {
   },
 };
 
-/** M7: open update tasks read by one reminder sweep. */
+/** M7: open update tasks read per page of the reminder sweep (keyset paging on the primary key). */
 export const SWEEP_ISSUES_READ = 200;
+/** M7: a reminder claim older than this belongs to a run that was cut off (functions stop after 900 s). */
+export const REMINDER_CLAIM_STALE_SECONDS = 16 * 60;
 
-/** M7: reminder bookkeeping on `change_issues` (separate from `ChangeIssueRepo`, which the M5 fakes implement). */
+/** Keyset cursor of `listOpenIssues`: the last row of the previous page. */
+export interface IssueCursor {
+  changeId: string;
+  ownerAccountId: string;
+}
+
+/**
+ * M7: reminder bookkeeping on `change_issues` (separate from `ChangeIssueRepo`, which the M5 fakes implement). Two
+ * steps: `claimReminder` before the Jira comment, `confirmReminder` after it was posted (only then the time, count and
+ * stage are recorded); `releaseReminder` when it was not posted. A claim left by a cut-off run goes stale.
+ */
 export interface ReminderRepo {
   /**
-   * Claims a reminder for the owner's open task: true for one caller only, when the task is `created` and was not
-   * reminded in the last `REMINDER_COOLDOWN_HOURS`. `autoStage` (automatic reminders) also needs a lower stage sent so
-   * far and records it; null = manual.
+   * A claim token when this caller may post a reminder now: the task is `created`, was not reminded in the last
+   * `REMINDER_COOLDOWN_HOURS` and holds no fresh claim; `autoStage` (automatic) also needs a lower stage sent so far.
+   * Null = manual. Null reply = someone else has it, or it is not due.
    */
-  claimReminder(changeId: string, ownerAccountId: string, autoStage: number | null): Promise<boolean>;
-  /**
-   * The reminder could not be posted: the claim is undone (count and stage back to `previous`, the cooldown no longer
-   * blocks), only while no other reminder was claimed since.
-   */
-  releaseReminder(changeId: string, ownerAccountId: string, previous: { reminderCount: number; autoReminders: number }): Promise<void>;
-  /** `created` tasks with an issue key, oldest first, at most `SWEEP_ISSUES_READ`. */
-  listOpenIssues(): Promise<ChangeIssueRow[]>;
+  claimReminder(changeId: string, ownerAccountId: string, autoStage: number | null): Promise<string | null>;
+  /** The comment was posted: records the time, one more reminder and the automatic stage; only with the claim token. */
+  confirmReminder(changeId: string, ownerAccountId: string, token: string, autoStage: number | null): Promise<boolean>;
+  /** The comment was not posted: drops the claim (nothing recorded), only with the claim token. */
+  releaseReminder(changeId: string, ownerAccountId: string, token: string): Promise<void>;
+  /** The Jira issue is already done: the task is closed locally (no closing comment), the claim dropped. */
+  closeDone(changeId: string, ownerAccountId: string, token: string): Promise<boolean>;
+  /** `created` tasks with an issue key after `after`, in primary-key order, at most `SWEEP_ISSUES_READ`. */
+  listOpenIssues(after?: IssueCursor): Promise<ChangeIssueRow[]>;
 }
+
+const stageOf = (s: number): number => Math.max(1, Math.min(9, Math.trunc(s)));
 
 export const sqlReminderRepo: ReminderRepo = {
   async claimReminder(changeId, ownerAccountId, autoStage) {
-    const stage = autoStage === null ? null : Math.max(1, Math.min(9, Math.trunc(autoStage)));
+    const stage = autoStage === null ? null : stageOf(autoStage);
+    const token = randomUUID();
     const n = await execute(
-      `UPDATE change_issues SET reminded_at = CURRENT_TIMESTAMP, reminder_count = reminder_count + 1${stage === null ? '' : ', auto_reminders = ?'}
+      `UPDATE change_issues SET reminder_claim = ?, reminder_claimed_at = CURRENT_TIMESTAMP
        WHERE change_id = ? AND owner_account_id = ? AND status = 'created' AND issue_key IS NOT NULL
-         AND (reminded_at IS NULL OR reminded_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL ${REMINDER_COOLDOWN_HOURS} HOUR))${stage === null ? '' : ' AND auto_reminders < ?'}`,
-      ...(stage === null ? [changeId, ownerAccountId] : [stage, changeId, ownerAccountId, stage]),
+         AND (reminded_at IS NULL OR reminded_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL ${REMINDER_COOLDOWN_HOURS} HOUR))
+         AND (reminder_claim IS NULL OR reminder_claimed_at IS NULL OR reminder_claimed_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL ${REMINDER_CLAIM_STALE_SECONDS} SECOND))${stage === null ? '' : ' AND auto_reminders < ?'}`,
+      token,
+      changeId,
+      ownerAccountId,
+      ...(stage === null ? [] : [stage]),
+    );
+    return n > 0 ? token : null;
+  },
+
+  async confirmReminder(changeId, ownerAccountId, token, autoStage) {
+    const stage = autoStage === null ? null : stageOf(autoStage);
+    const n = await execute(
+      `UPDATE change_issues SET reminded_at = CURRENT_TIMESTAMP, reminder_count = reminder_count + 1${stage === null ? '' : ', auto_reminders = GREATEST(auto_reminders, ?)'},
+         reminder_claim = NULL, reminder_claimed_at = NULL
+       WHERE change_id = ? AND owner_account_id = ? AND reminder_claim = ?`,
+      ...(stage === null ? [] : [stage]),
+      changeId,
+      ownerAccountId,
+      token,
     );
     return n > 0;
   },
 
-  async releaseReminder(changeId, ownerAccountId, previous) {
-    // No reminder before: reminded_at back to NULL; else just past the cooldown (the failed one was never posted, so a
-    // retry may go out now).
-    const count = Math.max(0, Math.trunc(previous.reminderCount));
-    await execute(
-      `UPDATE change_issues SET reminded_at = ${count === 0 ? 'NULL' : `DATE_SUB(CURRENT_TIMESTAMP, INTERVAL ${REMINDER_COOLDOWN_HOURS + 1} HOUR)`},
-         reminder_count = ?, auto_reminders = ?
-       WHERE change_id = ? AND owner_account_id = ? AND reminder_count = ?`,
-      count,
-      Math.max(0, Math.trunc(previous.autoReminders)),
-      changeId,
-      ownerAccountId,
-      count + 1,
-    );
+  async releaseReminder(changeId, ownerAccountId, token) {
+    await execute('UPDATE change_issues SET reminder_claim = NULL, reminder_claimed_at = NULL WHERE change_id = ? AND owner_account_id = ? AND reminder_claim = ?', changeId, ownerAccountId, token);
   },
 
-  async listOpenIssues() {
-    const rows = await query<IssueDbRow>(`SELECT ${COLUMNS} FROM change_issues WHERE status = 'created' AND issue_key IS NOT NULL ORDER BY created_at, change_id LIMIT ${SWEEP_ISSUES_READ}`);
+  async closeDone(changeId, ownerAccountId, token) {
+    const n = await execute(
+      "UPDATE change_issues SET status = 'closed', comment_sent = 1, reminder_claim = NULL, reminder_claimed_at = NULL WHERE change_id = ? AND owner_account_id = ? AND status = 'created' AND reminder_claim = ?",
+      changeId,
+      ownerAccountId,
+      token,
+    );
+    return n > 0;
+  },
+
+  async listOpenIssues(after) {
+    const cursor = after ? ' AND (change_id > ? OR (change_id = ? AND owner_account_id > ?))' : '';
+    const rows = await query<IssueDbRow>(
+      `SELECT ${COLUMNS} FROM change_issues WHERE status = 'created' AND issue_key IS NOT NULL${cursor} ORDER BY change_id, owner_account_id LIMIT ${SWEEP_ISSUES_READ}`,
+      ...(after ? [after.changeId, after.changeId, after.ownerAccountId] : []),
+    );
     return rows.map(toRow);
   },
 };

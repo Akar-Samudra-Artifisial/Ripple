@@ -128,6 +128,8 @@ export interface JiraClient {
   /** Moves the issue to a Done-category status; false when the workflow offers no such transition. */
   transitionToDone(key: string): Promise<boolean>;
   addComment(key: string, body: AdfDoc): Promise<void>;
+  /** M7: the issue's status is in the Done category (`GET /rest/api/3/issue/{key}?fields=status`, as the app). */
+  issueIsDone(key: string): Promise<boolean>;
 }
 
 export const jira: JiraClient = {
@@ -207,6 +209,11 @@ export const jira: JiraClient = {
 
   async addComment(key, body) {
     await request('POST', route`/rest/api/3/issue/${key}/comment`, { body });
+  },
+
+  async issueIsDone(key) {
+    const body = await request<{ fields?: { status?: { statusCategory?: { key?: string } } } }>('GET', route`/rest/api/3/issue/${key}?fields=status`);
+    return body?.fields?.status?.statusCategory?.key === 'done';
   },
 };
 

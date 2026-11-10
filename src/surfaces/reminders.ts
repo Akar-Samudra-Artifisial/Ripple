@@ -5,7 +5,7 @@
  * days later). One reminder per task per 20 hours; a claim on the row lets one caller through, and a Jira failure
  * undoes it. No Teamwork Graph (no user in a trigger). Logs carry ids, enums and counts only.
  */
-import { sqlChangeIssueRepo, sqlReminderRepo, type ChangeIssueRepo, type ChangeIssueRow, type ReminderRepo } from '../adapters/changeIssueRepo';
+import { sqlChangeIssueRepo, sqlReminderRepo, SWEEP_ISSUES_READ, type ChangeIssueRepo, type ChangeIssueRow, type IssueCursor, type ReminderRepo } from '../adapters/changeIssueRepo';
 import { sqlChangeRepo, type ChangeRepo, type ChangeRow } from '../adapters/changeRepo';
 import { canEditPage } from '../adapters/confluence';
 import { jira, type JiraClient } from '../adapters/jira';
@@ -23,7 +23,7 @@ export interface ReminderDeps {
   reminders: ReminderRepo;
   changes: Pick<ChangeRepo, 'getChange'>;
   proposals: Pick<ProposalRepo, 'listForChange'>;
-  jira: Pick<JiraClient, 'addComment'>;
+  jira: Pick<JiraClient, 'addComment' | 'issueIsDone'>;
   canEdit: (pageId: string) => Promise<boolean>;
   now: () => Date;
   ensure: () => Promise<void>;
@@ -48,25 +48,50 @@ const openPagesOf = (change: ChangeRow, row: ChangeIssueRow, proposals: readonly
   return new Set(proposals.filter((p) => pages.has(p.pageId) && isOpenProposal(p.status)).map((p) => p.pageId)).size;
 };
 
-type SendOutcome = 'reminded' | 'skipped' | { failed: string };
+type SendOutcome = 'reminded' | 'skipped' | 'done' | { failed: string };
 
-/** Claims, posts and (on failure) releases one reminder. Never throws. */
+const errText = (err: unknown): string => scrubErrorText(err instanceof Error ? err.message : String(err));
+
+/**
+ * Claims, checks and posts one reminder, then records it. The claim is dropped whenever nothing was posted (Jira
+ * failure, issue already Done), so the reminder stage is never used up without a comment; a run cut off between claim
+ * and record leaves a claim that goes stale (`REMINDER_CLAIM_STALE_SECONDS`). Never throws.
+ */
 async function remindOne(deps: ReminderDeps, change: ChangeRow, row: ChangeIssueRow, openPages: number, autoStage: number | null, now: Date): Promise<SendOutcome> {
   if (!row.issueKey || openPages === 0) return 'skipped';
-  if (!(await deps.reminders.claimReminder(change.id, row.ownerAccountId, autoStage))) return 'skipped';
+  let token: string | null;
   try {
+    token = await deps.reminders.claimReminder(change.id, row.ownerAccountId, autoStage);
+  } catch (err) {
+    return { failed: `sql: ${errText(err)}`.slice(0, 120) };
+  }
+  if (!token) return 'skipped';
+  const release = async (): Promise<void> => {
+    try {
+      await deps.reminders.releaseReminder(change.id, row.ownerAccountId, token);
+    } catch (err) {
+      console.warn('ripple reminder: release failed', { changeId: change.id, issueId: row.issueId, error: errText(err) });
+    }
+  };
+  try {
+    // Done in Jira (closed by hand): no reminder; the task is closed here too.
+    if (await deps.jira.issueIsDone(row.issueKey)) {
+      const closed = await deps.reminders.closeDone(change.id, row.ownerAccountId, token);
+      if (!closed) await release();
+      return 'done';
+    }
     const deadline = change.routing?.deadline ?? null;
     await deps.jira.addComment(row.issueKey, reminderBody({ ownerAccountId: row.ownerAccountId, openPages, deadline, state: deadlineState(deadline, now) }));
-    return 'reminded';
   } catch (err) {
-    const code = jiraErrorCode(err);
-    try {
-      await deps.reminders.releaseReminder(change.id, row.ownerAccountId, { reminderCount: row.reminderCount ?? 0, autoReminders: row.autoReminders ?? 0 });
-    } catch (releaseErr) {
-      console.warn('ripple reminder: release failed', { changeId: change.id, issueId: row.issueId, error: scrubErrorText(releaseErr instanceof Error ? releaseErr.message : String(releaseErr)) });
-    }
-    return { failed: code };
+    await release();
+    return { failed: jiraErrorCode(err) };
   }
+  try {
+    if (!(await deps.reminders.confirmReminder(change.id, row.ownerAccountId, token, autoStage))) console.warn('ripple reminder: claim lost before record', { changeId: change.id, issueId: row.issueId });
+  } catch (err) {
+    console.warn('ripple reminder: record failed', { changeId: change.id, issueId: row.issueId, error: errText(err) });
+  }
+  return 'reminded';
 }
 
 /**
@@ -94,7 +119,7 @@ export async function remindOwners(ctx: SourceContext, payload: Partial<RemindOw
     for (const row of rows) {
       const outcome = await remindOne(deps, change, row, openPagesOf(change, row, proposals), null, now);
       if (outcome === 'reminded') result.reminded++;
-      else if (outcome === 'skipped') result.skipped++;
+      else if (outcome === 'skipped' || outcome === 'done') result.skipped++;
       else {
         result.failed++;
         result.errorCode ??= outcome.failed;
@@ -114,43 +139,69 @@ export interface SweepOutcome {
   changes: number;
   reminded: number;
   skipped: number;
+  /** Tasks found Done in Jira and closed here (no reminder). */
+  done: number;
   failed: number;
+  /** The time budget ran out before every open task was looked at (the next run starts over). */
+  truncated: boolean;
 }
+
+/** Time budget of one sweep; the function times out after 900 s (`weekly-sweep` in manifest.yml). */
+export const SWEEP_BUDGET_MS = 12 * 60 * 1000;
 
 /**
  * Daily sweep: automatic reminders for the open tasks whose change is due (stage 1) or late (stage 2) and whose owner
- * still has open pages; each stage is sent once per task (`auto_reminders`). Never throws.
+ * still has open pages; each stage is sent once per task (`auto_reminders`). Every open task is read (keyset pages)
+ * until the time budget runs out. Never throws.
  */
-export async function runReminderSweep(deps: ReminderDeps = defaultReminderDeps): Promise<SweepOutcome> {
-  const out: SweepOutcome = { changes: 0, reminded: 0, skipped: 0, failed: 0 };
+export async function runReminderSweep(deps: ReminderDeps = defaultReminderDeps, budgetMs: number = SWEEP_BUDGET_MS): Promise<SweepOutcome> {
+  const out: SweepOutcome = { changes: 0, reminded: 0, skipped: 0, done: 0, failed: 0, truncated: false };
+  const started = deps.now().getTime();
+  const overBudget = (): boolean => deps.now().getTime() - started >= budgetMs;
   try {
     await deps.ensure();
     const now = deps.now();
-    const byChange = new Map<string, ChangeIssueRow[]>();
-    for (const r of await deps.reminders.listOpenIssues()) byChange.set(r.changeId, [...(byChange.get(r.changeId) ?? []), r]);
-    for (const [changeId, rows] of byChange) {
-      try {
-        const change = await deps.changes.getChange(changeId);
-        if (!change || change.status !== 'confirmed') continue;
-        const stage = dueReminders(deadlineState(change.routing?.deadline, now));
-        const todo = rows.filter((r) => (r.autoReminders ?? 0) < stage);
-        if (todo.length === 0) continue;
-        out.changes++;
-        const proposals = await deps.proposals.listForChange(changeId);
-        for (const row of todo) {
-          const outcome = await remindOne(deps, change, row, openPagesOf(change, row, proposals), stage, now);
+    const loaded = new Map<string, { change: ChangeRow; stage: number; proposals: readonly ProposalRow[] | null } | null>();
+    let after: IssueCursor | undefined;
+    for (;;) {
+      if (overBudget()) {
+        out.truncated = true;
+        break;
+      }
+      const page = await deps.reminders.listOpenIssues(after);
+      for (const row of page) {
+        if (overBudget()) {
+          out.truncated = true;
+          break;
+        }
+        try {
+          let entry = loaded.get(row.changeId);
+          if (entry === undefined) {
+            const change = await deps.changes.getChange(row.changeId);
+            entry = change && change.status === 'confirmed' ? { change, stage: dueReminders(deadlineState(change.routing?.deadline, now)), proposals: null } : null;
+            loaded.set(row.changeId, entry);
+          }
+          if (!entry || (row.autoReminders ?? 0) >= entry.stage) continue;
+          if (entry.proposals === null) {
+            entry.proposals = await deps.proposals.listForChange(row.changeId);
+            out.changes++;
+          }
+          const outcome = await remindOne(deps, entry.change, row, openPagesOf(entry.change, row, entry.proposals), entry.stage, now);
           if (outcome === 'reminded') out.reminded++;
           else if (outcome === 'skipped') out.skipped++;
+          else if (outcome === 'done') out.done++;
           else out.failed++;
+        } catch (err) {
+          out.failed++;
+          console.warn('ripple reminder sweep: task failed', { changeId: row.changeId, issueId: row.issueId, error: errText(err) });
         }
-      } catch (err) {
-        out.failed++;
-        console.warn('ripple reminder sweep: change failed', { changeId, error: scrubErrorText(err instanceof Error ? err.message : String(err)) });
       }
+      const last = page[page.length - 1];
+      if (out.truncated || !last || page.length < SWEEP_ISSUES_READ) break;
+      after = { changeId: last.changeId, ownerAccountId: last.ownerAccountId };
     }
   } catch (err) {
-    const error = err instanceof SchemaSettingUpError ? 'schema_setting_up' : scrubErrorText(err instanceof Error ? err.message : String(err));
-    console.warn('ripple reminder sweep failed', { error });
+    console.warn('ripple reminder sweep failed', { error: err instanceof SchemaSettingUpError ? 'schema_setting_up' : errText(err) });
   }
   console.info('ripple reminder sweep', { ...out });
   return out;

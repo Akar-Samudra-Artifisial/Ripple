@@ -297,6 +297,10 @@ export const MIGRATIONS: readonly { name: string; statement: string }[] = [
   { name: 'v032_change_issues_reminded_at', statement: 'ALTER TABLE change_issues ADD COLUMN IF NOT EXISTS reminded_at TIMESTAMP NULL' },
   { name: 'v033_change_issues_reminder_count', statement: 'ALTER TABLE change_issues ADD COLUMN IF NOT EXISTS reminder_count INT NOT NULL DEFAULT 0' },
   { name: 'v034_change_issues_auto_reminders', statement: 'ALTER TABLE change_issues ADD COLUMN IF NOT EXISTS auto_reminders INT NOT NULL DEFAULT 0' },
+  // M7 fix: a reminder is claimed (token + time) before the Jira comment and recorded only after it was posted, so a
+  // failed or cut-off comment never uses up the reminder stage; a claim older than one run is stale.
+  { name: 'v035_change_issues_reminder_claim', statement: 'ALTER TABLE change_issues ADD COLUMN IF NOT EXISTS reminder_claim VARCHAR(36) NULL' },
+  { name: 'v036_change_issues_reminder_claimed_at', statement: 'ALTER TABLE change_issues ADD COLUMN IF NOT EXISTS reminder_claimed_at TIMESTAMP NULL' },
 ];
 
 /** Name of the newest migration; the byline reports it so admins can confirm the schema is current. */

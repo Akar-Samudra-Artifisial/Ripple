@@ -96,6 +96,14 @@ describe('Forge SQL LIMIT (TiDB rejects a bound LIMIT with ER_WRONG_ARGUMENTS)',
     expect(calls).toEqual([]);
     await sqlFactSearch.readySources();
     expect(calls[0]?.statement).toMatch(/WHERE status = 'ready' ORDER BY page_id LIMIT 100$/);
+    expect(calls[0]?.params).toEqual([]);
+    await sqlFactSearch.readySources('9100001');
+    expect(calls[1]?.statement).toMatch(/WHERE status = 'ready' AND page_id > \? ORDER BY page_id LIMIT 100$/);
+    expect(calls[1]?.params).toEqual(['9100001']);
+    await sqlFactSearch.searchConfirmedFacts(['diem'], { sourcePageId: '9100001', id: 'f-9' });
+    expect(calls[2]?.statement).toContain('AND (f.source_page_id > ? OR (f.source_page_id = ? AND f.id > ?))');
+    expect(calls[2]?.statement).toMatch(/ORDER BY f.source_page_id, f.id LIMIT 200$/);
+    expect(calls[2]?.params).toEqual([...Array(4).fill('%diem%'), '9100001', '9100001', 'f-9']);
   });
 
   it('no statement in src binds LIMIT/OFFSET', () => {
@@ -194,34 +202,39 @@ describe('migration identifiers (TiDB rejects unquoted reserved words with ER_PA
 });
 
 describe('change_issues reminders (M7)', () => {
-  it('claims a reminder with status, cooldown and stage guards; bound values, inline interval', async () => {
+  it('claims with a token (status, cooldown, fresh-claim and stage guards), records only with the token', async () => {
     affected = () => 1;
-    expect(await sqlReminderRepo.claimReminder('ch-1', 'acc-1', null)).toBe(true);
-    expect(calls[0]?.statement).toContain('reminded_at = CURRENT_TIMESTAMP, reminder_count = reminder_count + 1');
+    const token = await sqlReminderRepo.claimReminder('ch-1', 'acc-1', null);
+    expect(token).toMatch(/^[0-9a-f-]{36}$/);
+    expect(calls[0]?.statement).toContain('SET reminder_claim = ?, reminder_claimed_at = CURRENT_TIMESTAMP');
     expect(calls[0]?.statement).toContain("status = 'created' AND issue_key IS NOT NULL");
     expect(calls[0]?.statement).toContain('(reminded_at IS NULL OR reminded_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 20 HOUR))');
+    expect(calls[0]?.statement).toContain('reminder_claimed_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 960 SECOND)');
     expect(calls[0]?.statement).not.toContain('auto_reminders');
-    expect(calls[0]?.params).toEqual(['ch-1', 'acc-1']);
-    expect(await sqlReminderRepo.claimReminder('ch-1', 'acc-1', 2)).toBe(true);
-    expect(calls[1]?.statement).toContain(', auto_reminders = ?');
+    expect(calls[0]?.params).toEqual([token, 'ch-1', 'acc-1']);
+    await sqlReminderRepo.claimReminder('ch-1', 'acc-1', 2);
     expect(calls[1]?.statement).toMatch(/AND auto_reminders < \?$/);
-    expect(calls[1]?.params).toEqual([2, 'ch-1', 'acc-1', 2]);
+    expect(calls[1]?.params?.slice(1)).toEqual(['ch-1', 'acc-1', 2]);
+    expect(await sqlReminderRepo.confirmReminder('ch-1', 'acc-1', 'tok', 2)).toBe(true);
+    expect(calls[2]?.statement).toContain('reminder_count = reminder_count + 1, auto_reminders = GREATEST(auto_reminders, ?)');
+    expect(calls[2]?.statement).toMatch(/AND reminder_claim = \?$/);
+    expect(calls[2]?.params).toEqual([2, 'ch-1', 'acc-1', 'tok']);
     affected = () => 0;
-    expect(await sqlReminderRepo.claimReminder('ch-1', 'acc-1', null)).toBe(false);
+    expect(await sqlReminderRepo.claimReminder('ch-1', 'acc-1', null)).toBeNull();
   });
 
-  it('releases only its own claim and lists open tasks with an inline LIMIT', async () => {
-    await sqlReminderRepo.releaseReminder('ch-1', 'acc-1', { reminderCount: 0, autoReminders: 0 });
-    expect(calls[0]?.statement).toContain('reminded_at = NULL');
-    expect(calls[0]?.statement).toMatch(/AND reminder_count = \?$/);
-    expect(calls[0]?.params).toEqual([0, 0, 'ch-1', 'acc-1', 1]);
-    await sqlReminderRepo.releaseReminder('ch-1', 'acc-1', { reminderCount: 2, autoReminders: 1 });
-    expect(calls[1]?.statement).toContain('DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 21 HOUR)');
-    expect(calls[1]?.params).toEqual([2, 1, 'ch-1', 'acc-1', 3]);
+  it('release and Done-close need the token; open tasks are read in keyset pages with an inline LIMIT', async () => {
+    await sqlReminderRepo.releaseReminder('ch-1', 'acc-1', 'tok');
+    expect(calls[0]?.statement).toBe('UPDATE change_issues SET reminder_claim = NULL, reminder_claimed_at = NULL WHERE change_id = ? AND owner_account_id = ? AND reminder_claim = ?');
+    await sqlReminderRepo.closeDone('ch-1', 'acc-1', 'tok');
+    expect(calls[1]?.statement).toContain("SET status = 'closed', comment_sent = 1");
+    expect(calls[1]?.params).toEqual(['ch-1', 'acc-1', 'tok']);
     await sqlReminderRepo.listOpenIssues();
-    expect(calls[2]?.statement).toContain('reminded_at, reminder_count, auto_reminders');
-    expect(calls[2]?.statement).toMatch(/WHERE status = 'created' AND issue_key IS NOT NULL ORDER BY created_at, change_id LIMIT 200$/);
+    expect(calls[2]?.statement).toMatch(/WHERE status = 'created' AND issue_key IS NOT NULL ORDER BY change_id, owner_account_id LIMIT 200$/);
     expect(calls[2]?.params).toEqual([]);
+    await sqlReminderRepo.listOpenIssues({ changeId: 'ch-1', ownerAccountId: 'acc-1' });
+    expect(calls[3]?.statement).toContain('AND (change_id > ? OR (change_id = ? AND owner_account_id > ?)) ORDER BY change_id, owner_account_id LIMIT 200');
+    expect(calls[3]?.params).toEqual(['ch-1', 'ch-1', 'acc-1']);
   });
 });
 

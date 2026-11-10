@@ -52,9 +52,16 @@ describe('M7 deadline state', () => {
 /** In-memory `change_issues` with the SQL guards of `sqlReminderRepo` (status, cooldown, stage). */
 class World {
   now = at('2026-11-20T09:00:00Z');
-  rows: (ChangeIssueRow & { remindedMs: number | null })[] = [];
+  rows: (ChangeIssueRow & { remindedMs: number | null; claim: string | null; claimedMs: number | null })[] = [];
   comments: { key: string; body: AdfDoc }[] = [];
   jiraFails = 0;
+  /** Issue keys that are Done in Jira. */
+  doneInJira = new Set<string>();
+  /** Milliseconds the clock moves on per posted comment (time budget tests). */
+  tick = 0;
+  tokens = 0;
+  /** The run is cut off between claim and record: the record never lands (the claim stays behind). */
+  recordLost = false;
   canEdit = true;
   change: ChangeRow = {
     id: CHANGE,
@@ -88,32 +95,53 @@ class World {
       ['owner-1', 'OPS-1'],
       ['owner-2', 'OPS-2'],
     ] as const) {
-      this.rows.push({ changeId: CHANGE, ownerAccountId: owner, sourcePageId: SOURCE, issueId: key, issueKey: key, issueUrl: null, assigneeSet: true, pageCount: 1, status: 'created', attempts: 1, commentSent: false, remindedAt: null, reminderCount: 0, autoReminders: 0, remindedMs: null });
+      this.rows.push({ changeId: CHANGE, ownerAccountId: owner, sourcePageId: SOURCE, issueId: key, issueKey: key, issueUrl: null, assigneeSet: true, pageCount: 1, status: 'created', attempts: 1, commentSent: false, remindedAt: null, reminderCount: 0, autoReminders: 0, remindedMs: null, claim: null, claimedMs: null });
     }
   }
+
+  row = (changeId: string, owner: string) => this.rows.find((x) => x.changeId === changeId && x.ownerAccountId === owner);
 
   snapshot = (): ChangeIssueRow[] => this.rows.map((r) => ({ ...r, remindedAt: r.remindedMs === null ? null : new Date(r.remindedMs).toISOString() }));
 
   reminders(): ReminderRepo {
     return {
       claimReminder: async (changeId, owner, stage) => {
-        const r = this.rows.find((x) => x.changeId === changeId && x.ownerAccountId === owner);
-        if (!r || r.status !== 'created' || !r.issueKey) return false;
-        if (r.remindedMs !== null && this.now.getTime() - r.remindedMs < 20 * 3600 * 1000) return false;
-        if (stage !== null && (r.autoReminders ?? 0) >= stage) return false;
+        const r = this.row(changeId, owner);
+        if (!r || r.status !== 'created' || !r.issueKey) return null;
+        if (r.remindedMs !== null && this.now.getTime() - r.remindedMs < 20 * 3600 * 1000) return null;
+        if (r.claim !== null && r.claimedMs !== null && this.now.getTime() - r.claimedMs < 16 * 60 * 1000) return null;
+        if (stage !== null && (r.autoReminders ?? 0) >= stage) return null;
+        r.claim = `tok-${++this.tokens}`;
+        r.claimedMs = this.now.getTime();
+        return r.claim;
+      },
+      confirmReminder: async (changeId, owner, token, stage) => {
+        const r = this.row(changeId, owner);
+        if (this.recordLost) throw new Error('cut off');
+        if (!r || r.claim !== token) return false;
         r.remindedMs = this.now.getTime();
         r.reminderCount = (r.reminderCount ?? 0) + 1;
-        if (stage !== null) r.autoReminders = stage;
+        if (stage !== null) r.autoReminders = Math.max(r.autoReminders ?? 0, stage);
+        r.claim = null;
+        r.claimedMs = null;
         return true;
       },
-      releaseReminder: async (changeId, owner, previous) => {
-        const r = this.rows.find((x) => x.changeId === changeId && x.ownerAccountId === owner);
-        if (!r || r.reminderCount !== previous.reminderCount + 1) return;
-        r.remindedMs = previous.reminderCount === 0 ? null : this.now.getTime() - 21 * 3600 * 1000;
-        r.reminderCount = previous.reminderCount;
-        r.autoReminders = previous.autoReminders;
+      releaseReminder: async (changeId, owner, token) => {
+        const r = this.row(changeId, owner);
+        if (r?.claim === token) Object.assign(r, { claim: null, claimedMs: null });
       },
-      listOpenIssues: async () => this.snapshot().filter((r) => r.status === 'created'),
+      closeDone: async (changeId, owner, token) => {
+        const r = this.row(changeId, owner);
+        if (r?.status !== 'created' || r.claim !== token) return false;
+        Object.assign(r, { status: 'closed', commentSent: true, claim: null, claimedMs: null });
+        return true;
+      },
+      listOpenIssues: async (after) =>
+        this.snapshot()
+          .filter((r) => r.status === 'created')
+          .sort((a, b) => (a.changeId === b.changeId ? (a.ownerAccountId < b.ownerAccountId ? -1 : 1) : a.changeId < b.changeId ? -1 : 1))
+          .filter((r) => !after || r.changeId > after.changeId || (r.changeId === after.changeId && r.ownerAccountId > after.ownerAccountId))
+          .slice(0, 200),
     };
   }
 
@@ -130,7 +158,9 @@ class World {
             throw new JiraError(500, 'Jira 500: secret');
           }
           this.comments.push({ key, body });
+          this.now = new Date(this.now.getTime() + this.tick);
         },
+        issueIsDone: async (key) => this.doneInJira.has(key),
       },
       canEdit: async () => this.canEdit,
       now: () => this.now,
@@ -183,7 +213,7 @@ describe('M7 remindOwners (Rollout "Remind")', () => {
   it('a Jira failure undoes the claim so a retry can send; the reply and logs carry codes only', async () => {
     w.jiraFails = 1;
     expect(await remindOwners(ctx, { changeId: CHANGE, issueKey: 'OPS-1' }, w.deps())).toEqual({ changeId: CHANGE, reminded: 0, skipped: 0, failed: 1, errorCode: 'http_500' });
-    expect(w.rows[0]).toMatchObject({ reminderCount: 0, remindedMs: null });
+    expect(w.rows[0]).toMatchObject({ reminderCount: 0, remindedMs: null, claim: null, autoReminders: 0 });
     expect(await remindOwners(ctx, { changeId: CHANGE, issueKey: 'OPS-1' }, w.deps())).toMatchObject({ reminded: 1 });
     const text = JSON.stringify(logs);
     for (const leak of ['owner-1', 'secret', 'viewer']) expect(text).not.toContain(leak);
@@ -210,7 +240,7 @@ describe('M7 Rollout: Late and Remind data per owner task', () => {
 describe('M7 reminder sweep (daily trigger)', () => {
   it('sends nothing before the deadline, once at the deadline, once more when late, never twice per stage', async () => {
     w.now = at('2026-11-19T09:00:00Z');
-    expect(await runReminderSweep(w.deps())).toEqual({ changes: 0, reminded: 0, skipped: 0, failed: 0 });
+    expect(await runReminderSweep(w.deps())).toEqual({ changes: 0, reminded: 0, skipped: 0, done: 0, failed: 0, truncated: false });
     w.now = at('2026-11-20T09:00:00Z');
     expect(await runReminderSweep(w.deps())).toMatchObject({ reminded: 2 });
     w.now = at('2026-11-23T09:00:00Z'); // still due: stage 1 already sent
@@ -236,9 +266,56 @@ describe('M7 reminder sweep (daily trigger)', () => {
     deps.reminders.listOpenIssues = async () => {
       throw new Error('sql down');
     };
-    await expect(runReminderSweep(deps)).resolves.toEqual({ changes: 0, reminded: 0, skipped: 0, failed: 0 });
+    await expect(runReminderSweep(deps)).resolves.toEqual({ changes: 0, reminded: 0, skipped: 0, done: 0, failed: 0, truncated: false });
     w.now = at('2026-11-25T09:00:00Z');
     await runReminderSweep(w.deps());
     expect(JSON.stringify(logs)).not.toMatch(/owner-|OPS-/);
+  });
+});
+
+describe('M7 review fixes: claim before comment, Done in Jira, budget and paging', () => {
+  it('a failed automatic comment leaves the stage unsent, so the next run sends it', async () => {
+    w.jiraFails = 2;
+    expect(await runReminderSweep(w.deps())).toMatchObject({ reminded: 0, failed: 2 });
+    expect(w.rows.map((r) => [r.autoReminders, r.reminderCount, r.claim])).toEqual([
+      [0, 0, null],
+      [0, 0, null],
+    ]);
+    expect(await runReminderSweep(w.deps())).toMatchObject({ reminded: 2 });
+    expect(w.rows.map((r) => r.autoReminders)).toEqual([1, 1]);
+  });
+
+  it('a run cut off before the record leaves a claim that blocks for 16 minutes, then goes stale', async () => {
+    w.recordLost = true;
+    expect(await remindOwners(ctx, { changeId: CHANGE, issueKey: 'OPS-1' }, w.deps())).toMatchObject({ reminded: 1 });
+    w.recordLost = false;
+    expect(w.rows[0]).toMatchObject({ autoReminders: 0, reminderCount: 0, claim: 'tok-1' });
+    w.now = at('2026-11-20T09:10:00Z');
+    expect(await runReminderSweep(w.deps())).toMatchObject({ reminded: 1, skipped: 1 });
+    w.now = at('2026-11-20T09:20:00Z');
+    expect(await runReminderSweep(w.deps())).toMatchObject({ reminded: 1 });
+    expect(w.rows.map((r) => r.autoReminders)).toEqual([1, 1]);
+  });
+
+  it('a task already Done in Jira gets no reminder and is closed here', async () => {
+    w.doneInJira.add('OPS-1');
+    expect(await runReminderSweep(w.deps())).toMatchObject({ reminded: 1, done: 1 });
+    expect(w.comments.map((c) => c.key)).toEqual(['OPS-2']);
+    expect(w.rows[0]).toMatchObject({ status: 'closed', commentSent: true, claim: null, reminderCount: 0 });
+    expect(await remindOwners(ctx, { changeId: CHANGE, issueKey: 'OPS-1' }, w.deps())).toEqual({ error: 'This update task is not open.' });
+  });
+
+  it('reads every open task in keyset pages and stops at the time budget', async () => {
+    for (let i = 0; i < 450; i++) {
+      w.change.routing?.pages.push({ pageId: `P${i}`, spaceId: 'S1', ownerAccountId: `o-${String(i).padStart(3, '0')}`, ownerRole: 'owner', copies: 1 } as never);
+      w.proposals.push({ pageId: `P${i}`, status: 'proposed' } as ProposalRow);
+      w.rows.push({ ...w.rows[0]!, ownerAccountId: `o-${String(i).padStart(3, '0')}`, issueKey: `OPS-${100 + i}` });
+    }
+    const all = await runReminderSweep(w.deps());
+    expect(all).toMatchObject({ reminded: 452, truncated: false });
+    w.now = at('2026-11-25T09:00:00Z');
+    w.tick = 60 * 1000; // one minute per comment
+    const cut = await runReminderSweep(w.deps(), 5 * 60 * 1000);
+    expect(cut).toMatchObject({ reminded: 5, truncated: true });
   });
 });

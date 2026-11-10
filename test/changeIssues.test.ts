@@ -215,6 +215,7 @@ class Store {
         if (this.closeFails) throw new JiraUnavailableError('down');
         this.comments.push({ key: k, body });
       },
+      issueIsDone: async () => false,
     };
   }
 

@@ -129,7 +129,8 @@ modules:
       name: Propose updates
       function: fact-keeper-action
       actionVerb: CREATE
-      description: Prepare edit proposals for every copy of a changed fact. Ask the user to confirm first.
+      description: Explains where update proposals are made. Ripple prepares them on the source page in Confluence after
+        its owner confirms the change; this action itself changes nothing.
       inputs:
         topic:
           title: Topic
@@ -166,6 +167,7 @@ modules:
       handler: index.onAppLifecycle
     - key: weekly-sweep
       handler: index.weeklySweep
+      timeoutSeconds: 900
     - key: extract-facts
       handler: index.extractFacts
       timeoutSeconds: 900
