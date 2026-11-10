@@ -17,6 +17,7 @@ import { sqlRepo, type FactRepo, type PageVersionInfo } from '../adapters/repo';
 import { ensureSchema } from '../adapters/sql';
 import { noSpaceTeamCache, spaceTeamsLookup, sqlSpaceTeamCache, type SpaceTeamCache } from '../adapters/spaceTeams';
 import { asUserGraph, fetchPageMeta, ownersFromPage, scrubErrorText, siteOf, type GraphRequest, type PageMeta } from '../adapters/teamworkGraph';
+import { confirmDay } from '../core/deadline';
 import { addWorkingDays, computeImpact, DEFAULT_DEADLINE_DAYS, isRippleVersion, matchFacts, MAX_DEADLINE_DAYS, offeredFacts, planDiff, wordingOnlyReverts, type KnownFact } from '../core/changes';
 import { parseExtraction } from '../core/facts';
 import { storageToText, TRUNCATED_MARK } from '../core/pageText';
@@ -643,7 +644,7 @@ export async function confirmChange(ctx: ChangeContext, payload: Partial<Confirm
       const { routing: base } = await summarise(ctx, pageId, change, true, deps, true);
       // M5: Jira issues only for changes confirmed while a project is set (never retroactively).
       const projectKey = deps.jiraProjectKey ? await deps.jiraProjectKey() : null;
-      routing = { ...base, deadline: addWorkingDays(deps.now(), days), ...(projectKey ? { jiraProjectKey: projectKey } : {}) };
+      routing = { ...base, deadline: addWorkingDays(confirmDay(payload?.today, deps.now()), days), ...(projectKey ? { jiraProjectKey: projectKey } : {}) };
       transitioned = await deps.changes.decide(change.id, version, 'confirmed', actor, days, routing);
       if (!transitioned) {
         const now = await deps.changes.getChange(change.id);

@@ -17,6 +17,7 @@ import type { Message } from '@forge/llm';
 import { dismissalKey, valueHash, type ChangeRepo, type ChangeRouting, type ChangeRow, type CopyForChange } from '../src/adapters/changeRepo';
 import type { SourcePage } from '../src/adapters/confluence';
 import type { FactRepo, PageVersionInfo } from '../src/adapters/repo';
+import { confirmDay, localDay } from '../src/core/deadline';
 import { addWorkingDays, computeImpact, factChanged, matchFacts, planDiff, wordingOnlyChange, type ChangeImpact, type FactChange, type KnownFact } from '../src/core/changes';
 import { identityKey, type ExtractedFact, type MergePlan, type StoredFact } from '../src/core/facts';
 import type { ChangeDecision, CopyStatus, ErrorReply, FactView, PendingChangeReply, SourceView } from '../src/core/views';
@@ -829,6 +830,24 @@ describe('planDiff / computeImpact / addWorkingDays', () => {
     expect(addWorkingDays(new Date('2026-11-06T15:00:00Z'), 5)).toBe('2026-11-13'); // Friday → next Friday
     expect(addWorkingDays(new Date('2026-11-09T09:00:00Z'), 5)).toBe('2026-11-16'); // Monday → next Monday
   });
+
+  it('one deadline rule for modal, routing and Jira: working days from the confirmer\'s local day', () => {
+    // The live case: Wednesday 11 Nov 07:30 in UTC+8 is still Tuesday in UTC.
+    const now = new Date('2026-11-10T23:30:00Z');
+    expect(confirmDay('2026-11-11', now)).toBe('2026-11-11');
+    expect(addWorkingDays(confirmDay('2026-11-11', now), 5)).toBe('2026-11-18');
+    expect(addWorkingDays('2026-11-11', 5)).toBe(addWorkingDays(new Date('2026-11-11T12:00:00Z'), 5));
+    // Weekend: Saturday and Sunday count from the next Monday.
+    expect(addWorkingDays('2026-11-14', 1)).toBe('2026-11-16');
+    expect(addWorkingDays('2026-11-15', 5)).toBe('2026-11-20');
+    // An implausible or malformed client day falls back to the UTC day.
+    expect(confirmDay('2026-11-13', now)).toBe('2026-11-10');
+    expect(confirmDay('2026-02-30', now)).toBe('2026-11-10');
+    expect(confirmDay(undefined, now)).toBe('2026-11-10');
+    expect(confirmDay('2026-11-09', now)).toBe('2026-11-09'); // UTC−12 just after UTC midnight
+    expect(localDay(new Date(2026, 10, 11, 0, 30))).toBe('2026-11-11');
+    expect(() => addWorkingDays('11/11/2026', 5)).toThrow();
+  });
 });
 
 describe('change resolvers', () => {
@@ -926,6 +945,16 @@ describe('change resolvers', () => {
     expect(await confirmChange(ctx, { changeId: id }, changeDeps())).toEqual({ error: 'Missing or invalid page version.' });
     expect(store.changes.get(id)?.status).toBe('pending');
     expect(store.facts.find((f) => f.id === FACT_IDS.domestic)?.value).toBe('$60');
+  });
+
+  it('confirmChange near midnight UTC dates the deadline like the modal (confirmer\'s local day, same function)', async () => {
+    const id = await pendingId();
+    const modalDue = addWorkingDays('2026-11-11', 5); // what the modal shows in UTC+8 on Wednesday 11 Nov
+    const r = (await confirmChange(ctx, { changeId: id, version: 4, deadlineDays: 5, today: '2026-11-11' }, changeDeps({ now: () => new Date('2026-11-10T23:30:00Z') }))) as ChangeDecision;
+    expect(r.deadline).toBe(modalDue);
+    expect(r.deadline).toBe('2026-11-18');
+    // The Jira duedate and the Rollout header both read the stored routing deadline.
+    expect(store.changes.get(id)?.routing?.deadline).toBe(modalDue);
   });
 
   it('confirmChange sets the new value, keeps the old one, restatuses copies and audits owner/team sources', async () => {

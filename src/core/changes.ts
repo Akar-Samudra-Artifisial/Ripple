@@ -455,14 +455,5 @@ export function computeImpact(changes: readonly FactChange[], copies: readonly C
   return impact;
 }
 
-/** `start` plus `days` working days (Mon–Fri), as a `YYYY-MM-DD` date (UTC). */
-export function addWorkingDays(start: Date, days: number): string {
-  const d = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
-  let left = Math.max(0, Math.trunc(days));
-  while (left > 0) {
-    d.setUTCDate(d.getUTCDate() + 1);
-    const day = d.getUTCDay();
-    if (day !== 0 && day !== 6) left--;
-  }
-  return d.toISOString().slice(0, 10);
-}
+/** Working-day deadlines live in `./deadline` (shared with the Custom UI); re-exported for existing callers. */
+export { addWorkingDays } from './deadline';

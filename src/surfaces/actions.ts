@@ -16,7 +16,7 @@ import { sqlScanRepo, type ScanRepo } from '../adapters/scanRepo';
 import { ensureSchema } from '../adapters/sql';
 import { fetchPageMeta, scrubErrorText } from '../adapters/teamworkGraph';
 import { deadlineState, itemOverdue } from '../core/reminders';
-import { SchemaSettingUpError } from '../core/schema';
+import { SchemaMigrationFailedError, SchemaSettingUpError } from '../core/schema';
 import { valueLabel } from '../core/valueLabel';
 import type { CopyStatus, CopyView, DeadlineState, ProposalState } from '../core/views';
 import { notImplemented, type NotImplemented } from './stub';
@@ -164,6 +164,9 @@ export interface ActionDeps {
   now?: () => Date;
   /** Milliseconds, for the time budget. Absent = `Date.now`. */
   clock?: () => number;
+  /** Waits between schema checks. Absent = a timer. */
+  sleep?: (ms: number) => Promise<void>;
+  /** The resolvers' schema guard: queues a migration run while steps are pending, throws `SchemaSettingUpError`. */
   ensure: () => Promise<void>;
 }
 
@@ -189,6 +192,37 @@ export const ACTION_BUDGET_MS = 30_000;
 /** Copy pages whose owner is looked up for the owner filter; the rest are left out (`truncated`). */
 export const MAX_OWNER_LOOKUPS = 50;
 const OWNER_CONCURRENCY = 5;
+
+/**
+ * Time an action waits for pending migrations (after an install or upgrade) before answering "setting up". Together
+ * with `ACTION_BUDGET_MS` it stays under the 55 s Rovo action limit.
+ */
+export const SCHEMA_WAIT_MS = 20_000;
+const SCHEMA_POLL_MS = 2_000;
+
+/**
+ * The schema is ready, or becomes ready within `SCHEMA_WAIT_MS`: `ensure` (the resolvers' guard, no DDL here) queues
+ * a run on the `schema-migrate` consumer, which applies the steps idempotently (one run at a time is safe), and this
+ * polls until it is done. False when still pending; a failed migration step and other errors are thrown.
+ */
+export async function waitForSchema(deps: Pick<ActionDeps, 'ensure' | 'clock' | 'sleep'>): Promise<boolean> {
+  const clock = deps.clock ?? Date.now;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const started = clock();
+  for (let checks = 1; ; checks++) {
+    try {
+      await deps.ensure();
+      if (checks > 1) console.info('ripple fact keeper: schema ready after wait', { checks });
+      return true;
+    } catch (err) {
+      if (!(err instanceof SchemaSettingUpError) || err instanceof SchemaMigrationFailedError) throw err;
+      if (clock() - started + SCHEMA_POLL_MS > SCHEMA_WAIT_MS) return false;
+      await sleep(SCHEMA_POLL_MS);
+    }
+  }
+}
+
+const SETTING_UP = 'Ripple is finishing a database update after an install or upgrade. Ask the same question again in about a minute; do not guess a value meanwhile.';
 
 const errorText = (err: unknown): string => scrubErrorText(err instanceof Error ? err.message : String(err));
 
@@ -480,7 +514,7 @@ export async function rolloutStatus(payload: ActionPayload | undefined, deps: Ac
   return { status: 'found', ...reply('Progress of the latest confirmed change of each fact over the copies you can open.', truncated), rollouts };
 }
 
-type Reply = FactAnswer | OutOfDateAnswer | RolloutAnswer | NotImplemented;
+type Reply = (FactAnswer & { retryable?: boolean }) | OutOfDateAnswer | RolloutAnswer | NotImplemented;
 
 /** The asking user's account id from the Forge function context (`context.principal.accountId`). */
 const principalOf = (context: unknown): string | undefined => {
@@ -493,14 +527,18 @@ export async function factKeeperAction(payload?: ActionPayload, context?: unknow
   if (!key) return notImplemented('Rovo action unknown');
   if (key === 'propose-updates') return notImplemented(`Rovo action ${key}`, { hint: 'source page' });
   try {
-    await deps.ensure();
+    if (!(await waitForSchema(deps))) {
+      console.warn('ripple fact keeper failed', { action: key, error: 'schema_setting_up' });
+      return { status: 'error', ...reply(SETTING_UP, false), retryable: true, facts: [] };
+    }
     if (key === 'get-fact') return await getFact(payload, deps);
     if (key === 'find-copies') return await findCopies(payload, deps);
     if (key === 'list-out-of-date') return await listOutOfDate(payload, deps, principalOf(context));
     return await rolloutStatus(payload, deps);
   } catch (err) {
-    const settingUp = err instanceof SchemaSettingUpError;
-    console.warn('ripple fact keeper failed', { action: key, error: settingUp ? 'schema_setting_up' : errorText(err) });
-    return { status: 'error', ...reply(settingUp ? 'Ripple is still setting up. Try again in a minute.' : 'Ripple could not answer right now. Do not guess a value.', false), facts: [] };
+    const failed = err instanceof SchemaMigrationFailedError;
+    const settingUp = !failed && err instanceof SchemaSettingUpError;
+    console.warn('ripple fact keeper failed', { action: key, error: failed ? 'schema_migration_failed' : settingUp ? 'schema_setting_up' : errorText(err) });
+    return { status: 'error', ...reply(settingUp ? SETTING_UP : 'Ripple could not answer right now. Do not guess a value.', false), retryable: settingUp, facts: [] };
   }
 }

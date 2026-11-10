@@ -6,7 +6,8 @@ vi.mock('@forge/events', () => ({ Queue: class {} }));
 
 import type { FoundFact } from '../src/adapters/repo';
 import type { CopyView } from '../src/core/views';
-import { bestFacts, factKeeperAction, MAX_READ_PAGES, topicWords, untrustedText, type ActionDeps } from '../src/surfaces/actions';
+import { SchemaMigrationFailedError, SchemaSettingUpError } from '../src/core/schema';
+import { ACTION_BUDGET_MS, bestFacts, factKeeperAction, MAX_READ_PAGES, SCHEMA_WAIT_MS, topicWords, untrustedText, type ActionDeps } from '../src/surfaces/actions';
 
 const SOURCE = '9100001';
 const RESTRICTED = '9100002';
@@ -267,5 +268,44 @@ describe('M7 Rovo Fact Keeper', () => {
     expect(await run('list-out-of-date', { owner: 'ana' })).toMatchObject({ status: 'none', truncated: true });
     const text = JSON.stringify(logs);
     for (const leak of [ANA, BUDI, 'Ana', 'ana', 'Budi']) expect(text).not.toContain(leak);
+  });
+
+  it('waits for pending migrations (queued by the same guard as the resolvers) before the first answer', async () => {
+    let pendingChecks = 3;
+    const slept: number[] = [];
+    deps.ensure = vi.fn(async () => {
+      if (pendingChecks-- > 0) throw new SchemaSettingUpError(34, 36);
+    });
+    deps.sleep = async (ms) => void slept.push(ms);
+    let t = 0;
+    deps.clock = () => t;
+    deps.sleep = async (ms) => {
+      slept.push(ms);
+      t += ms;
+    };
+    expect(await run('get-fact', { topic: 'domestic per diem' })).toMatchObject({ status: 'found' });
+    expect(deps.ensure).toHaveBeenCalledTimes(4);
+    expect(slept).toEqual([2000, 2000, 2000]);
+    expect(t).toBeLessThanOrEqual(SCHEMA_WAIT_MS);
+  });
+
+  it('still pending after the wait → a clear retryable reply within the budget; a failed step is not "setting up"', async () => {
+    let t = 0;
+    deps.clock = () => t;
+    deps.sleep = async (ms) => void (t += ms);
+    deps.ensure = vi.fn(async () => {
+      throw new SchemaSettingUpError(1, 36);
+    });
+    const r = await run('get-fact', { topic: 'domestic per diem' });
+    expect(r).toMatchObject({ status: 'error', retryable: true, message: expect.stringContaining('Ask the same question again') });
+    expect(t).toBeLessThanOrEqual(SCHEMA_WAIT_MS);
+    expect(SCHEMA_WAIT_MS + ACTION_BUDGET_MS).toBeLessThan(55_000);
+    expect(deps.search.searchConfirmedFacts).not.toHaveBeenCalled();
+    deps.ensure = vi.fn(async () => {
+      throw new SchemaMigrationFailedError(1, 36, { migration: 'v002', code: 'x', attempts: 3 });
+    });
+    expect(await run('list-out-of-date', {})).toMatchObject({ status: 'error', retryable: false });
+    expect(deps.ensure).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(logs)).toContain('schema_migration_failed');
   });
 });

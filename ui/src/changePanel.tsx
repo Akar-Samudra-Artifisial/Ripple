@@ -1,6 +1,7 @@
 import { Modal, router, view } from '@forge/bridge';
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { ChangeDecision, ChangePageView, ChangeSpaceView, PendingChangeReply, PendingChangeView } from '../../src/core/views';
+import { addWorkingDays, localDay } from '../../src/core/deadline';
 import { valueLabel } from '../../src/core/valueLabel';
 import { call } from './bridge';
 import { Alert, LoadingRows, errorOf } from './components';
@@ -14,22 +15,11 @@ const plural = (n: number, one: string, many: string): string => `${n} ${n === 1
 const spaceKeyOf = (url: string | null): string | null => (url ? (/\/spaces\/([^/]+)\//.exec(url)?.[1] ?? null) : null);
 const ownerName = (p: ChangePageView): string => p.owner.displayName ?? (p.owner.accountId ? 'Unknown user' : 'No owner');
 
-/** Today + n working days (Mon–Fri; public holidays are not known to the UI). */
-function addWorkingDays(days: number, from = new Date()): Date {
-  const d = new Date(from);
-  let left = days;
-  while (left > 0) {
-    d.setDate(d.getDate() + 1);
-    const wd = d.getDay();
-    if (wd !== 0 && wd !== 6) left -= 1;
-  }
-  return d;
-}
-const formatDay = (d: Date): string => d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
+/** A `YYYY-MM-DD` day as "Wed, 18 Nov" (read as UTC, so no time zone can move it). */
 const formatIsoDay = (iso: string | null): string | null => {
   if (!iso) return null;
-  const d = new Date(`${iso.slice(0, 10)}T12:00:00`);
-  return Number.isNaN(d.getTime()) ? iso : formatDay(d);
+  const d = new Date(`${iso.slice(0, 10)}T12:00:00Z`);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' });
 };
 
 interface SpaceGroup {
@@ -116,7 +106,7 @@ function ChangeReview({ mode, onDecided }: ChangeReviewProps) {
     setPending(action);
     setError(undefined);
     try {
-      const payload = action === 'confirmChange' ? { changeId: change.id, deadlineDays: days, version: change.version } : { changeId: change.id, version: change.version };
+      const payload = action === 'confirmChange' ? { changeId: change.id, deadlineDays: days, version: change.version, today: localDay(new Date()) } : { changeId: change.id, version: change.version };
       const decision = await call<ChangeDecision>(action, payload);
       setDone(decision);
       onDecided?.();
@@ -196,7 +186,8 @@ function ChangeReview({ mode, onDecided }: ChangeReviewProps) {
   const groups = groupBySpace(change);
   const owners = ownerCount(change.pages);
   const busy = pending !== undefined;
-  const dueDate = formatDay(addWorkingDays(days));
+  // Same rule and start day as the server (`confirmDay`), so the modal, Rollout and Jira show one date.
+  const dueDate = formatIsoDay(addWorkingDays(localDay(new Date()), days));
   const deadlineId = `${headingId}-deadline`;
   const notIncluded: string[] = [
     change.unsure > 0 ? `${plural(change.unsure, 'unsure copy', 'unsure copies')} (needs a human check)` : '',

@@ -248,9 +248,17 @@ describe('background and Rovo stubs', () => {
     // The schema check fails here (SQL is mocked away): the trigger logs and returns instead of throwing.
     await expect(onPageEvent({ eventType: 'avi:confluence:updated:page', content: { id: 1 } })).resolves.toBeUndefined();
     await expect(onPageEvent({ eventType: 'avi:confluence:updated:page', content: { id: 'x' } })).resolves.toBeUndefined();
-    for (const key of ACTIONS) {
-      // SQL is mocked away: the schema check fails, so every action but propose-updates answers with an error.
-      expect(await factKeeperAction({ context: { moduleKey: key } })).toMatchObject({ status: key === 'propose-updates' ? 'not_implemented' : 'error' });
+    // SQL is mocked away: the schema stays "setting up", so after waiting (fake timers) every action but
+    // propose-updates answers with an error.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'Date'] });
+    try {
+      for (const key of ACTIONS) {
+        const reply = factKeeperAction({ context: { moduleKey: key } });
+        await vi.runAllTimersAsync();
+        expect(await reply).toMatchObject({ status: key === 'propose-updates' ? 'not_implemented' : 'error' });
+      }
+    } finally {
+      vi.useRealTimers();
     }
   });
 

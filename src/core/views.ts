@@ -316,6 +316,8 @@ export interface ChangeIdPayload {
 export interface ConfirmChangePayload extends ChangeIdPayload {
   /** Working days the copy owners get (1–30); default 5. */
   deadlineDays?: number;
+  /** The confirmer's local day (`YYYY-MM-DD`) the deadline counts from, as shown in the modal; else the UTC day. */
+  today?: string;
 }
 
 /** Reply of `confirmChange` / `dismissChange`. */
