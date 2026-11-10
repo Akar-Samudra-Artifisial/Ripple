@@ -1,9 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
   <title>Ripple</title>
-  <!-- Small-size cut of ripple.svg (16–32 px): thicker strokes, same tile, rings and sync dot. -->
-  <rect width="24" height="24" rx="5.5" fill="#0B6872"/>
-  <circle cx="12" cy="12" r="2.4" fill="#FFFFFF"/>
-  <circle cx="12" cy="12" r="5.2" fill="none" stroke="#FFFFFF" stroke-width="1.7"/>
-  <circle cx="12" cy="12" r="8.4" fill="none" stroke="#FFFFFF" stroke-width="1.5" stroke-opacity="0.8"/>
-  <circle cx="17.94" cy="6.06" r="2.1" fill="#FFC24B" stroke="#0B6872" stroke-width="1"/>
+  <!-- Small-size cut of ripple.svg (16–32 px): no background, thicker strokes, same rings and sync dot. -->
+  <circle cx="12" cy="12" r="2.8" fill="#1D7AFC"/>
+  <circle cx="12" cy="12" r="6" fill="none" stroke="#1D7AFC" stroke-width="2"/>
+  <circle cx="12" cy="12" r="9.6" fill="none" stroke="#1D7AFC" stroke-width="1.9"/>
+  <circle cx="18.79" cy="5.21" r="2.4" fill="#F5CD47" stroke="#1D7AFC" stroke-width="1"/>
 </svg>
