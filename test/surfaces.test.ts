@@ -239,12 +239,13 @@ describe('background and Rovo stubs', () => {
     expect(forge.push).toHaveBeenCalledWith({ body: { reason: 'avi:forge:installed:app' } });
   });
 
-  it('page events never throw; actions reply "not implemented"', async () => {
+  it('page events never throw; Rovo actions never throw', async () => {
     // The schema check fails here (SQL is mocked away): the trigger logs and returns instead of throwing.
     await expect(onPageEvent({ eventType: 'avi:confluence:updated:page', content: { id: 1 } })).resolves.toBeUndefined();
     await expect(onPageEvent({ eventType: 'avi:confluence:updated:page', content: { id: 'x' } })).resolves.toBeUndefined();
     for (const key of ACTIONS) {
-      expect(await factKeeperAction({ context: { moduleKey: key } })).toMatchObject({ status: 'not_implemented', feature: `Rovo action ${key}` });
+      // SQL is mocked away: the schema check fails, so every action but propose-updates answers with an error.
+      expect(await factKeeperAction({ context: { moduleKey: key } })).toMatchObject({ status: key === 'propose-updates' ? 'not_implemented' : 'error' });
     }
   });
 

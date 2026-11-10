@@ -28,7 +28,7 @@ import { sqlChangeIssueRepo } from '../src/adapters/changeIssueRepo';
 import { sqlChangeRepo } from '../src/adapters/changeRepo';
 import { MIGRATIONS } from '../src/core/migrations';
 import { sqlProposalRepo } from '../src/adapters/proposalRepo';
-import { sqlRepo } from '../src/adapters/repo';
+import { sqlFactSearch, sqlRepo } from '../src/adapters/repo';
 import { sqlScanRepo } from '../src/adapters/scanRepo';
 import { sqlSpaceTeamCache } from '../src/adapters/spaceTeams';
 import { sqlErrorInfo, sqlInt, sqlOp } from '../src/core/schema';
@@ -81,6 +81,21 @@ describe('Forge SQL LIMIT (TiDB rejects a bound LIMIT with ER_WRONG_ARGUMENTS)',
     await sqlScanRepo.listCopies('9500001', undefined, ['9600001']);
     expect(calls[0]?.statement).toContain("AND c.status NOT IN ('ignored')");
     expect(calls[0]?.params).toEqual(['9500001', '9600001']);
+  });
+
+  it('M7 fact search: parameterised LIKE per word, confirmed facts of ready sources, inline LIMIT', async () => {
+    await sqlFactSearch.searchConfirmedFacts(['domestic', "x'; DROP", 'diem']);
+    const first = calls[0];
+    expect(first?.statement).toContain("f.status = 'confirmed'");
+    expect(first?.statement).toContain("s.status = 'ready'");
+    expect(first?.statement).toMatch(/LIMIT 200$/);
+    expect(first?.statement).not.toContain('domestic');
+    expect(first?.params).toEqual([...Array(4).fill('%domestic%'), ...Array(4).fill('%diem%')]);
+    calls.length = 0;
+    expect(await sqlFactSearch.searchConfirmedFacts(['%', ''])).toEqual([]);
+    expect(calls).toEqual([]);
+    await sqlFactSearch.readySources();
+    expect(calls[0]?.statement).toMatch(/WHERE status = 'ready' ORDER BY page_id LIMIT 100$/);
   });
 
   it('no statement in src binds LIMIT/OFFSET', () => {

@@ -285,3 +285,49 @@ async function insertFact(pageId: string, f: ExtractedFact, page: PageVersionInf
     page.versionAt,
   );
 }
+
+/** M7: rows read by one fact search (scored and cut in the Fact Keeper action). */
+export const FACT_SEARCH_READ = 200;
+/** M7: sources read by one out-of-date listing. */
+export const READY_SOURCES_READ = 100;
+
+/** A confirmed fact of a ready source, found by the Fact Keeper search. */
+export interface FoundFact extends FactView {
+  sourcePageId: string;
+  sourceTitle: string | null;
+}
+
+/** M7: read-only search for the Rovo Fact Keeper (separate from `FactRepo`, which the extraction fakes implement). */
+export interface FactSearchRepo {
+  /**
+   * Confirmed facts of ready sources whose subject, attribute, value or condition contains any of `words` (lowercase
+   * letters and digits only, so no LIKE wildcard can be injected). At most `FACT_SEARCH_READ` rows, unordered by score.
+   */
+  searchConfirmedFacts(words: readonly string[]): Promise<FoundFact[]>;
+  /** Ready sources (id + title), at most `READY_SOURCES_READ`. */
+  readySources(): Promise<{ pageId: string; title: string | null }[]>;
+}
+
+const FACT_COLUMNS_F = FACT_COLUMNS.split(', ')
+  .map((c) => `f.${c}`)
+  .join(', ');
+
+export const sqlFactSearch: FactSearchRepo = {
+  async searchConfirmedFacts(words) {
+    const safe = words.filter((w) => /^[a-z0-9]{1,40}$/.test(w));
+    if (safe.length === 0) return [];
+    const one = '(LOWER(f.subject) LIKE ? OR LOWER(f.attribute) LIKE ? OR LOWER(f.value) LIKE ? OR LOWER(COALESCE(f.fact_condition, \'\')) LIKE ?)';
+    const rows = await query<FactRow & { source_title: string | null }>(
+      `SELECT ${FACT_COLUMNS_F}, s.title AS source_title FROM facts f JOIN sources s ON s.page_id = f.source_page_id AND s.status = 'ready'
+       WHERE f.status = 'confirmed' AND (${safe.map(() => one).join(' OR ')})
+       ORDER BY f.source_page_id, f.id LIMIT ${FACT_SEARCH_READ}`,
+      ...safe.flatMap((w) => Array.from({ length: 4 }, () => `%${w}%`)),
+    );
+    return rows.map((r) => ({ ...toFact(r), sourcePageId: r.source_page_id, sourceTitle: r.source_title }));
+  },
+
+  async readySources() {
+    const rows = await query<{ page_id: string; title: string | null }>(`SELECT page_id, title FROM sources WHERE status = 'ready' ORDER BY page_id LIMIT ${READY_SOURCES_READ}`);
+    return rows.map((r) => ({ pageId: r.page_id, title: r.title }));
+  },
+};
