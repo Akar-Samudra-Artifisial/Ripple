@@ -1,1 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#0C66E4" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="2"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="10"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <title>Ripple</title>
+  <!-- Source of truth (centre) with a ripple spreading out; the amber dot is a copy back in sync. -->
+  <rect width="512" height="512" rx="112" fill="#0B6872"/>
+  <circle cx="256" cy="256" r="46" fill="#FFFFFF"/>
+  <circle cx="256" cy="256" r="104" fill="none" stroke="#FFFFFF" stroke-width="28"/>
+  <circle cx="256" cy="256" r="170" fill="none" stroke="#FFFFFF" stroke-width="24" stroke-opacity="0.72"/>
+  <circle cx="376.2" cy="135.8" r="36" fill="#FFC24B" stroke="#0B6872" stroke-width="16"/>
+</svg>

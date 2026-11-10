@@ -17,6 +17,7 @@ modules:
   confluence:contentBylineItem:
     - key: ripple-byline
       title: Ripple
+      icon: resource:icons;ripple-small.svg
       resource: byline-ui
       resolver:
         function: ui-resolver
@@ -31,7 +32,7 @@ modules:
   jira:issuePanel:
     - key: ripple-approval
       title: Ripple update
-      icon: resource:icons;ripple.svg
+      icon: resource:icons;ripple-small.svg
       resource: approval-ui
       resolver:
         function: ui-resolver
@@ -75,6 +76,7 @@ modules:
       name: Fact Keeper
       description: Answers questions with the official value from the source-of-truth page, and lists where a fact
         is repeated and which copies are out of date.
+      icon: resource:icons;ripple-512.png
       prompt: resource:agent-prompt;prompt.md
       conversationStarters:
         - What's the per diem for domestic travel?
