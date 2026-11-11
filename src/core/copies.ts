@@ -718,9 +718,38 @@ function safeValueDiffers(fact: ScanFact, j: Judgement): boolean {
   return ![...j.quote.matchAll(FROM_TO)].some((m) => isStated(m[1])) && ![...j.quote.matchAll(PAST_VALUE)].some((m) => isStated(m[1]));
 }
 
+/** Digits masked, words normalised: "Trips over $2,500 require …" and "Trips over $2,000 require …" are equal. */
+const withoutDigits = (text: string): string => normaliseKeyPart(text.replace(/\d{1,3}(?:[.,]\d{3})+(?!\d)|\d+(?:[.,]\d+)?/g, ' 0 '));
+
+/**
+ * The copy states the fact's own source sentence word for word with only its one number changed (the judge said
+ * "value_differs" for a current mention). Subject, condition, unit, rate and limit wording are then the source's by
+ * construction, so this is drift even when the judge stayed unsure or worded the condition differently. The judge's
+ * quote may hold neighbouring sentences (an FAQ question, another rule): exactly one of its sentences must carry the
+ * stated number, and that sentence must be the source sentence. A stated condition must be worded from that sentence
+ * (else the usual condition check applies). Past-value wording and sibling values are still checked afterwards.
+ */
+function mirrorsSourceSentence(fact: ScanFact, j: Judgement): boolean {
+  if (j.reasonCode !== 'value_differs' || j.mention !== 'current' || !fact.quote) return false;
+  const own = normaliseValue(fact.value, fact.unit).numbers;
+  const stated = normaliseValue(j.statedValue, j.statedUnit).numbers;
+  const inSource = numbersIn(fact.quote);
+  if (own.length !== 1 || stated.length !== 1 || inSource.length !== 1 || inSource[0] !== own[0] || stated[0] === own[0]) return false;
+  const withStated = j.quote.split(/(?<=[.!?])\s+/u).filter((s) => numbersIn(s).includes(stated[0] as number));
+  if (withStated.length !== 1) return false;
+  const sentence = withStated[0] as string;
+  if (numbersIn(sentence).length !== 1 || withoutDigits(sentence) !== withoutDigits(fact.quote)) return false;
+  const words = new Set(normaliseKeyPart(sentence).split(' '));
+  return normaliseKeyPart(j.statedCondition)
+    .split(' ')
+    .filter((w) => w.length >= 3 && !STOPWORDS.has(w) && !/^\d/.test(w))
+    .every((w) => stems(w).some((x) => words.has(x)));
+}
+
 function statusOf(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[]): CopyDecision | null {
   if (j.mention === 'historical') return { status: 'historical', reason: 'Past value (historical mention); not checked.' };
-  if (!sameCondition(fact, j.statedCondition, siblings)) {
+  const mirror = mirrorsSourceSentence(fact, j);
+  if (!mirror && !sameCondition(fact, j.statedCondition, siblings)) {
     return { status: 'unsure', reason: fact.condition ? `Different condition: "${j.statedCondition}" vs "${fact.condition}".` : `Only for "${j.statedCondition}"; the source has no condition.` };
   }
   const cmp = compareValues({ value: fact.value, unit: fact.unit }, { value: j.statedValue, unit: j.statedUnit });
@@ -728,7 +757,7 @@ function statusOf(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[]): 
   // The judge's own "value_matches" with an equal value and no other condition is in sync, also when it (or the
   // quote check) left same_fact at "unsure": an equal value cannot be drift.
   const matches = cmp === 'same' && j.reasonCode === 'value_matches' && j.mention === 'current';
-  if (j.sameFact === 'unsure' && !matches && !(cmp === 'different' && safeValueDiffers(fact, j))) return { status: 'unsure', reason: 'Ripple is not sure this is the same fact.' };
+  if (j.sameFact === 'unsure' && !matches && !(cmp === 'different' && (mirror || safeValueDiffers(fact, j)))) return { status: 'unsure', reason: 'Ripple is not sure this is the same fact.' };
   if (cmp === 'same') return { status: 'in_sync', reason: 'Same value as the source.' };
   const stated = valueLabel(j.statedValue, j.statedUnit);
   const official = valueLabel(fact.value, fact.unit);

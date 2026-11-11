@@ -1309,10 +1309,45 @@ describe('M6 Nimbus Labs demo data through the scan rules (simulated judge)', ()
     expect(trap.map((i) => [i.fact.id, i.decision?.status])).toEqual([[factId('domestic'), 'unsure']]);
   });
 
+  it('gallery runs: both drift sentences mirror their source sentence and are drift for judge "yes" and "unsure"', () => {
+    const sales = NIMBUS_PAGES.find((p) => p.slug === 'sales-travel-guide') as (typeof NIMBUS_PAGES)[number];
+    const faq = NIMBUS_PAGES.find((p) => p.slug === 'fin-expense-faq') as (typeof NIMBUS_PAGES)[number];
+    const a13 = sales.mentions.find((m) => m.fact === 'approval') as NimbusMention;
+    const c9 = faq.mentions.find((m) => m.fact === 'claims') as NimbusMention;
+    const d13 = sales.mentions.find((m) => m.fact === 'domestic') as NimbusMention;
+    const d9 = faq.mentions.find((m) => m.fact === 'domestic') as NimbusMention;
+    // Live extraction variants of the source facts (threshold/booking condition, unit inside the value or not).
+    const approvals = [fact('approval'), { ...fact('approval'), condition: 'Trips over $2,000' }, { ...fact('approval'), condition: null, value: '$2,000', unit: null }];
+    const claimsFacts = [fact('claims'), { ...fact('claims'), value: '30 days', unit: 'days', condition: 'after the trip ends' }];
+    const cases: [ScanFact[], NimbusMention, string[], [string, string | null][], (string | null)[]][] = [
+      [approvals, a13, [a13.quote, `${d13.quote} ${a13.quote}`], [['$2,500', null], ['$2,500', 'USD'], ['2500', 'USD']], [null, 'over $2,500', 'Trips over $2,500', 'before booking']],
+      [claimsFacts, c9, [c9.quote, `How long do I have to submit? ${c9.quote}`, `${c9.quote} Do I need receipts for meals? ${d9.quote}`], [['45 days', 'days'], ['45', null], ['45', 'days after the trip ends']], [null, 'after the trip ends', 'submitted within 45 days after the trip ends']],
+    ];
+    for (const [facts, m, quotes, values, conditions] of cases) {
+      for (const f of facts) for (const quote of quotes) for (const [statedValue, statedUnit] of values) for (const statedCondition of conditions) for (const sameFact of ['yes', 'unsure'] as const) {
+        const j = judgement(m.fact as FactKey, { sameFact, reasonCode: 'value_differs', statedValue, statedUnit, statedCondition, quote });
+        expect(judgeOutcome(f, j, siblingsOf(f, FACTS)).decision?.status, `${m.fact} ${sameFact} ${statedValue}|${statedUnit} c=${statedCondition} q=${quote}`).toBe('drifted');
+      }
+    }
+    // Not a mirror: other wording, another currency or no currency sign, a condition the sentence lacks, a past value,
+    // two numbers in the sentence, another reason code.
+    const approval = fact('approval');
+    const unsure = (over: Partial<Judgement>) => judgeOutcome(approval, judgement('approval', { sameFact: 'unsure', reasonCode: 'value_differs', statedValue: '$2,500', statedUnit: 'USD', statedCondition: null, quote: a13.quote, ...over }), []).decision?.status;
+    expect(unsure({ quote: 'Trips over $2,500 require manager approval before booking, except conferences.' })).toBe('unsure');
+    expect(unsure({ quote: 'Trips over €2,500 require manager approval before booking.', statedValue: '€2,500', statedUnit: 'EUR' })).not.toBe('drifted');
+    expect(unsure({ quote: 'Trips over 2,500 require manager approval before booking.', statedUnit: null, statedValue: '2,500' })).toBe('unsure');
+    expect(unsure({ statedCondition: 'external contractors' })).toBe('unsure');
+    expect(unsure({ quote: 'Trips over $2,500 require manager approval before booking within 3 days.' })).toBe('unsure');
+    expect(unsure({ reasonCode: 'ambiguous' })).toBe('unsure');
+    expect(unsure({ quote: 'Until 2025, trips over $2,500 require manager approval before booking.' })).toBe('unsure');
+    const claimsUnsure = judgeOutcome(fact('claims'), judgement('claims', { sameFact: 'unsure', reasonCode: 'value_differs', statedValue: '45 days', statedUnit: 'days', statedCondition: 'External training', quote: 'External training claims must be submitted within 45 days after the trip ends.' }), []).decision?.status;
+    expect(claimsUnsure).toBe('unsure');
+  });
+
   it('live shape of 8.34.0 (Sales Team Travel Guide): approval $2,500 judged unsure / value_differs is drifted only when the quote proves it', () => {
     const sales = NIMBUS_PAGES.find((p) => p.slug === 'sales-travel-guide');
     const a13 = sales?.mentions.find((m) => m.fact === 'approval') as NimbusMention;
-    expect(a13.quote).toBe('Trips over $2,500 need manager approval before booking.');
+    expect(a13.quote).toBe('Trips over $2,500 require manager approval before booking.');
     const approval = fact('approval');
     const status = (over: Partial<Judgement>, f: ScanFact = approval) =>
       judgeOutcome(f, judgement('approval', { sameFact: 'unsure', reasonCode: 'value_differs', statedValue: a13.statedValue, statedUnit: a13.statedUnit, statedCondition: a13.statedCondition, quote: a13.quote, ...over }), siblingsOf(f, FACTS)).decision?.status;

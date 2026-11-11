@@ -259,7 +259,7 @@ describe('Nimbus Labs demo content', () => {
       'Expense claims must be submitted within 45 days after the trip ends.',
       'International travel: the per diem is $100 per day.',
       'For domestic customer visits the per diem is $65 per day.',
-      'Trips over $2,500 need manager approval before booking.',
+      'Trips over $2,500 require manager approval before booking.',
     ]);
   });
 
