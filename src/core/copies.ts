@@ -652,15 +652,6 @@ export function judgeOutcome(fact: ScanFact, judged: Judgement, siblings: readon
   return decision ? { decision } : { decision: null, reason: 'value_not_comparable' };
 }
 
-/**
- * The judge's own "value_differs" with same_fact "unsure" is drift only when the quote proves it (live: "Trips over
- * $2,500 need manager approval before booking." for a $2,000 limit): a current mention, one number each in the same
- * written unit and exactly one number in the sentence, the same limit/scope wording ("over", "up to", "only", …) and
- * rate ("per day") as the fact's own sentence, no group after "for" the fact does not name, the sentence names the
- * fact's subject/attribute, the stated condition (if any) is in the sentence (the condition itself was checked by
- * `sameCondition`, which ignores "over"/"under" as stopwords), and the stated number is not a past value ("was",
- * "from X to Y"). Past-value wording and sibling values are checked afterwards like any drift.
- */
 /** Limit and scope wording: "over $2,000", "up to $2,500" and "at least $2,500" are not the same rule. */
 const LIMIT_QUALIFIERS: readonly [RegExp, string][] = [
   [/\b(?:up to|at most|no more than|not more than|maximum|max)\b/iu, 'at_most'],
@@ -688,6 +679,15 @@ function unknownGroups(quote: string, factText: string): string[] {
     .filter((w) => w.length >= 3 && !STOPWORDS.has(w) && !CONDITION_FILLER.has(w) && !stems(w).some((x) => known.has(x)));
 }
 
+/**
+ * The judge's own "value_differs" with same_fact "unsure" is drift only when the quote proves it (live: "Trips over
+ * $2,500 need manager approval before booking." for a $2,000 limit): a current mention, one number each in the same
+ * written unit and exactly one number in the sentence, the same limit/scope wording ("over", "up to", "only", …) and
+ * rate ("per day") as the fact's own sentence, no group after "for" the fact does not name, the sentence names the
+ * fact's subject/attribute, the stated condition (if any) is in the sentence (the condition itself was checked by
+ * `sameCondition`, which ignores "over"/"under" as stopwords), and the stated number is not a past value ("was",
+ * "from X to Y"). Past-value wording and sibling values are checked afterwards like any drift.
+ */
 function safeValueDiffers(fact: ScanFact, j: Judgement): boolean {
   if (j.reasonCode !== 'value_differs' || j.mention !== 'current') return false;
   const o = normaliseValue(fact.value, fact.unit);
@@ -718,8 +718,19 @@ function safeValueDiffers(fact: ScanFact, j: Judgement): boolean {
   return ![...j.quote.matchAll(FROM_TO)].some((m) => isStated(m[1])) && ![...j.quote.matchAll(PAST_VALUE)].some((m) => isStated(m[1]));
 }
 
-/** Digits masked, words normalised: "Trips over $2,500 require …" and "Trips over $2,000 require …" are equal. */
-const withoutDigits = (text: string): string => normaliseKeyPart(text.replace(/\d{1,3}(?:[.,]\d{3})+(?!\d)|\d+(?:[.,]\d+)?/g, ' 0 '));
+/**
+ * The sentence with each number masked by its written style, everything else kept (case and spacing aside, end
+ * punctuation trimmed): "Trips over $2,500 require …" and "Trips over $2,000 require …" are equal; "$2.500", "$ 2,500"
+ * and "2,500" are not "$2,000".
+ */
+const withoutDigits = (text: string): string =>
+  text
+    .normalize('NFKC')
+    .replace(/\d{1,3}(?:([.,])\d{3})+(?!\d)|\d+(?:([.,])\d+)?/g, (_m, group?: string, decimal?: string) => `#${group ? `g${group}` : decimal ? `d${decimal}` : ''}`)
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[\s.!?]+$/u, '')
+    .trim();
 
 /**
  * The copy states the fact's own source sentence word for word with only its one number changed (the judge said
@@ -727,7 +738,8 @@ const withoutDigits = (text: string): string => normaliseKeyPart(text.replace(/\
  * construction, so this is drift even when the judge stayed unsure or worded the condition differently. The judge's
  * quote may hold neighbouring sentences (an FAQ question, another rule): exactly one of its sentences must carry the
  * stated number, and that sentence must be the source sentence. A stated condition must be worded from that sentence
- * (else the usual condition check applies). Past-value wording and sibling values are still checked afterwards.
+ * or from the fact itself ("submission deadline", "submit" for "submitted"); else the usual condition check applies.
+ * Past-value wording and sibling values are still checked afterwards (a sibling's value is never drift here).
  */
 function mirrorsSourceSentence(fact: ScanFact, j: Judgement): boolean {
   if (j.reasonCode !== 'value_differs' || j.mention !== 'current' || !fact.quote) return false;
@@ -739,11 +751,14 @@ function mirrorsSourceSentence(fact: ScanFact, j: Judgement): boolean {
   if (withStated.length !== 1) return false;
   const sentence = withStated[0] as string;
   if (numbersIn(sentence).length !== 1 || withoutDigits(sentence) !== withoutDigits(fact.quote)) return false;
-  const words = new Set(normaliseKeyPart(sentence).split(' '));
+  const words = normaliseKeyPart(`${sentence} ${fact.subject} ${fact.attribute} ${fact.unit ?? ''} ${fact.condition ?? ''}`).split(' ');
+  const known = new Set(words);
+  // Inflections: "submit" / "submitted" (one word a prefix of the other, at least 5 letters).
+  const inflected = (w: string): boolean => words.some((x) => Math.min(w.length, x.length) >= 5 && (x.startsWith(w) || w.startsWith(x)));
   return normaliseKeyPart(j.statedCondition)
     .split(' ')
-    .filter((w) => w.length >= 3 && !STOPWORDS.has(w) && !/^\d/.test(w))
-    .every((w) => stems(w).some((x) => words.has(x)));
+    .filter((w) => w.length >= 3 && !STOPWORDS.has(w) && !CONDITION_FILLER.has(w) && !/^\d/.test(w))
+    .every((w) => stems(w).some((x) => known.has(x)) || inflected(w));
 }
 
 function statusOf(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[]): CopyDecision | null {
@@ -763,7 +778,7 @@ function statusOf(fact: ScanFact, j: Judgement, siblings: readonly ScanFact[]): 
   const official = valueLabel(fact.value, fact.unit);
   if (HISTORICAL_CUE.test(j.quote)) return { status: 'unsure', reason: `Looks like a past value (${stated}); please check.` };
   const sibling = siblings.find((s) => s.id !== fact.id && compareValues({ value: s.value, unit: s.unit }, { value: j.statedValue, unit: j.statedUnit }) === 'same');
-  if (sibling && !j.statedCondition) return { status: 'unsure', reason: `Value matches the fact for "${sibling.condition ?? 'another case'}".` };
+  if (sibling && (mirror || !j.statedCondition)) return { status: 'unsure', reason: `Value matches the fact for "${sibling.condition ?? 'another case'}".` };
   return { status: 'drifted', reason: `Value differs: ${stated} vs ${official} on the source.` };
 }
 

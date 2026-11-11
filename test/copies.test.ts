@@ -752,9 +752,11 @@ describe('copy scan (search + judge consumers)', () => {
         const id = COPY_PAGES.find((p) => p.title === title)?.id;
         return info.mock.calls.find((c) => c[0] === 'ripple judge page' && (c[1] as { pageId: string }).pageId === id)?.[1] as { facts: { factId: string; outcome: string }[]; dropReasons: Record<string, number> };
       };
-      expect(pageLog('Finance FAQ').facts).toContainEqual({ factId: factId('claims'), outcome: 'drifted', reasonCode: 'other' });
+      expect(pageLog('Finance FAQ').facts).toContainEqual(expect.objectContaining({ factId: factId('claims'), outcome: 'drifted', reasonCode: 'other' }));
       const training = COPY_PAGES.find((p) => p.kind === 'trap' && p.expect.domestic === 'unsure');
-      expect(pageLog(training?.title ?? '').facts).toContainEqual({ factId: factId('domestic'), outcome: 'unsure', reasonCode: 'different_condition' });
+      expect(pageLog(training?.title ?? '').facts).toContainEqual(expect.objectContaining({ factId: factId('domestic'), outcome: 'unsure', reasonCode: 'different_condition' }));
+      // The judge's same_fact is logged as an enum (plus "/condition" when one was stated), never the condition text.
+      for (const f of pageLog(training?.title ?? '').facts as { sameFact?: string }[]) if (f.sameFact) expect(f.sameFact).toMatch(/^((yes|no|unsure)(\/condition)?\+?)+$/);
       expect(scans.statusOf('domestic', training?.id ?? '')).toBe('unsure');
       const logged = JSON.stringify(info.mock.calls.filter((c) => c[0] === 'ripple judge page'));
       expect(logged).not.toMatch(/acc-1|per diem|\$40|External training/i);
@@ -815,7 +817,7 @@ describe('copy scan (search + judge consumers)', () => {
         for (const k of KEYS) expect(scans.statusOf(k, p.id), `${p.title} / ${k}`).toBe(p.expect[k] ?? null);
       const logs = info.mock.calls.filter((c) => c[0] === 'ripple judge page').map((c) => c[1] as { pageId: string; facts: { factId: string; outcome: string; reasonCode: string }[] });
       const offsiteLog = logs.find((l) => l.pageId === offsite.id);
-      expect(offsiteLog?.facts).toContainEqual({ factId: factId('international'), outcome: 'sibling_fact', reasonCode: 'different_condition' });
+      expect(offsiteLog?.facts).toContainEqual(expect.objectContaining({ factId: factId('international'), outcome: 'sibling_fact', reasonCode: 'different_condition' }));
       // Every fact entry has an enum reason code, also without any judged mention.
       for (const l of logs) for (const f of l.facts) expect(f.reasonCode).toMatch(/^[a-z_+]+$/);
       expect(logs.some((l) => l.facts.some((f) => f.outcome === 'no_match' && f.reasonCode === 'no_mention'))).toBe(true);
@@ -1334,7 +1336,7 @@ describe('M6 Nimbus Labs demo data through the scan rules (simulated judge)', ()
     const approval = fact('approval');
     const unsure = (over: Partial<Judgement>) => judgeOutcome(approval, judgement('approval', { sameFact: 'unsure', reasonCode: 'value_differs', statedValue: '$2,500', statedUnit: 'USD', statedCondition: null, quote: a13.quote, ...over }), []).decision?.status;
     expect(unsure({ quote: 'Trips over $2,500 require manager approval before booking, except conferences.' })).toBe('unsure');
-    expect(unsure({ quote: 'Trips over €2,500 require manager approval before booking.', statedValue: '€2,500', statedUnit: 'EUR' })).not.toBe('drifted');
+    expect(unsure({ quote: 'Trips over €2,500 require manager approval before booking.', statedValue: '€2,500', statedUnit: 'EUR' })).toBeUndefined(); // another currency: not comparable, no card
     expect(unsure({ quote: 'Trips over 2,500 require manager approval before booking.', statedUnit: null, statedValue: '2,500' })).toBe('unsure');
     expect(unsure({ statedCondition: 'external contractors' })).toBe('unsure');
     expect(unsure({ quote: 'Trips over $2,500 require manager approval before booking within 3 days.' })).toBe('unsure');
@@ -1342,6 +1344,40 @@ describe('M6 Nimbus Labs demo data through the scan rules (simulated judge)', ()
     expect(unsure({ quote: 'Until 2025, trips over $2,500 require manager approval before booking.' })).toBe('unsure');
     const claimsUnsure = judgeOutcome(fact('claims'), judgement('claims', { sameFact: 'unsure', reasonCode: 'value_differs', statedValue: '45 days', statedUnit: 'days', statedCondition: 'External training', quote: 'External training claims must be submitted within 45 days after the trip ends.' }), []).decision?.status;
     expect(claimsUnsure).toBe('unsure');
+    // Other number formats are no exact mirror.
+    expect(unsure({ quote: 'Trips over 2.500 require manager approval before booking.', statedValue: '2.500', statedUnit: null })).toBe('unsure');
+    // With a condition only the mirror accepts ("over …" vs the fact's "Before booking"), the format decides.
+    expect(unsure({ quote: a13.quote, statedCondition: 'over $2,500' })).toBe('drifted');
+    expect(unsure({ quote: 'Trips over $ 2,500 require manager approval before booking.', statedValue: '$ 2,500', statedCondition: 'over $ 2,500' })).toBe('unsure');
+    expect(unsure({ quote: 'Trips over $2.500 require manager approval before booking.', statedValue: '$2.500', statedCondition: 'over $2.500' })).toBe('unsure');
+    // A neighbouring sentence with a past-value cue keeps a mirror unsure.
+    expect(unsure({ quote: `Last year the limit was different. ${a13.quote}` })).toBe('unsure');
+    // A sibling's value is never drift for a mirror, with or without a stated condition.
+    const domestic = fact('domestic');
+    const domesticSentence = (domestic.quote as string).replace('$60', '$90');
+    for (const statedCondition of [null, 'domestic travel']) {
+      const j = judgement('domestic', { sameFact: 'unsure', reasonCode: 'value_differs', statedValue: '$90', statedUnit: 'per day', statedCondition, quote: domesticSentence });
+      expect(judgeOutcome(domestic, j, siblingsOf(domestic, FACTS)).decision?.status, String(statedCondition)).toBe('unsure');
+    }
+  });
+
+  it('live 8.47.0: C9 is the source claims sentence with only 45; judge yes/unsure → drifted, also with conditions worded from the fact', () => {
+    const faq = NIMBUS_PAGES.find((p) => p.slug === 'fin-expense-faq') as (typeof NIMBUS_PAGES)[number];
+    const c9 = faq.mentions.find((m) => m.fact === 'claims') as NimbusMention;
+    expect(c9.quote.replace('45', '30')).toBe('Expense claims must be submitted within 30 days after the trip ends.');
+    expect(NIMBUS_SOURCE.storage).toContain(c9.quote.replace('45', '30'));
+    const claims = fact('claims');
+    const quotes = [c9.quote, `How long do I have to submit? ${c9.quote}`];
+    const conditions = [null, 'after the trip ends', 'submission deadline', 'submit after the trip ends', 'expense claims submission'];
+    for (const quote of quotes) for (const statedCondition of conditions) for (const sameFact of ['yes', 'unsure'] as const) {
+      for (const [statedValue, statedUnit] of [['45 days', 'days'], ['45', null], ['45 days', 'days after the trip ends']] as const) {
+        const j = judgement('claims', { sameFact, reasonCode: 'value_differs', statedValue, statedUnit, statedCondition, quote });
+        expect(judgeOutcome(claims, j, siblingsOf(claims, FACTS)).decision?.status, `${sameFact} ${statedValue}|${statedUnit} c=${statedCondition} q=${quote}`).toBe('drifted');
+      }
+    }
+    // A condition from outside the sentence and the fact still blocks the mirror.
+    const j = judgement('claims', { sameFact: 'unsure', reasonCode: 'value_differs', statedValue: '45 days', statedUnit: 'days', statedCondition: 'contractors', quote: c9.quote });
+    expect(judgeOutcome(claims, j, siblingsOf(claims, FACTS)).decision?.status).toBe('unsure');
   });
 
   it('live shape of 8.34.0 (Sales Team Travel Guide): approval $2,500 judged unsure / value_differs is drifted only when the quote proves it', () => {

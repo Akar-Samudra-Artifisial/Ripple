@@ -518,6 +518,7 @@ async function judgePage(scan: ScanRow, page: PendingPage, facts: readonly ScanF
   const chunked = new Set(chunks.flatMap((c) => c.factIds));
   const outcomes = new Map<string, string[]>(pageFacts.map((f) => [f.id, chunked.has(f.id) ? [] : ['no_chunk']]));
   const reasonCodes = new Map<string, string[]>();
+  const sameFacts = new Map<string, string[]>();
   const mentions: PageMention[] = [];
   for (const r of results) {
     dropped += r.dropped;
@@ -531,6 +532,8 @@ async function judgePage(scan: ScanRow, page: PendingPage, facts: readonly ScanF
     outcomes.get(fact.id)?.push(decision ? decision.status : (reason ?? 'not_copy'));
     // Enum value only (anything else was parsed to "other"): never the judge's free text.
     reasonCodes.set(fact.id, [...(reasonCodes.get(fact.id) ?? []), j.reasonCode ?? 'other']);
+    // The judge's same_fact enum and whether it stated a condition (never the condition text): why an answer stayed unsure.
+    sameFacts.set(fact.id, [...(sameFacts.get(fact.id) ?? []), `${j.sameFact}${j.statedCondition ? '/condition' : ''}`]);
     if (!decision) continue;
     const list = found.get(fact.id) ?? [];
     list.push({
@@ -559,6 +562,7 @@ async function judgePage(scan: ScanRow, page: PendingPage, facts: readonly ScanF
       outcome: list.length > 0 ? list.join('+') : 'no_match',
       // No judged mention (no chunk or nothing reported) is "no_mention", so every entry has an enum reason code.
       reasonCode: reasonCodes.get(factId)?.join('+') ?? 'no_mention',
+      ...(sameFacts.has(factId) ? { sameFact: sameFacts.get(factId)?.join('+') } : {}),
     })),
     dropped,
     dropReasons,
